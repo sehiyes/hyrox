@@ -1,0 +1,2487 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>모델별 주간 품질 이상징후 Dashboard</title>
+
+<!-- ===================== EXTERNAL LIBRARIES ===================== -->
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/datatables.net-bs5@1.13.11/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/datatables.net@1.13.11/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/datatables.net-bs5@1.13.11/js/dataTables.bootstrap5.min.js"></script>
+
+<style>
+/* ===================== DESIGN TOKENS ===================== */
+:root{
+  --bg:#F5F7FA;
+  --surface:#FFFFFF;
+  --surface-2:#EEF1F5;
+  --border:#E1E7EF;
+  --ink:#1B2432;
+  --ink-soft:#5B6B82;
+  --accent:#0F8B8D;      /* circuit teal - primary */
+  --accent-ink:#0B6668;
+  --graphite:#1F2A3C;    /* structural navy */
+  --warn:#F5A623;
+  --danger:#E5484D;
+  --good:#16A34A;
+  --shadow: 0 1px 2px rgba(20,30,45,.04), 0 4px 14px rgba(20,30,45,.06);
+  --radius: 10px;
+  --font-display:'Pretendard', -apple-system, sans-serif;
+  --font-mono:'IBM Plex Mono', monospace;
+}
+html[data-theme="dark"]{
+  --bg:#0B0F16;
+  --surface:#131A24;
+  --surface-2:#1A2330;
+  --border:#26313F;
+  --ink:#E7ECF3;
+  --ink-soft:#8A97A9;
+  --accent:#2DD4CF;
+  --accent-ink:#7FE7E3;
+  --graphite:#0D131D;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+}
+
+*{box-sizing:border-box;}
+body{
+  font-family:var(--font-display);
+  background:var(--bg);
+  color:var(--ink);
+  margin:0;
+  transition:background .2s ease, color .2s ease;
+}
+.mono{font-family:var(--font-mono);}
+
+/* ===================== LAYOUT ===================== */
+#appShell{display:flex; min-height:100vh;}
+
+/* Sidebar */
+#sidebar{
+  width:270px; flex:0 0 270px;
+  background:var(--graphite);
+  color:#DDE6F0;
+  padding:20px 16px;
+  position:sticky; top:0; height:100vh; overflow-y:auto;
+}
+#sidebar .brand{
+  font-weight:800; font-size:1.05rem; letter-spacing:.02em;
+  display:flex; align-items:center; gap:8px; margin-bottom:4px;
+}
+#sidebar .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent); box-shadow:0 0 8px var(--accent);}
+#sidebar .brand-sub{font-size:.72rem; color:#8FA3BB; margin-bottom:22px; font-family:var(--font-mono);}
+#sidebar h6{
+  color:#7C90A8; font-size:.68rem; text-transform:uppercase; letter-spacing:.12em;
+  margin:20px 0 8px; font-weight:700;
+}
+.filter-group{margin-bottom:6px;}
+#sidebar select, #sidebar input[type=date], #sidebar input[type=text]{
+  width:100%; background:#0F1622; border:1px solid #263140; color:#E7ECF3;
+  border-radius:8px; padding:7px 9px; font-size:.8rem; margin-bottom:8px;
+}
+#sidebar select[multiple]{height:84px;}
+#sidebar .btn-apply{
+  width:100%; background:var(--accent); border:none; color:#04211f; font-weight:700;
+  padding:9px; border-radius:8px; font-size:.85rem; margin-top:6px;
+}
+#sidebar .btn-reset{
+  width:100%; background:transparent; border:1px solid #2B3646; color:#9FB0C4;
+  padding:7px; border-radius:8px; font-size:.78rem; margin-top:6px;
+}
+
+/* Main content */
+#main{flex:1; min-width:0; padding:22px 26px 60px;}
+
+.topbar{
+  display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; gap:12px; flex-wrap:wrap;
+}
+.topbar .title{font-size:1.28rem; font-weight:800; letter-spacing:-.01em;}
+.topbar .title .sub{display:block; font-size:.78rem; color:var(--ink-soft); font-weight:500; font-family:var(--font-mono); margin-top:2px;}
+
+.theme-toggle{
+  border:1px solid var(--border); background:var(--surface); border-radius:20px;
+  padding:6px 14px; font-size:.78rem; cursor:pointer; color:var(--ink);
+}
+
+/* Upload zone */
+#uploadZone{
+  border:2px dashed var(--border); border-radius:var(--radius); background:var(--surface);
+  padding:34px 20px; text-align:center; cursor:pointer; transition:.15s;
+  margin-bottom:20px;
+}
+#uploadZone.dragover{border-color:var(--accent); background:var(--surface-2);}
+#uploadZone .up-title{font-weight:700; font-size:1rem;}
+#uploadZone .up-sub{color:var(--ink-soft); font-size:.82rem; margin-top:4px; font-family:var(--font-mono);}
+
+/* Card */
+.qcard{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:16px 16px 10px; margin-bottom:18px;
+}
+.qcard h5{font-size:.86rem; font-weight:700; margin-bottom:10px; display:flex; align-items:center; gap:8px;}
+.qcard h5 .idx{font-family:var(--font-mono); color:var(--accent); font-size:.72rem; border:1px solid var(--accent); border-radius:5px; padding:1px 6px;}
+.chart-wrap{position:relative; height:280px;}
+.chart-wrap.tall{height:360px;}
+
+/* KPI row */
+.kpi-grid{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:18px;}
+.kpi{
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  padding:14px 16px; box-shadow:var(--shadow);
+}
+.kpi .lbl{font-size:.72rem; color:var(--ink-soft); font-weight:600; text-transform:uppercase; letter-spacing:.06em;}
+.kpi .val{font-family:var(--font-mono); font-size:1.55rem; font-weight:700; margin-top:4px;}
+.kpi .delta{font-size:.76rem; margin-top:2px; font-family:var(--font-mono);}
+.delta.up{color:var(--danger);}
+.delta.down{color:var(--good);}
+
+/* AI Insight terminal */
+#aiInsight{
+  background:#081015; border:1px solid #1C2733; border-radius:var(--radius);
+  padding:16px 18px; margin-bottom:20px; font-family:var(--font-mono); color:#8FF7D8;
+  box-shadow:inset 0 0 30px rgba(15,139,141,.08), var(--shadow);
+  position:relative; overflow:hidden;
+}
+#aiInsight::before{
+  content:''; position:absolute; inset:0; pointer-events:none;
+  background:repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0px, rgba(255,255,255,0.015) 1px, transparent 1px, transparent 3px);
+}
+#aiInsight .term-head{display:flex; align-items:center; gap:8px; color:#4E6E76; font-size:.7rem; margin-bottom:10px; text-transform:uppercase; letter-spacing:.14em;}
+#aiInsight .term-head .b{width:8px;height:8px;border-radius:50%; background:#2DD4CF;}
+#aiInsight .line{font-size:.86rem; line-height:1.65; opacity:0; animation:fadeIn .4s forwards;}
+#aiInsight .line::before{content:'> '; color:#2DD4CF;}
+#aiInsight .cursor{display:inline-block; width:7px; height:14px; background:#2DD4CF; vertical-align:middle; animation:blink 1s step-end infinite;}
+@keyframes fadeIn{to{opacity:1;}}
+@keyframes blink{50%{opacity:0;}}
+
+/* badges for anomaly types */
+.badge-anom{font-family:var(--font-mono); font-size:.68rem; font-weight:700; padding:3px 8px; border-radius:6px; letter-spacing:.03em;}
+.badge-warn{background:#FFF3DC; color:#8A5A00;}
+.badge-danger{background:#FCE4E4; color:#A5121A;}
+.badge-new{background:#E4F3FF; color:#0B5C9E;}
+.badge-trend{background:#EDE7FE; color:#5B3DBB;}
+.badge-model{background:#E4F7EE; color:#0D7A45;}
+.badge-version{background:#FCEFE0; color:#A15A0A;}
+.badge-eng{background:#F1F1F1; color:#444;}
+html[data-theme="dark"] .badge-warn{background:#3A2C0C; color:#F5C767;}
+html[data-theme="dark"] .badge-danger{background:#3A1416; color:#FF9A9E;}
+html[data-theme="dark"] .badge-new{background:#0E2A3D; color:#7FCBFF;}
+html[data-theme="dark"] .badge-trend{background:#241C40; color:#C6B6FF;}
+html[data-theme="dark"] .badge-model{background:#0E2A1E; color:#7FE0AC;}
+html[data-theme="dark"] .badge-version{background:#332107; color:#F2B267;}
+html[data-theme="dark"] .badge-eng{background:#242424; color:#CCC;}
+
+/* Quality index chip */
+.qi-chip{display:inline-flex; align-items:center; gap:6px; font-family:var(--font-mono); font-weight:700; font-size:.78rem; padding:4px 10px; border-radius:20px;}
+.qi-green{background:#E4F7EE; color:#0D7A45;}
+.qi-yellow{background:#FFF3DC; color:#8A5A00;}
+.qi-red{background:#FCE4E4; color:#A5121A;}
+
+/* Heatmap */
+.heatmap-scroll{overflow:auto; max-height:420px;}
+table.heatmap{border-collapse:collapse; font-size:.72rem; width:100%;}
+table.heatmap th, table.heatmap td{border:1px solid var(--border); padding:4px 6px; text-align:center; white-space:nowrap;}
+table.heatmap th{background:var(--surface-2); position:sticky; top:0; z-index:2; font-weight:600;}
+table.heatmap td.rowhead{position:sticky; left:0; background:var(--surface-2); font-weight:600; text-align:left; z-index:1;}
+table.heatmap td.cell{font-family:var(--font-mono); color:#08202080;}
+
+/* Timeline */
+.tl-item{display:flex; gap:14px; padding:10px 0; border-bottom:1px solid var(--border);}
+.tl-item:last-child{border-bottom:none;}
+.tl-week{font-family:var(--font-mono); font-size:.72rem; color:var(--ink-soft); width:88px; flex:0 0 88px; padding-top:2px;}
+.tl-body{flex:1;}
+.tl-body .tt{font-weight:700; font-size:.86rem;}
+.tl-body .dd{font-size:.78rem; color:var(--ink-soft); margin-top:2px;}
+
+/* Search grid */
+.search-grid{display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:14px;}
+.search-grid input{font-size:.8rem; padding:7px 9px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--ink);}
+
+/* Model detail selector */
+.model-select-row{display:flex; align-items:center; gap:10px; margin-bottom:16px;}
+.model-select-row select{max-width:320px;}
+
+/* Tabs */
+.nav-tabs .nav-link{color:var(--ink-soft); font-weight:600; font-size:.86rem;}
+.nav-tabs .nav-link.active{color:var(--accent); border-color:var(--border) var(--border) var(--surface); background:var(--surface);}
+
+/* Table */
+table.dataTable{font-size:.78rem;}
+.dt-buttons{margin-bottom:10px;}
+
+/* Empty state */
+#emptyState{padding:80px 20px; text-align:center; color:var(--ink-soft);}
+#emptyState .big{font-size:2rem; margin-bottom:8px;}
+
+.hidden{display:none !important;}
+
+/* Loading overlay */
+#loadingOverlay{
+  position:fixed; inset:0; background:rgba(11,15,22,.55); backdrop-filter:blur(2px);
+  display:flex; align-items:center; justify-content:center; z-index:9999;
+  opacity:0; pointer-events:none; transition:opacity .15s ease;
+}
+#loadingOverlay.show{ opacity:1; pointer-events:auto; }
+#loadingOverlay .lo-box{
+  background:var(--surface); border:1px solid var(--border); border-radius:14px;
+  padding:28px 34px; text-align:center; box-shadow:var(--shadow); min-width:240px;
+}
+#loadingOverlay .lo-spinner{
+  width:34px; height:34px; margin:0 auto 14px; border-radius:50%;
+  border:3px solid var(--border); border-top-color:var(--accent);
+  animation:spin .8s linear infinite;
+}
+#loadingOverlay .lo-msg{ font-size:.85rem; color:var(--ink); font-weight:600; }
+@keyframes spin{ to{ transform:rotate(360deg); } }
+
+@media (max-width:1100px){
+  .kpi-grid{grid-template-columns:repeat(2,1fr);}
+  .search-grid{grid-template-columns:repeat(2,1fr);}
+  #sidebar{position:relative; height:auto;}
+  #appShell{flex-direction:column;}
+}
+</style>
+</head>
+<body>
+
+<div id="appShell">
+
+  <!-- ===================== SIDEBAR : FILTERS ===================== -->
+  <aside id="sidebar">
+    <div class="brand"><span class="dot"></span> QUALITY RADAR</div>
+    <div class="brand-sub">AS 접수 이상징후 분석 시스템</div>
+
+    <h6>🌐 공유 백업 자동 불러오기</h6>
+    <input type="text" id="autoFetchPath" placeholder="quality_radar_shared_backup.json">
+    <div style="display:flex; gap:6px; margin-bottom:6px;">
+      <button id="btnAutoFetchNow" class="btn-reset" style="width:auto; flex:1; padding:6px 8px; font-size:.75rem;">지금 새로고침</button>
+    </div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:.74rem; color:#9FB0C4; cursor:pointer; margin-bottom:6px;">
+      <input type="checkbox" id="autoFetchEnabled" checked>
+      열 때마다 이 경로에서 자동으로 불러오기
+    </label>
+    <div id="autoFetchStatus" class="mono" style="font-size:.68rem; color:#7C90A8; margin-bottom:18px; line-height:1.5; word-break:break-all;"></div>
+
+    <h6>🎯 추적 모델 (전체 분석 범위)</h6>
+    <div id="trackedModelChips" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;"></div>
+    <div style="display:flex; gap:6px; margin-bottom:6px;">
+      <input type="text" id="trackedModelInput" placeholder="모델명 입력 후 추가 (쉼표로 여러개)" style="flex:1; margin-bottom:0;">
+      <button id="btnAddTrackedModel" style="background:var(--accent); border:none; color:#04211f; font-weight:700; border-radius:8px; padding:0 12px; font-size:.8rem; white-space:nowrap;">+ 추가</button>
+    </div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:.74rem; color:#9FB0C4; cursor:pointer; margin-bottom:8px;">
+      <input type="checkbox" id="trackedModelsActive" checked>
+      이 목록에 있는 모델만 분석 (해제 시 전체 모델 분석)
+    </label>
+    <button id="btnResetTrackedModels" class="btn-reset" style="margin-bottom:18px;">기본 목록으로 초기화</button>
+
+    <h6>🚫 제외 고장코드</h6>
+    <div id="excludedCodeChips" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;"></div>
+    <div style="display:flex; gap:6px; margin-bottom:6px;">
+      <input type="text" id="excludedCodeInput" placeholder="고장코드 입력 후 추가 (쉼표로 여러개)" style="flex:1; margin-bottom:0;">
+      <button id="btnAddExcludedCode" style="background:var(--danger); border:none; color:#fff; font-weight:700; border-radius:8px; padding:0 12px; font-size:.8rem; white-space:nowrap;">+ 제외</button>
+    </div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:.74rem; color:#9FB0C4; cursor:pointer; margin-bottom:18px;">
+      <input type="checkbox" id="excludedCodesActive" checked>
+      이 고장코드가 붙은 건은 분석에서 제외
+    </label>
+
+    <h6>기간</h6>
+    <div class="filter-group">
+      <input type="date" id="f_dateFrom">
+      <input type="date" id="f_dateTo">
+    </div>
+
+    <h6>모델</h6>
+    <select id="f_model" multiple></select>
+
+    <h6>접수처</h6>
+    <select id="f_center" multiple></select>
+
+    <h6>유무상구분</h6>
+    <select id="f_warranty" multiple></select>
+
+    <h6>고장코드</h6>
+    <select id="f_faultcode" multiple></select>
+
+    <h6>불량명</h6>
+    <select id="f_defect" multiple></select>
+
+    <h6>엔지니어</h6>
+    <select id="f_engineer" multiple></select>
+
+    <h6>OS버전</h6>
+    <select id="f_os" multiple></select>
+
+    <h6>INAVI버전</h6>
+    <select id="f_inavi" multiple></select>
+
+    <h6>지도버전</h6>
+    <select id="f_map" multiple></select>
+
+    <h6>재현여부</h6>
+    <select id="f_repro" multiple></select>
+
+    <h6>회수여부</h6>
+    <select id="f_recall" multiple></select>
+
+    <button class="btn-apply" id="btnApplyFilters">필터 적용</button>
+    <button class="btn-reset" id="btnResetFilters">필터 초기화</button>
+  </aside>
+
+  <!-- ===================== MAIN ===================== -->
+  <main id="main">
+
+    <div class="topbar">
+      <div class="title">모델별 주간 품질 이상징후 Dashboard
+        <span class="sub">MARKET QUALITY · WEEKLY ANOMALY DETECTION</span>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span id="fileMeta" class="mono" style="font-size:.78rem; color:var(--ink-soft);"></span>
+        <button class="theme-toggle" id="themeToggle">🌙 Dark Mode</button>
+      </div>
+    </div>
+
+    <!-- Upload zone -->
+    <div id="uploadZone">
+      <div class="up-title">📁 AS 접수 데이터 업로드 (CSV / XLSX)</div>
+      <div class="up-sub">이번 주 신규 접수분만 올려도 됩니다 — 기존 누적 데이터에 자동으로 합쳐집니다</div>
+      <div class="up-sub" style="margin-top:2px;">🔒 AS사이트 원본 양식 그대로 올려도 됩니다 — 고객명·휴대번호·고객ID·실소유자명/휴대전화/주소·주소·송장번호·차량번호·차대번호는 업로드 즉시 자동으로 제거되고 저장되지 않습니다</div>
+      <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" class="hidden">
+    </div>
+
+    <div id="uploadOptions" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin:-8px 0 18px; font-size:.8rem; color:var(--ink-soft);">
+      <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+        <input type="checkbox" id="mergeToggle" checked>
+        기존 누적 데이터에 자동 병합 (해제 시 이번 파일로 전체 교체)
+      </label>
+      <div style="display:flex; gap:8px;">
+        <button class="btn-reset" id="btnBackup" style="width:auto; padding:6px 12px;">⬇ 누적 데이터 백업(JSON)</button>
+        <button class="btn-reset" id="btnRestore" style="width:auto; padding:6px 12px;">⬆ 백업 불러오기</button>
+        <button class="btn-reset" id="btnClearAccum" style="width:auto; padding:6px 12px; color:#C0392B; border-color:#C0392B;">🗑 누적 데이터 초기화</button>
+        <input type="file" id="restoreInput" accept=".json" class="hidden">
+      </div>
+    </div>
+
+    <div id="accumBar" class="hidden mono" style="font-size:.78rem; color:var(--ink-soft); background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px 14px; margin:-8px 0 18px;"></div>
+
+    <div id="emptyState">
+      <div class="big">📊</div>
+      데이터를 업로드하면 대시보드가 자동으로 생성됩니다.<br>
+      <span style="font-size:.8rem;">매주 신규 접수분을 계속 올리면 이 브라우저에 누적 저장되어, 시간이 지날수록 모델별 이상징후를 더 정확히 잡아냅니다.</span>
+    </div>
+
+    <div id="dashboardRoot" class="hidden">
+
+      <!-- AI Insight Terminal -->
+      <div id="aiInsight">
+        <div class="term-head"><span class="b"></span> AI INSIGHT ENGINE — AUTO-GENERATED ANALYSIS</div>
+        <div id="aiInsightBody"></div>
+      </div>
+
+      <!-- KPI -->
+      <div class="kpi-grid" id="kpiGrid"></div>
+
+      <!-- Tabs -->
+      <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active" data-tab="tab-overview">전체 개요</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="tab-weekly">주별 개요</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="tab-monthly">월별 개요</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="tab-model">모델 상세 분석</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="tab-anomaly">이상징후 &amp; 타임라인</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="tab-table">데이터 테이블</button></li>
+      </ul>
+
+      <!-- ============ TAB: OVERVIEW (전체 기간 개요) ============ -->
+      <div class="tab-pane" id="tab-overview" style="margin-top:16px;">
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">②</span> 모델별 접수 TOP10</h5>
+              <div class="chart-wrap"><canvas id="chartModelTop10"></canvas></div></div>
+          </div>
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">④</span> 고장코드 TOP20</h5>
+              <div class="chart-wrap"><canvas id="chartFaultcodeTop20"></canvas></div></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">⑬</span> 유무상 비율</h5>
+              <div class="chart-wrap"><canvas id="chartWarrantyPie"></canvas></div></div>
+          </div>
+        </div>
+
+        <div class="qcard">
+          <h5><span class="idx">⑤</span> HeatMap — 모델 × 고장코드 발생건수</h5>
+          <div class="heatmap-scroll"><table class="heatmap" id="heatmapTable"></table></div>
+        </div>
+
+        <div class="qcard">
+          <h5><span class="idx">⑦</span> Pareto Chart — 고장코드 기준</h5>
+          <div class="chart-wrap tall"><canvas id="chartPareto"></canvas></div>
+        </div>
+
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">⑧</span> 제조월별 발생 (제조번호 추출)</h5>
+              <div class="chart-wrap"><canvas id="chartManufMonth"></canvas></div></div>
+          </div>
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">⑫</span> 접수처별 발생</h5>
+              <div class="chart-wrap"><canvas id="chartCenter"></canvas></div></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="qcard"><h5><span class="idx">⑨</span> OS버전 영향</h5>
+              <div class="chart-wrap"><canvas id="chartOS"></canvas></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ TAB: WEEKLY OVERVIEW (주별 개요) ============ -->
+      <div class="tab-pane hidden" id="tab-weekly" style="margin-top:16px;">
+        <div class="qcard">
+          <h5><span class="idx">①</span> 주별 접수 추이 (전체 기간)</h5>
+          <div class="chart-wrap tall"><canvas id="chartWeeklyTrend"></canvas></div>
+        </div>
+
+        <div class="qcard">
+          <h5><span class="idx">⑥</span> 누적 불량 Trend (Stacked Area, 상위 모델)</h5>
+          <div class="chart-wrap tall"><canvas id="chartStackedArea"></canvas></div>
+        </div>
+
+        <div class="model-select-row">
+          <label class="mono" style="font-size:.82rem; color:var(--ink-soft);">주차 선택:</label>
+          <select id="weeklyOverviewSelect"></select>
+          <span id="weeklyKpiChip" class="mono" style="font-size:.8rem; color:var(--ink-soft);"></span>
+        </div>
+
+        <div id="weeklyOverviewBody"></div>
+      </div>
+
+      <!-- ============ TAB: MONTHLY OVERVIEW (월별 개요) ============ -->
+      <div class="tab-pane hidden" id="tab-monthly" style="margin-top:16px;">
+        <div class="qcard">
+          <h5>월별 접수 추이 (전체 기간)</h5>
+          <div class="chart-wrap tall"><canvas id="chartMonthlyTrend"></canvas></div>
+        </div>
+
+        <div class="model-select-row">
+          <label class="mono" style="font-size:.82rem; color:var(--ink-soft);">월 선택:</label>
+          <select id="monthlyOverviewSelect"></select>
+          <span id="monthlyKpiChip" class="mono" style="font-size:.8rem; color:var(--ink-soft);"></span>
+        </div>
+
+        <div id="monthlyOverviewBody"></div>
+      </div>
+
+      <!-- ============ TAB: MODEL DETAIL ============ -->
+      <div class="tab-pane hidden" id="tab-model" style="margin-top:16px;">
+        <div class="model-select-row">
+          <label class="mono" style="font-size:.82rem; color:var(--ink-soft);">모델 선택:</label>
+          <select id="modelDetailSelect"></select>
+          <span id="modelQiChip"></span>
+        </div>
+        <div id="modelAnomalySummary" style="margin-bottom:16px;"></div>
+        <div id="modelDetailBody"></div>
+      </div>
+
+      <!-- ============ TAB: ANOMALY ============ -->
+      <div class="tab-pane hidden" id="tab-anomaly" style="margin-top:16px;">
+        <div class="qcard">
+          <h5>🚨 자동 감지된 이상징후</h5>
+          <div id="anomalyList" style="font-size:.82rem;"></div>
+        </div>
+        <div class="qcard">
+          <h5>🕒 품질 이슈 타임라인</h5>
+          <div id="timelineList"></div>
+        </div>
+      </div>
+
+      <!-- ============ TAB: TABLE ============ -->
+      <div class="tab-pane hidden" id="tab-table" style="margin-top:16px;">
+        <div class="qcard">
+          <h5>🔍 통합 검색</h5>
+          <div class="search-grid">
+            <input type="text" id="s_model" placeholder="모델 검색">
+            <input type="text" id="s_defect" placeholder="불량 검색">
+            <input type="text" id="s_faultcode" placeholder="고장코드 검색">
+            <input type="text" id="s_receipt" placeholder="접수번호 검색">
+            <input type="text" id="s_engineer" placeholder="엔지니어 검색">
+          </div>
+          <div class="table-responsive">
+            <table id="mainTable" class="display" style="width:100%"></table>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /dashboardRoot -->
+  </main>
+</div>
+
+<script>
+/* =========================================================================
+   QUALITY RADAR — 모델별 주간 품질 이상징후 Dashboard
+   전체 로직: 업로드 → 전처리 → 집계 → 차트 → 이상징후 탐지 → AI Insight
+   ========================================================================= */
+
+/* ------------------------- 전역 상태 (Global State) ------------------------- */
+const state = {
+  raw: [],          // 원본 파싱 데이터
+  data: [],         // 전처리 완료 데이터
+  filtered: [],     // 필터 적용된 데이터 (모든 렌더링은 이 배열 기준)
+  weekList: [],     // 정렬된 전체 주(week) 목록 [{key,label,year,week}]
+  monthList: [],    // 정렬된 전체 월(month) 목록 [{key,label,year,month}]
+  charts: {},       // Chart.js 인스턴스 저장소
+  dataTable: null,
+  anomalies: [],
+  theme: 'light',
+  accumulatedRaw: [],  // 현재 세션 기준 '진짜' 누적 원본(정제된) 데이터 — 병합의 기준(source of truth)
+  tableDirty: true,    // 데이터 테이블 탭을 열 때만 다시 그리기 위한 플래그
+  trackedModels: [],       // 추적(분석 대상) 모델 화이트리스트 — 정규화된 모델명
+  trackedModelsActive: true, // 추적 목록만 분석에 포함할지 여부
+  excludedFaultCodes: [],      // 제외할 고장코드 블랙리스트 — 정규화된 코드
+  excludedFaultCodesActive: true // 블랙리스트 제외 기능 on/off
+};
+
+const FIELD = {
+  DATE: '접수일', MODEL: '모델명', DEFECT: '불량명', FAULTCODE: '고장코드',
+  OS: 'OS버전', INAVI: 'INAVI버전', MAPVER: '지도버전', CENTER: '접수처',
+  WARRANTY: '유무상구분', ENGINEER: '엔지니어', SERIAL: '제조번호',
+  REPRO: '재현여부', RECALL: '회수여부', RECEIPT: '접수번호',
+  SYMPTOM: '고장증상', PAYCODE: '처리코드', PAYCODE_LABOR: '처리코드(공임)', AMOUNT: '결제금액'
+};
+
+// 매주 신규 업로드분을 이 브라우저(localStorage)에 계속 누적 저장하기 위한 키
+const STORAGE_KEY = 'quality_radar_accumulated_v1';
+
+// 추적 모델(분석 범위) 화이트리스트 저장 키 + 기본값
+const STORAGE_KEY_MODELS = 'quality_radar_tracked_models_v1';
+const DEFAULT_TRACKED_MODELS_RAW = ['IB VX3000','IB QX100','IB QXD2','IB ZX3000','IB FXD9000','IB V1000 Lite','IB Z1','IB Quantum4','IB QXD9900 MINI'];
+
+function loadTrackedModelConfig(){
+  try{
+    const s = localStorage.getItem(STORAGE_KEY_MODELS);
+    if(s === null) return { active:true, models: DEFAULT_TRACKED_MODELS_RAW.map(normalizeModel) };
+    const obj = JSON.parse(s);
+    return {
+      active: obj.active !== undefined ? !!obj.active : true,
+      models: Array.isArray(obj.models) ? obj.models : DEFAULT_TRACKED_MODELS_RAW.map(normalizeModel)
+    };
+  }catch(e){
+    console.warn('추적 모델 설정 로드 실패', e);
+    return { active:true, models: DEFAULT_TRACKED_MODELS_RAW.map(normalizeModel) };
+  }
+}
+
+function saveTrackedModelConfig(){
+  try{
+    localStorage.setItem(STORAGE_KEY_MODELS, JSON.stringify({ active: state.trackedModelsActive, models: state.trackedModels }));
+  }catch(e){ console.warn('추적 모델 설정 저장 실패', e); }
+}
+
+function renderTrackedModelChips(){
+  const wrap = document.getElementById('trackedModelChips');
+  if(!wrap) return;
+  if(!state.trackedModels.length){
+    wrap.innerHTML = `<span style="font-size:.72rem; color:#7C90A8;">등록된 모델이 없습니다 (현재 전체 모델 분석 중)</span>`;
+    return;
+  }
+  wrap.innerHTML = state.trackedModels.map(m => `
+    <span style="display:inline-flex; align-items:center; gap:5px; background:#132A2A; border:1px solid #1E3D3D; color:#8FF7D8; border-radius:14px; padding:3px 8px 3px 10px; font-size:.72rem; font-family:var(--font-mono);">
+      ${escapeHtml(m)}
+      <button data-model="${escapeHtml(m)}" class="chip-remove" title="목록에서 제거" style="background:none;border:none;color:#5B8B86;cursor:pointer;font-size:.85rem;line-height:1;padding:0;">×</button>
+    </span>
+  `).join('');
+  wrap.querySelectorAll('.chip-remove').forEach(btn=>{
+    btn.addEventListener('click', () => removeTrackedModel(btn.dataset.model));
+  });
+}
+
+// 이미 쌓여있는 누적 원본 데이터가 있으면, 바뀐 추적 모델 목록 기준으로 즉시 다시 집계한다
+function reapplyTrackedModelsToData(){
+  if(!state.accumulatedRaw.length) return;
+  showLoading('추적 모델 기준으로 다시 집계하는 중입니다…');
+  setTimeout(() => {
+    loadDataset(state.accumulatedRaw);
+    renderAccumBar();
+    hideLoading();
+  }, 20);
+}
+
+function addTrackedModelsFromInput(){
+  const input = document.getElementById('trackedModelInput');
+  const raw = input.value;
+  if(!raw.trim()) return;
+  const parts = raw.split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
+  let addedAny = false;
+  parts.forEach(p => {
+    const name = normalizeModel(p);
+    if(name && name !== '(모델명 없음)' && !state.trackedModels.includes(name)){
+      state.trackedModels.push(name);
+      addedAny = true;
+    }
+  });
+  input.value = '';
+  if(!addedAny) return;
+  saveTrackedModelConfig();
+  renderTrackedModelChips();
+  reapplyTrackedModelsToData();
+}
+
+function removeTrackedModel(name){
+  state.trackedModels = state.trackedModels.filter(m => m !== name);
+  saveTrackedModelConfig();
+  renderTrackedModelChips();
+  reapplyTrackedModelsToData();
+}
+
+function setupTrackedModelControls(){
+  document.getElementById('btnAddTrackedModel').addEventListener('click', addTrackedModelsFromInput);
+  document.getElementById('trackedModelInput').addEventListener('keydown', e => {
+    if(e.key === 'Enter'){ e.preventDefault(); addTrackedModelsFromInput(); }
+  });
+  document.getElementById('trackedModelsActive').addEventListener('change', e => {
+    state.trackedModelsActive = e.target.checked;
+    saveTrackedModelConfig();
+    reapplyTrackedModelsToData();
+  });
+  document.getElementById('btnResetTrackedModels').addEventListener('click', () => {
+    if(!confirm('추적 모델 목록을 기본값(IB 접두사가 붙은 9개 모델)으로 초기화할까요?')) return;
+    state.trackedModels = DEFAULT_TRACKED_MODELS_RAW.map(normalizeModel);
+    state.trackedModelsActive = true;
+    document.getElementById('trackedModelsActive').checked = true;
+    saveTrackedModelConfig();
+    renderTrackedModelChips();
+    reapplyTrackedModelsToData();
+  });
+}
+
+/* ------------------------------------------------------------------------
+   제외 고장코드 (Excluded Fault Codes)
+   - 실제 데이터에는 "지정점-매장관리>판매이력관리" 처럼 실제 불량이 아니라
+     매장/판매 관리 시스템에서 흘러들어온 값이 고장코드에 섞여있는 경우가 있다.
+   - 추적 모델과 동일한 방식(화이트리스트 대신 블랙리스트)으로, 업로드 시 자동 제외한다.
+   ------------------------------------------------------------------------ */
+const STORAGE_KEY_EXCLUDED_CODES = 'quality_radar_excluded_faultcodes_v1';
+const DEFAULT_EXCLUDED_FAULTCODES_RAW = ['지정점-매장관리>판매이력관리'];
+
+function loadExcludedFaultCodeConfig(){
+  try{
+    const s = localStorage.getItem(STORAGE_KEY_EXCLUDED_CODES);
+    if(s === null) return { active:true, codes: DEFAULT_EXCLUDED_FAULTCODES_RAW.map(normalizeCode) };
+    const obj = JSON.parse(s);
+    return {
+      active: obj.active !== undefined ? !!obj.active : true,
+      codes: Array.isArray(obj.codes) ? obj.codes : DEFAULT_EXCLUDED_FAULTCODES_RAW.map(normalizeCode)
+    };
+  }catch(e){
+    console.warn('제외 고장코드 설정 로드 실패', e);
+    return { active:true, codes: DEFAULT_EXCLUDED_FAULTCODES_RAW.map(normalizeCode) };
+  }
+}
+
+function saveExcludedFaultCodeConfig(){
+  try{
+    localStorage.setItem(STORAGE_KEY_EXCLUDED_CODES, JSON.stringify({ active: state.excludedFaultCodesActive, codes: state.excludedFaultCodes }));
+  }catch(e){ console.warn('제외 고장코드 설정 저장 실패', e); }
+}
+
+function renderExcludedCodeChips(){
+  const wrap = document.getElementById('excludedCodeChips');
+  if(!wrap) return;
+  if(!state.excludedFaultCodes.length){
+    wrap.innerHTML = `<span style="font-size:.72rem; color:#7C90A8;">제외 설정된 고장코드가 없습니다</span>`;
+    return;
+  }
+  wrap.innerHTML = state.excludedFaultCodes.map(c => `
+    <span style="display:inline-flex; align-items:center; gap:5px; background:#3A1416; border:1px solid #522024; color:#FF9A9E; border-radius:14px; padding:3px 8px 3px 10px; font-size:.72rem; font-family:var(--font-mono);">
+      ${escapeHtml(c)}
+      <button data-code="${escapeHtml(c)}" class="chip-remove-code" title="목록에서 제거" style="background:none;border:none;color:#C97176;cursor:pointer;font-size:.85rem;line-height:1;padding:0;">×</button>
+    </span>
+  `).join('');
+  wrap.querySelectorAll('.chip-remove-code').forEach(btn=>{
+    btn.addEventListener('click', () => removeExcludedCode(btn.dataset.code));
+  });
+}
+
+function addExcludedCodesFromInput(){
+  const input = document.getElementById('excludedCodeInput');
+  const raw = input.value;
+  if(!raw.trim()) return;
+  const parts = raw.split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
+  let addedAny = false;
+  parts.forEach(p => {
+    const code = normalizeCode(p);
+    if(code && !state.excludedFaultCodes.includes(code)){
+      state.excludedFaultCodes.push(code);
+      addedAny = true;
+    }
+  });
+  input.value = '';
+  if(!addedAny) return;
+  saveExcludedFaultCodeConfig();
+  renderExcludedCodeChips();
+  reapplyTrackedModelsToData();
+}
+
+function removeExcludedCode(code){
+  state.excludedFaultCodes = state.excludedFaultCodes.filter(c => c !== code);
+  saveExcludedFaultCodeConfig();
+  renderExcludedCodeChips();
+  reapplyTrackedModelsToData();
+}
+
+function setupExcludedCodeControls(){
+  document.getElementById('btnAddExcludedCode').addEventListener('click', addExcludedCodesFromInput);
+  document.getElementById('excludedCodeInput').addEventListener('keydown', e => {
+    if(e.key === 'Enter'){ e.preventDefault(); addExcludedCodesFromInput(); }
+  });
+  document.getElementById('excludedCodesActive').addEventListener('change', e => {
+    state.excludedFaultCodesActive = e.target.checked;
+    saveExcludedFaultCodeConfig();
+    reapplyTrackedModelsToData();
+  });
+}
+
+/* ------------------------------------------------------------------------
+   공유 백업 자동 불러오기
+   - 이 HTML을 부서 서버 등 http(s)로 호스팅해두고, 담당자가 정해진 파일명으로
+     같은 위치에 백업 JSON을 올려두면, 대시보드를 열 때 자동으로 그 데이터를 불러온다.
+   - file://로 직접 열었을 때는 브라우저 보안 정책상 fetch가 막히는 경우가 많아
+     동작하지 않을 수 있다(그럴 땐 조용히 실패하고 기존 방식으로 넘어간다).
+   ------------------------------------------------------------------------ */
+const STORAGE_KEY_AUTOFETCH = 'quality_radar_autofetch_config_v1';
+const DEFAULT_AUTOFETCH_PATH = 'quality_radar_shared_backup.json';
+
+function loadAutoFetchConfig(){
+  try{
+    const s = localStorage.getItem(STORAGE_KEY_AUTOFETCH);
+    if(!s) return { path: DEFAULT_AUTOFETCH_PATH, enabled: true };
+    const obj = JSON.parse(s);
+    return {
+      path: obj.path || DEFAULT_AUTOFETCH_PATH,
+      enabled: obj.enabled !== false
+    };
+  }catch(e){ return { path: DEFAULT_AUTOFETCH_PATH, enabled: true }; }
+}
+
+function saveAutoFetchConfig(){
+  try{
+    localStorage.setItem(STORAGE_KEY_AUTOFETCH, JSON.stringify({
+      path: document.getElementById('autoFetchPath').value.trim() || DEFAULT_AUTOFETCH_PATH,
+      enabled: document.getElementById('autoFetchEnabled').checked
+    }));
+  }catch(e){ console.warn('자동 불러오기 설정 저장 실패', e); }
+}
+
+function setAutoFetchStatus(msg, isError){
+  const el = document.getElementById('autoFetchStatus');
+  if(!el) return;
+  el.textContent = msg;
+  el.style.color = isError ? '#C97176' : '#7FE0AC';
+}
+
+// 성공하면 true, 실패(파일 없음/비활성/file://에서 막힘 등)하면 false를 반환한다
+async function tryAutoFetchSharedBackup(){
+  const cfg = loadAutoFetchConfig();
+  document.getElementById('autoFetchPath').value = cfg.path;
+  document.getElementById('autoFetchEnabled').checked = cfg.enabled;
+
+  if(!cfg.enabled || !cfg.path){
+    setAutoFetchStatus('자동 불러오기가 꺼져 있습니다.');
+    return false;
+  }
+
+  setAutoFetchStatus('공유 백업 확인 중…');
+  try{
+    const res = await fetch(cfg.path, { cache:'no-store' });
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if(!Array.isArray(json)) throw new Error('배열 형식이 아닙니다');
+    if(!json.length){
+      setAutoFetchStatus('공유 백업 파일은 있지만 비어있습니다.');
+      return false;
+    }
+    state.accumulatedRaw = json.map(cleanRawRow);
+    saveAccumulatedRaw(state.accumulatedRaw); // 오프라인 대비 이 브라우저에도 캐시
+    const ok = loadDataset(state.accumulatedRaw);
+    if(ok){
+      document.getElementById('fileMeta').textContent = '🌐 공유 백업에서 자동으로 불러왔습니다';
+      renderAccumBar(`공유 백업 자동 로드 (총 ${state.accumulatedRaw.length.toLocaleString()}건)`);
+    }
+    setAutoFetchStatus(`✅ 공유 백업 불러옴 (${json.length.toLocaleString()}건, ${new Date().toLocaleTimeString('ko-KR')} 기준)`);
+    return true;
+  }catch(err){
+    setAutoFetchStatus('공유 백업을 찾지 못했습니다 (' + err.message + ') — 담당자가 아직 안 올렸거나, 로컬 파일(file://)로 열어서 그럴 수 있어요.', true);
+    return false;
+  }
+}
+
+function setupAutoFetchControls(){
+  document.getElementById('btnAutoFetchNow').addEventListener('click', () => {
+    saveAutoFetchConfig();
+    tryAutoFetchSharedBackup();
+  });
+  document.getElementById('autoFetchPath').addEventListener('change', saveAutoFetchConfig);
+  document.getElementById('autoFetchEnabled').addEventListener('change', saveAutoFetchConfig);
+}
+
+// 대시보드에 데이터를 미리 넣어서 배포하고 싶을 때 쓰는 사전 임베딩 슬롯.
+// 형식: {cols:[...헤더...], rows:[[값1,값2,...], ...]}  — 객체 반복보다 훨씬 가벼움.
+// 비워두면(cols/rows가 없으면) 평소처럼 업로드로만 데이터를 채운다.
+const EMBEDDED_DATASET = {cols: [], rows: []};
+
+function hydrateEmbeddedDataset(){
+  if(!EMBEDDED_DATASET || !EMBEDDED_DATASET.cols || !EMBEDDED_DATASET.cols.length) return [];
+  const cols = EMBEDDED_DATASET.cols;
+  return EMBEDDED_DATASET.rows.map(rowArr => {
+    const obj = {};
+    cols.forEach((c,i) => { obj[c] = rowArr[i]; });
+    return obj;
+  });
+}
+
+/* ========================================================================
+   0. 로딩 오버레이 (대용량 처리 중 "응답없음"처럼 보이지 않도록)
+   ======================================================================== */
+function showLoading(msg){
+  let el = document.getElementById('loadingOverlay');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'loadingOverlay';
+    el.innerHTML = `<div class="lo-box"><div class="lo-spinner"></div><div class="lo-msg"></div></div>`;
+    document.body.appendChild(el);
+  }
+  el.querySelector('.lo-msg').textContent = msg || '처리 중입니다…';
+  el.classList.add('show');
+}
+function hideLoading(){
+  const el = document.getElementById('loadingOverlay');
+  if(el) el.classList.remove('show');
+}
+
+/* ========================================================================
+   1. 파일 업로드 (Drag & Drop / Click)
+   ======================================================================== */
+function setupUpload(){
+  const zone = document.getElementById('uploadZone');
+  const input = document.getElementById('fileInput');
+
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('dragover');
+    if(e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  });
+  input.addEventListener('change', e => {
+    if(e.target.files.length) handleFile(e.target.files[0]);
+  });
+}
+
+// AS사이트 원본 엑셀은 실제 컬럼명(접수번호/접수일/모델명...) 위에 제목 줄
+// ("AS현황목록_AS부설정" 같은)이 한 줄 더 있는 경우가 있다. 그걸 그대로 헤더로
+// 읽어버리면 접수일 등 모든 컬럼을 못 찾아서 데이터가 통째로 비게 된다.
+// 그래서 처음 몇 줄을 훑어 실제 헤더가 있는 줄을 찾아낸 뒤, 그 줄부터 다시 표를 구성한다.
+const KNOWN_HEADER_HINTS = ['접수번호','접수일','모델명','고장코드','불량명','접수처','엔지니어','고장증상'];
+
+function rowsFromGrid(rows2D){
+  if(!rows2D || !rows2D.length) return [];
+  let headerRowIdx = 0;
+  const scanLimit = Math.min(rows2D.length, 10);
+  for(let i=0; i<scanLimit; i++){
+    const rowVals = (rows2D[i]||[]).map(v=>trimVal(v));
+    const matchCount = KNOWN_HEADER_HINTS.filter(h=>rowVals.includes(h)).length;
+    if(matchCount >= 2){ headerRowIdx = i; break; }
+  }
+  const headers = (rows2D[headerRowIdx]||[]).map(h=>trimVal(h));
+  const dataRows = rows2D.slice(headerRowIdx+1);
+  return dataRows
+    .map(rowArr => {
+      const obj = {};
+      headers.forEach((h,idx) => { if(h) obj[h] = rowArr[idx]!==undefined ? rowArr[idx] : ''; });
+      return obj;
+    })
+    .filter(obj => Object.values(obj).some(v => trimVal(v) !== ''));
+}
+
+function handleFile(file){
+  const name = file.name.toLowerCase();
+  document.getElementById('fileMeta').textContent = `📄 ${file.name}`;
+  showLoading('파일을 읽는 중입니다…');
+
+  if(name.endsWith('.csv')){
+    Papa.parse(file, {
+      header:false, skipEmptyLines:true, dynamicTyping:false, worker:true,
+      complete: res => onNewFileParsed(rowsFromGrid(res.data)),
+      error: err => { hideLoading(); alert('CSV 파싱 오류: ' + err.message); }
+    });
+  } else if(name.endsWith('.xlsx') || name.endsWith('.xls')){
+    const reader = new FileReader();
+    reader.onload = e => {
+      try{
+        const wb = XLSX.read(e.target.result, {type:'array'});
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows2D = XLSX.utils.sheet_to_json(ws, {header:1, defval:'', raw:false});
+        onNewFileParsed(rowsFromGrid(rows2D));
+      }catch(err){ hideLoading(); alert('XLSX 파싱 오류: ' + err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    hideLoading();
+    alert('CSV 또는 XLSX 파일만 지원합니다.');
+  }
+}
+
+/* ========================================================================
+   2. 전처리 (Preprocessing)
+   ======================================================================== */
+function trimVal(v){
+  if(v===null || v===undefined) return '';
+  return String(v).trim().replace(/\s+/g,' ');
+}
+
+function normalizeModel(v){
+  let s = trimVal(v).toUpperCase();
+  s = s.replace(/[-_]+/g,'-');
+  return s || '(모델명 없음)';
+}
+
+function normalizeDefect(v){
+  let s = trimVal(v);
+  return s || '(불량명 없음)';
+}
+
+function normalizeCode(v){
+  return trimVal(v).replace(/\s+/g,'').toUpperCase();
+}
+
+function parseDateFlexible(v){
+  if(!v) return null;
+  let s = trimVal(v);
+  if(!s) return null;
+  // 엑셀 시리얼 넘버 처리
+  if(/^\d+(\.\d+)?$/.test(s) && Number(s) > 20000 && Number(s) < 60000){
+    const d = XLSX.SSF ? XLSX.SSF.parse_date_code(Number(s)) : null;
+    if(d) return new Date(d.y, d.m-1, d.d);
+  }
+  s = s.replace(/[.\/]/g,'-');
+  let d = new Date(s);
+  if(!isNaN(d.getTime())) return d;
+  // YYYYMMDD
+  let m = s.match(/^(\d{4})-?(\d{2})-?(\d{2})/);
+  if(m){
+    d = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]));
+    if(!isNaN(d.getTime())) return d;
+  }
+  return null;
+}
+
+// ISO 8601 주차 계산
+function getISOWeek(date){
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  const fThDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - fThDayNum + 3);
+  const week = 1 + Math.round((d - firstThursday) / (7*86400000));
+  return { isoYear: d.getUTCFullYear(), isoWeek: week };
+}
+
+function weekKeyOf(isoYear, isoWeek){
+  return isoYear + '-W' + String(isoWeek).padStart(2,'0');
+}
+
+// 화면 표시용 주차 라벨: "2026년 5주차"(ISO 주차) 대신 "2026년 2월 1주차"(그 주의 월요일이 속한 달 기준 몇 번째 주)로 표기
+function computeWeekLabel(date){
+  const day = (date.getDay() + 6) % 7; // 0=월요일 ... 6=일요일
+  const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate() - day);
+  const year = monday.getFullYear();
+  const month = monday.getMonth(); // 0-indexed
+
+  const firstOfMonth = new Date(year, month, 1);
+  const firstDow = (firstOfMonth.getDay() + 6) % 7;
+  const firstMonday = new Date(year, month, 1 - firstDow);
+  const weekOfMonth = Math.round((monday - firstMonday) / (7*86400000)) + 1;
+
+  return `${year}년 ${month+1}월 ${weekOfMonth}주차`;
+}
+
+// 제조번호 인코딩 규칙: 7번째 글자=생산년(P=2024,Q=2025,R=2026,S=2027 …), 8번째 글자=생산월(1~9=1~9월, O=10월, N=11월, D=12월)
+const MANUF_YEAR_BASE_CHAR = 'P';
+const MANUF_YEAR_BASE_YEAR = 2024;
+const MANUF_MONTH_CODE_MAP = {'1':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'O':10,'N':11,'D':12};
+
+function extractManufMonth(serial){
+  if(!serial) return null;
+  const s = String(serial).trim();
+  if(s.length < 8) return null;
+
+  const yearChar = s.charAt(6).toUpperCase();  // 7번째 글자
+  const monthChar = s.charAt(7).toUpperCase(); // 8번째 글자
+
+  const yearOffset = yearChar.charCodeAt(0) - MANUF_YEAR_BASE_CHAR.charCodeAt(0);
+  const year = MANUF_YEAR_BASE_YEAR + yearOffset;
+  if(year < 2015 || year > 2035) return null; // 인코딩 규칙에서 벗어난 값(오탐) 방지
+
+  const month = MANUF_MONTH_CODE_MAP[monthChar];
+  if(!month) return null;
+
+  return year + '-' + String(month).padStart(2,'0');
+}
+
+// '--', '.', '-' 처럼 실질적으로 값이 없는 표기를 "(미기재)"와 동일하게 취급
+function isBlankLikeVersion(v){
+  const s = trimVal(v);
+  if(!s) return true;
+  if(/^[.\-]+$/.test(s)) return true;
+  return false;
+}
+
+function isYesLike(v){
+  const s = trimVal(v).toUpperCase();
+  return ['Y','YES','O','유','있음','TRUE','1','재현','회수'].some(t => s===t) || s.includes('유') || s.includes('Y');
+}
+
+// 개인정보(고객정보) 컬럼 — 업로드된 원본에 이 컬럼들이 있어도 여기서 걸러진 이후로는
+// 메모리·누적저장(localStorage)·백업(JSON) 그 어디에도 절대 남지 않는다.
+const PII_COLUMNS_TO_STRIP = [
+  '고객명','휴대번호','고객ID','실소유자명','실소유자휴대전화','실소유자주소',
+  '주소','송장번호','차량번호','차대번호'
+];
+
+// 원본 행의 key/value 공백 정리 + 개인정보 컬럼 제거 (누적 저장 시에도 이 정제된 형태를 저장)
+function cleanRawRow(row){
+  const out = {};
+  for(const k in row){
+    if(!k) continue;
+    const key = trimVal(k);
+    if(PII_COLUMNS_TO_STRIP.includes(key)) continue; // 개인정보 컬럼은 아예 담지 않음
+    out[key] = trimVal(row[k]);
+  }
+  return out;
+}
+
+function preprocessRow(rawRow){
+  const cleaned = cleanRawRow(rawRow);
+  const dateRaw = cleaned[FIELD.DATE];
+  const d = parseDateFlexible(dateRaw);
+  if(!d) return null; // 날짜 오류 자동 제외
+
+  const {isoYear, isoWeek} = getISOWeek(d);
+  const wk = weekKeyOf(isoYear, isoWeek);
+
+  const out = Object.assign({}, cleaned);
+
+  out['__date'] = d;
+  out['__year'] = isoYear;
+  out['__isoWeek'] = isoWeek;
+  out['__weekKey'] = wk;
+  out['__weekLabel'] = computeWeekLabel(d);
+  out['__monthYear'] = d.getFullYear();
+  out['__monthNum'] = d.getMonth() + 1;
+  out['__monthKey'] = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+  out['__monthLabel'] = `${d.getFullYear()}년 ${d.getMonth()+1}월`;
+
+  out[FIELD.MODEL] = normalizeModel(out[FIELD.MODEL]);
+  out[FIELD.DEFECT] = normalizeDefect(out[FIELD.DEFECT] || out[FIELD.SYMPTOM] || out['상세증상(고객)']);
+  out[FIELD.FAULTCODE] = normalizeCode(out[FIELD.FAULTCODE]) || '(미기재)';
+  out[FIELD.OS] = isBlankLikeVersion(out[FIELD.OS]) ? '(미기재)' : trimVal(out[FIELD.OS]);
+  out[FIELD.INAVI] = isBlankLikeVersion(out[FIELD.INAVI]) ? '(미기재)' : trimVal(out[FIELD.INAVI]);
+  out[FIELD.MAPVER] = isBlankLikeVersion(out[FIELD.MAPVER]) ? '(미기재)' : trimVal(out[FIELD.MAPVER]);
+  out[FIELD.CENTER] = trimVal(out[FIELD.CENTER]) || '(미기재)';
+  out[FIELD.WARRANTY] = trimVal(out[FIELD.WARRANTY]) || '(미기재)';
+  out[FIELD.ENGINEER] = trimVal(out[FIELD.ENGINEER]) || '(미배정)';
+  out['__manufMonth'] = extractManufMonth(out[FIELD.SERIAL]);
+  out['__isRepro'] = isYesLike(out[FIELD.REPRO] || out['증상재현']);
+  out['__isRecall'] = isYesLike(out[FIELD.RECALL]);
+  out['__isPaid'] = trimVal(out[FIELD.WARRANTY]).includes('유상');
+
+  return out;
+}
+
+/* ------------------------------------------------------------------------
+   누적 저장 (Accumulation)
+   - 매주 신규 접수분만 업로드해도, 브라우저(localStorage)에 이전 데이터와
+     합쳐서 계속 쌓아두고, 전체 누적 기준으로 주간 이상징후를 탐지한다.
+   - 고유키: 접수번호가 있으면 접수번호 기준, 없으면 날짜+모델+불량명+연락처
+     조합으로 대체 (같은 키가 다시 올라오면 최신 값으로 갱신 — 진행상태 업데이트 대응).
+   ------------------------------------------------------------------------ */
+function getRowUniqueKey(cleanedRow){
+  const receipt = trimVal(cleanedRow[FIELD.RECEIPT]);
+  if(receipt) return 'R::' + receipt;
+  // 고객명/휴대번호는 개인정보라 이미 제거된 상태이므로, 날짜+모델+고장코드+제조번호 조합으로 대체
+  return ['D', cleanedRow[FIELD.DATE], cleanedRow[FIELD.MODEL], cleanedRow[FIELD.FAULTCODE],
+    cleanedRow[FIELD.SERIAL]||''].join('::');
+}
+
+// 전처리된(preprocessRow 통과) 행 배열에서 접수번호 기준 중복을 제거한다.
+// 같은 접수번호가 여러 번 나오면(파일 자체 중복, 진행상태 갱신 재수록 등) 마지막 값만 남긴다.
+function dedupeByReceiptNo(rows){
+  const seen = new Map();
+  rows.forEach(r => {
+    const receipt = trimVal(r[FIELD.RECEIPT]);
+    const key = receipt
+      ? ('R::' + receipt)
+      : ('D::' + r.__date.getTime() + '::' + r[FIELD.MODEL] + '::' + r[FIELD.FAULTCODE] + '::' + (r[FIELD.SERIAL]||''));
+    seen.set(key, r); // 나중 값으로 덮어써서 최신 데이터를 유지
+  });
+  return Array.from(seen.values());
+}
+
+function loadAccumulatedRaw(){
+  try{
+    const s = localStorage.getItem(STORAGE_KEY);
+    if(!s) return [];
+    const arr = JSON.parse(s);
+    return Array.isArray(arr) ? arr : [];
+  }catch(e){
+    console.warn('누적 데이터 로드 실패', e);
+    return [];
+  }
+}
+
+// 저장은 항상 best-effort. 용량 초과 시 조용히 false를 반환하고, 호출부에서 필요한 만큼만 안내한다.
+function saveAccumulatedRaw(rows){
+  try{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
+    return true;
+  }catch(e){
+    console.warn('누적 데이터 저장 실패(용량 초과 가능성)', e);
+    return false;
+  }
+}
+
+// state.accumulatedRaw(현재 세션의 진짜 누적본)을 기준으로 새 데이터를 병합한다.
+function mergeIntoAccumulated(rawRows){
+  const cleanedNew = rawRows.map(cleanRawRow);
+  const map = new Map();
+  state.accumulatedRaw.forEach(r => map.set(getRowUniqueKey(r), r));
+  let added = 0, updated = 0;
+  cleanedNew.forEach(r => {
+    const k = getRowUniqueKey(r);
+    if(map.has(k)) updated++; else added++;
+    map.set(k, r); // 동일 키가 다시 올라오면 최신 데이터로 덮어씀
+  });
+  const merged = Array.from(map.values());
+  state.accumulatedRaw = merged;
+  const saved = saveAccumulatedRaw(merged);
+  return {merged, added, updated, saved};
+}
+
+function onNewFileParsed(rawRows){
+  if(!rawRows || rawRows.length === 0){
+    hideLoading();
+    alert('파일에서 읽은 데이터가 없습니다.');
+    return;
+  }
+  showLoading(`데이터 ${rawRows.length.toLocaleString()}건을 처리하는 중입니다…`);
+  // 무거운 동기 작업(전처리·집계·차트 렌더링) 전에 로딩 화면이 먼저 그려지도록 한 틱 양보한다
+  setTimeout(() => {
+    const mergeMode = document.getElementById('mergeToggle').checked;
+    let finalRows, added = rawRows.length, updated = 0, saved = true;
+
+    if(mergeMode){
+      const result = mergeIntoAccumulated(rawRows);
+      finalRows = result.merged;
+      added = result.added; updated = result.updated; saved = result.saved;
+    } else {
+      const cleaned = rawRows.map(cleanRawRow);
+      state.accumulatedRaw = cleaned;
+      saved = saveAccumulatedRaw(cleaned);
+      finalRows = cleaned;
+    }
+
+    const ok = loadDataset(finalRows);
+    if(ok){
+      let note = mergeMode
+        ? `이번 업로드: 신규 ${added.toLocaleString()}건 병합${updated? `, 기존 ${updated.toLocaleString()}건 갱신`:''}`
+        : `이번 업로드로 전체 교체 (${added.toLocaleString()}건)`;
+      if(!saved){
+        // 브라우저 저장에 실패하면 조용히 넘어가지 않고, 그 자리에서 바로 백업 파일을 내려받게 한다
+        // (이전에는 경고만 띄우고 지나가서, 사용자가 눈치채지 못하고 다음에 열었을 때 데이터가 통째로
+        //  사라지는 일이 있었다 — 이제는 최소한 파일로는 항상 남는다)
+        downloadAccumulatedBackup(finalRows, 'auto');
+        note += ' · ⚠ 데이터 용량이 커서 브라우저 저장공간에는 다 담기지 못해, 대신 백업 파일을 자동으로 내려받았습니다. 다음에 열 때 "백업 불러오기"로 이 파일을 넣어주세요.';
+      }
+      renderAccumBar(note);
+    }
+    hideLoading();
+  }, 30);
+}
+
+// 정제된 원본 행 배열(rawRows)을 받아 전처리 → 상태 반영 → 렌더링까지 수행
+function loadDataset(rawRows){
+  let cleaned = rawRows.map(preprocessRow).filter(r => r !== null);
+
+  // 추적 모델 화이트리스트가 켜져 있으면, 목록에 없는 모델은 분석 대상에서 아예 제외한다
+  if(state.trackedModelsActive && state.trackedModels.length){
+    cleaned = cleaned.filter(r => state.trackedModels.includes(r[FIELD.MODEL]));
+  }
+
+  // 제외 고장코드 블랙리스트가 켜져 있으면, 해당 고장코드가 붙은 건은 분석 대상에서 제외한다
+  if(state.excludedFaultCodesActive && state.excludedFaultCodes.length){
+    cleaned = cleaned.filter(r => !state.excludedFaultCodes.includes(r[FIELD.FAULTCODE]));
+  }
+
+  // 접수번호 기준 중복 제거 — 같은 접수번호가 여러 번 들어와도 한 건으로만 집계한다.
+  // (접수번호가 비어있는 예외적인 행은 날짜+모델+고장코드+제조번호 조합으로 대체 판단)
+  cleaned = dedupeByReceiptNo(cleaned);
+
+  cleaned.sort((a,b) => a.__date - b.__date);
+  state.data = cleaned;
+
+  if(cleaned.length === 0){
+    alert('조건에 맞는 유효한 데이터가 없습니다. 추적 모델 목록(모델명 표기)이나 접수일 형식을 확인해주세요.');
+    document.getElementById('emptyState').classList.remove('hidden');
+    document.getElementById('dashboardRoot').classList.add('hidden');
+    return false;
+  }
+
+  buildWeekList();
+  buildMonthList();
+  buildFilterOptions();
+  state.filtered = state.data.slice();
+
+  document.getElementById('emptyState').classList.add('hidden');
+  document.getElementById('dashboardRoot').classList.remove('hidden');
+
+  renderAll();
+  return true;
+}
+
+function renderAccumBar(note){
+  const bar = document.getElementById('accumBar');
+  const total = state.data.length;
+  if(total === 0){ bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  const range = state.weekList.length
+    ? `${state.weekList[0].label} ~ ${state.weekList[state.weekList.length-1].label}`
+    : '-';
+  bar.innerHTML = `📦 누적 데이터: <b>${range}</b> · 총 <b>${total.toLocaleString()}건</b>` + (note ? ` · ${escapeHtml(note)}` : '');
+}
+
+// 페이지를 열었을 때: ①임베딩된 데이터가 있으면 그것부터, ②없으면 이 브라우저에 저장된 누적 데이터를 불러온다
+function tryLoadExistingAccumulation(){
+  const embedded = hydrateEmbeddedDataset();
+  let base, sourceNote;
+  if(embedded.length){
+    base = embedded.map(cleanRawRow);
+    sourceNote = '📦 이 파일에 사전 포함된 데이터셋을 불러왔습니다';
+  } else {
+    base = loadAccumulatedRaw();
+    sourceNote = '💾 브라우저에 저장된 누적 데이터를 불러왔습니다';
+  }
+  if(!base.length) return;
+
+  state.accumulatedRaw = base;
+  const ok = loadDataset(base);
+  if(ok){
+    const saved = saveAccumulatedRaw(base);
+    document.getElementById('fileMeta').textContent = sourceNote;
+    if(saved){
+      renderAccumBar('이 브라우저에도 저장되어 다음에 열 때 이어서 볼 수 있어요');
+    } else {
+      downloadAccumulatedBackup(base, 'auto');
+      renderAccumBar('⚠ 데이터 용량이 커서 브라우저 저장공간에는 다 담기지 못해, 대신 백업 파일을 자동으로 내려받았습니다. 다음에 열 때 "백업 불러오기"로 이 파일을 넣어주세요.');
+    }
+  }
+}
+
+/* 누적 데이터 백업 / 복원 / 초기화 */
+// 누적 데이터를 JSON 파일로 다운로드한다. suffix는 파일명 구분용(예: 'auto'로 자동백업임을 표시)
+function downloadAccumulatedBackup(rows, suffix){
+  if(!rows || !rows.length) return;
+  const blob = new Blob([JSON.stringify(rows)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const tag = suffix ? `_${suffix}` : '';
+  a.download = `quality_radar_backup_${new Date().toISOString().slice(0,10)}${tag}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function setupAccumControls(){
+  document.getElementById('btnBackup').addEventListener('click', () => {
+    const stored = state.accumulatedRaw.length ? state.accumulatedRaw : loadAccumulatedRaw();
+    if(!stored.length){ alert('백업할 누적 데이터가 없습니다.'); return; }
+    downloadAccumulatedBackup(stored);
+  });
+
+  document.getElementById('btnRestore').addEventListener('click', () => {
+    document.getElementById('restoreInput').click();
+  });
+  document.getElementById('restoreInput').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try{
+        const json = JSON.parse(ev.target.result);
+        if(!Array.isArray(json)) throw new Error('배열 형식이 아닙니다');
+        const result = mergeIntoAccumulated(json);
+        const ok = loadDataset(result.merged);
+        if(ok){
+          let note = `백업 파일 병합 완료 (신규 ${result.added.toLocaleString()}건, 갱신 ${result.updated.toLocaleString()}건)`;
+          if(!result.saved){
+            downloadAccumulatedBackup(result.merged, 'auto');
+            note += ' · ⚠ 용량 초과로 브라우저에는 다 저장되지 못해, 병합된 최신 백업 파일을 자동으로 내려받았습니다.';
+          }
+          renderAccumBar(note);
+          document.getElementById('fileMeta').textContent = `💾 백업 파일 불러옴: ${file.name}`;
+        }
+      }catch(err){
+        alert('백업 파일을 불러오지 못했습니다: ' + err.message);
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+  });
+
+  document.getElementById('btnClearAccum').addEventListener('click', () => {
+    if(!confirm('이 브라우저에 저장된 누적 데이터를 모두 삭제할까요?\n이 작업은 되돌릴 수 없습니다. (백업 JSON 파일이 있다면 나중에 다시 불러올 수 있습니다)')) return;
+    localStorage.removeItem(STORAGE_KEY);
+    state.accumulatedRaw = [];
+    state.data = []; state.filtered = []; state.weekList = [];
+    document.getElementById('dashboardRoot').classList.add('hidden');
+    document.getElementById('emptyState').classList.remove('hidden');
+    document.getElementById('accumBar').classList.add('hidden');
+    document.getElementById('fileMeta').textContent = '';
+  });
+}
+
+function buildWeekList(){
+  const set = new Map();
+  state.data.forEach(r => {
+    if(!set.has(r.__weekKey)) set.set(r.__weekKey, {key:r.__weekKey, year:r.__year, week:r.__isoWeek, label:r.__weekLabel});
+  });
+  state.weekList = Array.from(set.values()).sort((a,b) => a.year===b.year ? a.week-b.week : a.year-b.year);
+}
+
+function buildMonthList(){
+  const set = new Map();
+  state.data.forEach(r => {
+    if(!set.has(r.__monthKey)) set.set(r.__monthKey, {key:r.__monthKey, year:r.__monthYear, month:r.__monthNum, label:r.__monthLabel});
+  });
+  state.monthList = Array.from(set.values()).sort((a,b) => a.year===b.year ? a.month-b.month : a.year-b.year);
+}
+
+/* ========================================================================
+   3. 필터 (Filters)
+   ======================================================================== */
+function uniqueSorted(field){
+  return Array.from(new Set(state.data.map(r => r[field]).filter(v=>v))).sort();
+}
+
+function populateMultiSelect(id, values){
+  const el = document.getElementById(id);
+  el.innerHTML = values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+}
+
+function buildFilterOptions(){
+  populateMultiSelect('f_model', uniqueSorted(FIELD.MODEL));
+  populateMultiSelect('f_center', uniqueSorted(FIELD.CENTER));
+  populateMultiSelect('f_warranty', uniqueSorted(FIELD.WARRANTY));
+  populateMultiSelect('f_faultcode', uniqueSorted(FIELD.FAULTCODE));
+  populateMultiSelect('f_defect', uniqueSorted(FIELD.DEFECT));
+  populateMultiSelect('f_engineer', uniqueSorted(FIELD.ENGINEER));
+  populateMultiSelect('f_os', uniqueSorted(FIELD.OS));
+  populateMultiSelect('f_inavi', uniqueSorted(FIELD.INAVI));
+  populateMultiSelect('f_map', uniqueSorted(FIELD.MAPVER));
+  populateMultiSelect('f_repro', ['Y','N']);
+  populateMultiSelect('f_recall', ['Y','N']);
+
+  const minD = state.data[0].__date, maxD = state.data[state.data.length-1].__date;
+  document.getElementById('f_dateFrom').value = toDateInputVal(minD);
+  document.getElementById('f_dateTo').value = toDateInputVal(maxD);
+}
+
+function toDateInputVal(d){ return d.toISOString().slice(0,10); }
+
+function getSelected(id){
+  return Array.from(document.getElementById(id).selectedOptions).map(o => o.value);
+}
+
+function applyFilters(){
+  const from = document.getElementById('f_dateFrom').value ? new Date(document.getElementById('f_dateFrom').value) : null;
+  const to = document.getElementById('f_dateTo').value ? new Date(document.getElementById('f_dateTo').value) : null;
+  const model = getSelected('f_model');
+  const center = getSelected('f_center');
+  const warranty = getSelected('f_warranty');
+  const faultcode = getSelected('f_faultcode');
+  const defect = getSelected('f_defect');
+  const engineer = getSelected('f_engineer');
+  const os = getSelected('f_os');
+  const inavi = getSelected('f_inavi');
+  const mapv = getSelected('f_map');
+  const repro = getSelected('f_repro');
+  const recall = getSelected('f_recall');
+
+  state.filtered = state.data.filter(r => {
+    if(from && r.__date < from) return false;
+    if(to && r.__date > new Date(to.getTime()+86400000-1)) return false;
+    if(model.length && !model.includes(r[FIELD.MODEL])) return false;
+    if(center.length && !center.includes(r[FIELD.CENTER])) return false;
+    if(warranty.length && !warranty.includes(r[FIELD.WARRANTY])) return false;
+    if(faultcode.length && !faultcode.includes(r[FIELD.FAULTCODE])) return false;
+    if(defect.length && !defect.includes(r[FIELD.DEFECT])) return false;
+    if(engineer.length && !engineer.includes(r[FIELD.ENGINEER])) return false;
+    if(os.length && !os.includes(r[FIELD.OS])) return false;
+    if(inavi.length && !inavi.includes(r[FIELD.INAVI])) return false;
+    if(mapv.length && !mapv.includes(r[FIELD.MAPVER])) return false;
+    if(repro.length && !repro.includes(r.__isRepro?'Y':'N')) return false;
+    if(recall.length && !recall.includes(r.__isRecall?'Y':'N')) return false;
+    return true;
+  });
+  renderAll();
+}
+
+function resetFilters(){
+  ['f_model','f_center','f_warranty','f_faultcode','f_defect','f_engineer','f_os','f_inavi','f_map','f_repro','f_recall'].forEach(id=>{
+    Array.from(document.getElementById(id).options).forEach(o=>o.selected=false);
+  });
+  if(state.data.length){
+    document.getElementById('f_dateFrom').value = toDateInputVal(state.data[0].__date);
+    document.getElementById('f_dateTo').value = toDateInputVal(state.data[state.data.length-1].__date);
+  }
+  state.filtered = state.data.slice();
+  renderAll();
+}
+
+/* ========================================================================
+   4. 공통 집계 유틸
+   ======================================================================== */
+function countBy(arr, keyFn){
+  const m = new Map();
+  arr.forEach(x => { const k = keyFn(x); m.set(k, (m.get(k)||0)+1); });
+  return m;
+}
+function topN(map, n){
+  return Array.from(map.entries()).sort((a,b)=>b[1]-a[1]).slice(0,n);
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function palette(n){
+  const base = ['#0F8B8D','#2563A8','#F5A623','#E5484D','#7C5CBF','#16A34A','#D97757','#5B6B82','#0B6668','#A15A0A','#9E4FBF','#0E7C7B'];
+  const out=[]; for(let i=0;i<n;i++) out.push(base[i%base.length]); return out;
+}
+
+function weeklyCounts(data){
+  const byWeek = countBy(data, r => r.__weekKey);
+  return state.weekList.map(w => ({...w, count: byWeek.get(w.key)||0}));
+}
+
+function monthlyCounts(data){
+  const byMonth = countBy(data, r => r.__monthKey);
+  return state.monthList.map(m => ({...m, count: byMonth.get(m.key)||0}));
+}
+
+/* ========================================================================
+   5. KPI 렌더링
+   ======================================================================== */
+function renderKPI(){
+  const data = state.filtered;
+  const wc = weeklyCounts(data);
+  const thisWeek = wc.length ? wc[wc.length-1] : {count:0};
+  const prevWeek = wc.length>1 ? wc[wc.length-2] : {count:0};
+  const delta = prevWeek.count>0 ? ((thisWeek.count-prevWeek.count)/prevWeek.count*100) : (thisWeek.count>0?100:0);
+  const models = new Set(data.map(r=>r[FIELD.MODEL])).size;
+  const defects = new Set(data.map(r=>r[FIELD.DEFECT])).size;
+
+  const kpis = [
+    {lbl:'총 접수건수', val: data.length.toLocaleString()},
+    {lbl:'이번주 접수', val: thisWeek.count.toLocaleString()},
+    {lbl:'전주 대비 증감률', val: (delta>=0?'+':'')+delta.toFixed(1)+'%', delta: delta},
+    {lbl:'모델 수', val: models.toLocaleString()},
+    {lbl:'불량 종류 수', val: defects.toLocaleString()},
+  ];
+
+  document.getElementById('kpiGrid').innerHTML = kpis.map(k => `
+    <div class="kpi">
+      <div class="lbl">${k.lbl}</div>
+      <div class="val">${k.val}</div>
+      ${k.delta!==undefined ? `<div class="delta ${k.delta>=0?'up':'down'}">${k.delta>=0?'▲':'▼'} 전주 대비</div>` : ''}
+    </div>
+  `).join('');
+}
+
+/* ========================================================================
+   6. 차트 렌더링
+   ======================================================================== */
+function destroyChart(id){ if(state.charts[id]){ state.charts[id].destroy(); delete state.charts[id]; } }
+
+function chartTextColor(){
+  return getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#1B2432';
+}
+function chartGridColor(){
+  return getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#E1E7EF';
+}
+
+function baseOptions(extra){
+  return Object.assign({
+    responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{labels:{color:chartTextColor(), font:{family:'Pretendard', size:11}}} },
+    scales:{
+      x:{ ticks:{color:chartTextColor(), font:{size:10}}, grid:{color:chartGridColor()} },
+      y:{ ticks:{color:chartTextColor(), font:{size:10}}, grid:{color:chartGridColor()} }
+    }
+  }, extra||{});
+}
+
+function renderWeeklyTrendChart(){
+  const wc = weeklyCounts(state.filtered);
+  destroyChart('weekly');
+  const ctx = document.getElementById('chartWeeklyTrend');
+  state.charts.weekly = new Chart(ctx, {
+    type:'line',
+    data:{ labels: wc.map(w=>w.label),
+      datasets:[{ label:'주별 접수건수', data:wc.map(w=>w.count), borderColor:'#0F8B8D',
+        backgroundColor:'rgba(15,139,141,.15)', fill:true, tension:.25, pointRadius:3 }] },
+    options: baseOptions()
+  });
+}
+
+function renderBarChart(canvasId, chartKey, labels, values, color, horizontal){
+  destroyChart(chartKey);
+  const ctx = document.getElementById(canvasId);
+  if(!ctx) return;
+  state.charts[chartKey] = new Chart(ctx, {
+    type:'bar',
+    data:{ labels, datasets:[{ label:'건수', data:values, backgroundColor:color||'#2563A8', borderRadius:4 }] },
+    options: baseOptions({ indexAxis: horizontal?'y':'x', plugins:{legend:{display:false}} })
+  });
+}
+
+// 아래 render*For 함수들은 전체개요(state.filtered)에서도, 주별개요(선택한 주차의 부분집합)에서도
+// 재사용할 수 있도록 데이터 배열과 캔버스 id를 인자로 받는다.
+function renderModelTop10For(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.MODEL]), 10);
+  renderBarChart(canvasId, chartKey, t.map(x=>x[0]), t.map(x=>x[1]), '#0F8B8D', true);
+}
+function renderDefectTop20For(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.DEFECT]), 20);
+  renderBarChart(canvasId, chartKey, t.map(x=>x[0]), t.map(x=>x[1]), '#2563A8', true);
+}
+function renderFaultcodeTop20For(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.FAULTCODE]), 20);
+  renderBarChart(canvasId, chartKey, t.map(x=>x[0]), t.map(x=>x[1]), '#7C5CBF', true);
+}
+function renderCenterChartFor(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.CENTER]), 15);
+  renderBarChart(canvasId, chartKey, t.map(x=>x[0]), t.map(x=>x[1]), '#D97757', true);
+}
+function renderOSChartFor(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.OS]), 15);
+  renderBarChart(canvasId, chartKey, t.map(x=>x[0]), t.map(x=>x[1]), '#16A34A');
+}
+function renderManufMonthChartFor(data, canvasId, chartKey){
+  const withMonth = data.filter(r=>r.__manufMonth);
+  const m = countBy(withMonth, r=>r.__manufMonth);
+  const keys = Array.from(m.keys()).sort();
+  renderBarChart(canvasId, chartKey, keys, keys.map(k=>m.get(k)), '#0B6668');
+}
+function renderWarrantyPieFor(data, canvasId, chartKey){
+  const entries = Array.from(countBy(data, r=>r[FIELD.WARRANTY]).entries());
+  destroyChart(chartKey);
+  const ctx = document.getElementById(canvasId);
+  if(!ctx) return;
+  state.charts[chartKey] = new Chart(ctx, {
+    type:'pie',
+    data:{ labels: entries.map(e=>e[0]), datasets:[{ data:entries.map(e=>e[1]), backgroundColor: palette(entries.length) }] },
+    options: baseOptions({ scales:{} })
+  });
+}
+function renderParetoFor(data, canvasId, chartKey){
+  const t = topN(countBy(data, r=>r[FIELD.FAULTCODE]), 15);
+  const total = data.length || 1;
+  let cum = 0;
+  const cumPct = t.map(x => { cum += x[1]; return +(cum/total*100).toFixed(1); });
+  destroyChart(chartKey);
+  const ctx = document.getElementById(canvasId);
+  if(!ctx) return;
+  state.charts[chartKey] = new Chart(ctx, {
+    data:{ labels: t.map(x=>x[0]),
+      datasets:[
+        { type:'bar', label:'건수', data:t.map(x=>x[1]), backgroundColor:'#2563A8', order:2, yAxisID:'y' },
+        { type:'line', label:'누적 %', data:cumPct, borderColor:'#E5484D', backgroundColor:'#E5484D', yAxisID:'y1', tension:.2, order:1, pointRadius:3 }
+      ]
+    },
+    options: baseOptions({
+      scales:{
+        x:{ ticks:{color:chartTextColor(),font:{size:9}}, grid:{color:chartGridColor()} },
+        y:{ position:'left', ticks:{color:chartTextColor()}, grid:{color:chartGridColor()} },
+        y1:{ position:'right', min:0, max:100, ticks:{color:chartTextColor(), callback:v=>v+'%'}, grid:{display:false} }
+      }
+    })
+  });
+}
+function renderHeatmapFor(data, tableId){
+  const models = topN(countBy(data, r=>r[FIELD.MODEL]),12).map(x=>x[0]);
+  const codes = topN(countBy(data, r=>r[FIELD.FAULTCODE]),15).map(x=>x[0]);
+
+  const grid = {};
+  let maxVal = 0;
+  data.forEach(r=>{
+    if(!models.includes(r[FIELD.MODEL]) || !codes.includes(r[FIELD.FAULTCODE])) return;
+    const key = r[FIELD.MODEL]+'|||'+r[FIELD.FAULTCODE];
+    grid[key] = (grid[key]||0)+1;
+    if(grid[key]>maxVal) maxVal = grid[key];
+  });
+
+  let html = '<thead><tr><th>모델 \\ 고장코드</th>' + codes.map(d=>`<th>${escapeHtml(d)}</th>`).join('') + '</tr></thead><tbody>';
+  models.forEach(model => {
+    html += `<tr><td class="rowhead">${escapeHtml(model)}</td>`;
+    codes.forEach(code => {
+      const v = grid[model+'|||'+code] || 0;
+      const intensity = maxVal ? v/maxVal : 0;
+      const bg = v===0 ? 'transparent' : `rgba(15,139,141,${0.12+intensity*0.75})`;
+      html += `<td class="cell" style="background:${bg};">${v||''}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  const el = document.getElementById(tableId);
+  if(el) el.innerHTML = html;
+}
+
+// 전체개요(state.filtered) 기본 호출용 래퍼
+function renderModelTop10(){ renderModelTop10For(state.filtered, 'chartModelTop10','modelTop10'); }
+function renderDefectTop20(){ renderDefectTop20For(state.filtered, 'chartDefectTop20','defectTop20'); }
+function renderFaultcodeTop20(){ renderFaultcodeTop20For(state.filtered, 'chartFaultcodeTop20','faultTop20'); }
+function renderCenterChart(){ renderCenterChartFor(state.filtered, 'chartCenter','center'); }
+function renderOSChart(){ renderOSChartFor(state.filtered, 'chartOS','os'); }
+function renderManufMonthChart(){ renderManufMonthChartFor(state.filtered, 'chartManufMonth','manuf'); }
+function renderWarrantyPie(){ renderWarrantyPieFor(state.filtered, 'chartWarrantyPie','warranty'); }
+function renderPareto(){ renderParetoFor(state.filtered, 'chartPareto','pareto'); }
+function renderHeatmap(){ renderHeatmapFor(state.filtered, 'heatmapTable'); }
+
+function renderStackedArea(){
+  const modelCounts = countBy(state.filtered, r=>r[FIELD.MODEL]);
+  const topModels = topN(modelCounts,6).map(x=>x[0]);
+  const datasets = topModels.map((model,i) => {
+    const sub = state.filtered.filter(r=>r[FIELD.MODEL]===model);
+    const wc = weeklyCounts(sub);
+    // "누적" 그래프이므로 주간 건수를 그대로 쓰지 않고, 매 주까지의 러닝 합계(누적합)로 변환한다
+    // (이렇게 해야 값이 절대 내려가지 않고 계속 쌓이는 형태로 보인다)
+    let running = 0;
+    const cumulative = wc.map(w => { running += w.count; return running; });
+    return { label:model, data:cumulative, backgroundColor: palette(6)[i]+'CC', borderColor: palette(6)[i], fill:true, tension:.2 };
+  });
+  const labels = state.weekList.map(w=>w.label);
+  destroyChart('stacked');
+  const ctx = document.getElementById('chartStackedArea');
+  state.charts.stacked = new Chart(ctx, {
+    type:'line',
+    data:{ labels, datasets },
+    options: baseOptions({ scales:{ x:{stacked:true, ticks:{color:chartTextColor(),font:{size:10}}, grid:{color:chartGridColor()}}, y:{stacked:true, ticks:{color:chartTextColor()}, grid:{color:chartGridColor()}} } })
+  });
+}
+
+function renderAllCharts(){
+  renderWeeklyTrendChart();
+  renderModelTop10();
+  renderFaultcodeTop20();
+  renderWarrantyPie();
+  renderStackedArea();
+  renderPareto();
+  renderManufMonthChart();
+  renderCenterChart();
+  renderOSChart();
+  renderHeatmap();
+}
+
+/* ========================================================================
+   7. 모델 상세 분석
+   ======================================================================== */
+function renderModelDetailSelect(){
+  const sel = document.getElementById('modelDetailSelect');
+  const models = uniqueSorted(FIELD.MODEL);
+  const current = sel.value;
+  sel.innerHTML = models.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+  if(models.includes(current)) sel.value = current;
+  renderModelDetail(sel.value || models[0]);
+}
+
+/* ========================================================================
+   6-1. 주별 개요 (선택한 한 주차만 놓고 전체개요와 동일한 종류의 차트를 보여줌)
+   ======================================================================== */
+function renderWeeklyOverviewSelect(){
+  const sel = document.getElementById('weeklyOverviewSelect');
+  if(!sel) return;
+  const current = sel.value;
+  // 최신 주차가 위로 오도록 정렬해서 보여준다
+  const weeksDesc = state.weekList.slice().reverse();
+  sel.innerHTML = weeksDesc.map(w=>`<option value="${escapeHtml(w.key)}">${escapeHtml(w.label)}</option>`).join('');
+  const validKeys = state.weekList.map(w=>w.key);
+  if(validKeys.includes(current)) sel.value = current;
+  renderWeeklyOverview(sel.value || (weeksDesc[0] && weeksDesc[0].key));
+}
+
+function renderWeeklyOverview(weekKey){
+  if(!weekKey) return;
+  const weekObj = state.weekList.find(w=>w.key===weekKey);
+  const data = state.filtered.filter(r=>r.__weekKey===weekKey);
+
+  // 이번 주 KPI 미니 요약 (전주 대비 증감 포함)
+  const idx = state.weekList.findIndex(w=>w.key===weekKey);
+  const prevCount = idx>0 ? state.filtered.filter(r=>r.__weekKey===state.weekList[idx-1].key).length : 0;
+  const delta = prevCount>0 ? ((data.length-prevCount)/prevCount*100) : (data.length>0?100:0);
+  document.getElementById('weeklyKpiChip').textContent =
+    `총 ${data.length.toLocaleString()}건 · 전주 대비 ${delta>=0?'+':''}${delta.toFixed(1)}%`;
+
+  document.getElementById('weeklyOverviewBody').innerHTML = `
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>모델별 접수 TOP10</h5><div class="chart-wrap"><canvas id="wk_chartModelTop10"></canvas></div></div>
+      </div>
+      <div class="col-lg-6">
+        <div class="qcard"><h5>고장코드 TOP20</h5><div class="chart-wrap"><canvas id="wk_chartFaultcodeTop20"></canvas></div></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>유무상 비율</h5><div class="chart-wrap"><canvas id="wk_chartWarrantyPie"></canvas></div></div>
+      </div>
+    </div>
+    <div class="qcard">
+      <h5>HeatMap — 모델 × 고장코드 발생건수</h5>
+      <div class="heatmap-scroll"><table class="heatmap" id="wk_heatmapTable"></table></div>
+    </div>
+    <div class="qcard">
+      <h5>Pareto Chart — 고장코드 기준</h5>
+      <div class="chart-wrap tall"><canvas id="wk_chartPareto"></canvas></div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>제조월별 발생</h5><div class="chart-wrap"><canvas id="wk_chartManufMonth"></canvas></div></div>
+      </div>
+      <div class="col-lg-6">
+        <div class="qcard"><h5>접수처별 발생</h5><div class="chart-wrap"><canvas id="wk_chartCenter"></canvas></div></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>OS버전 영향</h5><div class="chart-wrap"><canvas id="wk_chartOS"></canvas></div></div>
+      </div>
+    </div>
+  `;
+
+  renderModelTop10For(data, 'wk_chartModelTop10','wk_modelTop10');
+  renderFaultcodeTop20For(data, 'wk_chartFaultcodeTop20','wk_faultTop20');
+  renderWarrantyPieFor(data, 'wk_chartWarrantyPie','wk_warranty');
+  renderHeatmapFor(data, 'wk_heatmapTable');
+  renderParetoFor(data, 'wk_chartPareto','wk_pareto');
+  renderManufMonthChartFor(data, 'wk_chartManufMonth','wk_manuf');
+  renderCenterChartFor(data, 'wk_chartCenter','wk_center');
+  renderOSChartFor(data, 'wk_chartOS','wk_os');
+}
+
+/* ========================================================================
+   6-2. 월별 개요 (선택한 한 달만 놓고 전체개요와 동일한 종류의 차트를 보여줌)
+   ======================================================================== */
+function renderMonthlyTrendChart(){
+  const mc = monthlyCounts(state.filtered);
+  destroyChart('monthly');
+  const ctx = document.getElementById('chartMonthlyTrend');
+  if(!ctx) return;
+  state.charts.monthly = new Chart(ctx, {
+    type:'line',
+    data:{ labels: mc.map(m=>m.label),
+      datasets:[{ label:'월별 접수건수', data:mc.map(m=>m.count), borderColor:'#7C5CBF',
+        backgroundColor:'rgba(124,92,191,.15)', fill:true, tension:.25, pointRadius:3 }] },
+    options: baseOptions()
+  });
+}
+
+function renderMonthlyOverviewSelect(){
+  const sel = document.getElementById('monthlyOverviewSelect');
+  if(!sel) return;
+  const current = sel.value;
+  // 최신 달이 위로 오도록 정렬해서 보여준다
+  const monthsDesc = state.monthList.slice().reverse();
+  sel.innerHTML = monthsDesc.map(m=>`<option value="${escapeHtml(m.key)}">${escapeHtml(m.label)}</option>`).join('');
+  const validKeys = state.monthList.map(m=>m.key);
+  if(validKeys.includes(current)) sel.value = current;
+  renderMonthlyOverview(sel.value || (monthsDesc[0] && monthsDesc[0].key));
+}
+
+function renderMonthlyOverview(monthKey){
+  if(!monthKey) return;
+  const data = state.filtered.filter(r=>r.__monthKey===monthKey);
+
+  // 이번 달 KPI 미니 요약 (전월 대비 증감 포함)
+  const idx = state.monthList.findIndex(m=>m.key===monthKey);
+  const prevCount = idx>0 ? state.filtered.filter(r=>r.__monthKey===state.monthList[idx-1].key).length : 0;
+  const delta = prevCount>0 ? ((data.length-prevCount)/prevCount*100) : (data.length>0?100:0);
+  document.getElementById('monthlyKpiChip').textContent =
+    `총 ${data.length.toLocaleString()}건 · 전월 대비 ${delta>=0?'+':''}${delta.toFixed(1)}%`;
+
+  document.getElementById('monthlyOverviewBody').innerHTML = `
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>모델별 접수 TOP10</h5><div class="chart-wrap"><canvas id="mo_chartModelTop10"></canvas></div></div>
+      </div>
+      <div class="col-lg-6">
+        <div class="qcard"><h5>고장코드 TOP20</h5><div class="chart-wrap"><canvas id="mo_chartFaultcodeTop20"></canvas></div></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>유무상 비율</h5><div class="chart-wrap"><canvas id="mo_chartWarrantyPie"></canvas></div></div>
+      </div>
+    </div>
+    <div class="qcard">
+      <h5>HeatMap — 모델 × 고장코드 발생건수</h5>
+      <div class="heatmap-scroll"><table class="heatmap" id="mo_heatmapTable"></table></div>
+    </div>
+    <div class="qcard">
+      <h5>Pareto Chart — 고장코드 기준</h5>
+      <div class="chart-wrap tall"><canvas id="mo_chartPareto"></canvas></div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>제조월별 발생</h5><div class="chart-wrap"><canvas id="mo_chartManufMonth"></canvas></div></div>
+      </div>
+      <div class="col-lg-6">
+        <div class="qcard"><h5>접수처별 발생</h5><div class="chart-wrap"><canvas id="mo_chartCenter"></canvas></div></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6">
+        <div class="qcard"><h5>OS버전 영향</h5><div class="chart-wrap"><canvas id="mo_chartOS"></canvas></div></div>
+      </div>
+    </div>
+  `;
+
+  renderModelTop10For(data, 'mo_chartModelTop10','mo_modelTop10');
+  renderFaultcodeTop20For(data, 'mo_chartFaultcodeTop20','mo_faultTop20');
+  renderWarrantyPieFor(data, 'mo_chartWarrantyPie','mo_warranty');
+  renderHeatmapFor(data, 'mo_heatmapTable');
+  renderParetoFor(data, 'mo_chartPareto','mo_pareto');
+  renderManufMonthChartFor(data, 'mo_chartManufMonth','mo_manuf');
+  renderCenterChartFor(data, 'mo_chartCenter','mo_center');
+  renderOSChartFor(data, 'mo_chartOS','mo_os');
+}
+
+function computeQualityIndex(data, model){
+  const sub = data.filter(r=>r[FIELD.MODEL]===model);
+  if(sub.length===0) return {score:100, color:'qi-green'};
+
+  const wc = weeklyCounts(sub);
+  const last = wc.length? wc[wc.length-1].count:0;
+  const prev = wc.length>1? wc[wc.length-2].count:0;
+  const growthRate = prev>0 ? (last-prev)/prev : (last>0?1:0);
+
+  const reproRate = sub.filter(r=>r.__isRepro).length / sub.length;
+  const recallRate = sub.filter(r=>r.__isRecall).length / sub.length;
+  const paidRate = sub.filter(r=>r.__isPaid).length / sub.length;
+  const diversity = new Set(sub.map(r=>r[FIELD.DEFECT])).size;
+  const diversityPenaltyBase = Math.min(diversity/20, 1);
+
+  let score = 100;
+  score -= Math.max(0, growthRate) * 25;      // 급증 페널티
+  score -= reproRate * 20;                    // 재현율 페널티
+  score -= recallRate * 15;                   // 회수율 페널티
+  score -= paidRate * 10;                     // 유상비율 페널티
+  score -= diversityPenaltyBase * 15;         // 불량 다양성 페널티
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  let color = 'qi-green';
+  if(score < 50) color = 'qi-red';
+  else if(score < 80) color = 'qi-yellow';
+  return {score, color, growthRate, reproRate, recallRate, paidRate, diversity};
+}
+
+function renderModelDetail(model){
+  if(!model) return;
+  const sub = state.filtered.filter(r=>r[FIELD.MODEL]===model);
+  const qi = computeQualityIndex(state.filtered, model);
+  document.getElementById('modelQiChip').innerHTML =
+    `<span class="qi-chip ${qi.color}">품질지수 ${qi.score}점</span>`;
+
+  // 이 모델에 해당하는 이상징후만 뽑아서 품질지수 아래에 요약
+  renderModelAnomalySummary(model);
+
+  const wc = weeklyCounts(sub);
+  const faultTop = topN(countBy(sub, r=>r[FIELD.FAULTCODE]), 10);
+  const osTop = topN(countBy(sub, r=>r[FIELD.OS]), 10);
+  const laborCodeTop = topN(countBy(sub, r=>r[FIELD.PAYCODE_LABOR]||'(미기재)'), 10);
+  const manufWithMonth = sub.filter(r=>r.__manufMonth);
+  const manufMap = countBy(manufWithMonth, r=>r.__manufMonth);
+  const manufKeys = Array.from(manufMap.keys()).sort();
+  const manufTop = manufKeys.map(k => [k, manufMap.get(k)]);
+  const reproRate = sub.length? (sub.filter(r=>r.__isRepro).length/sub.length*100).toFixed(1):'0.0';
+
+  document.getElementById('modelDetailBody').innerHTML = `
+    <div class="qcard"><h5>주별 추이 — ${escapeHtml(model)} <span style="font-size:.68rem; color:var(--ink-soft); font-weight:500;">(점을 클릭하면 그 주에 등록된 상세 내역을 볼 수 있어요)</span></h5>
+      <div class="chart-wrap"><canvas id="md_weekly"></canvas></div></div>
+    <div class="qcard hidden" id="weekDrilldownCard">
+      <h5>주간 상세 내역 — <span id="weekDrilldownLabel" class="mono"></span></h5>
+      <div id="weekDrilldownContent" class="table-responsive" style="max-height:400px; overflow:auto;"></div>
+    </div>
+    <div class="qcard">
+      <h5>고장코드 TOP10 <span style="font-size:.68rem; color:var(--ink-soft); font-weight:500;">(막대를 클릭하면 처리코드(공임) 비율을 볼 수 있어요)</span></h5>
+      <div class="chart-wrap"><canvas id="md_fault"></canvas></div>
+    </div>
+    <div class="qcard hidden" id="faultDrilldownCard">
+      <h5>선택한 고장코드의 처리코드(공임) 비율 — <span id="faultDrilldownLabel" class="mono"></span></h5>
+      <div class="chart-wrap"><canvas id="md_fault_drilldown"></canvas></div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6"><div class="qcard"><h5>처리코드(공임) 분포</h5><div class="chart-wrap"><canvas id="md_paycode"></canvas></div></div></div>
+      <div class="col-lg-6"><div class="qcard">
+        <h5>제조년월별 발생 <span style="font-size:.68rem; color:var(--ink-soft); font-weight:500;">(막대를 클릭하면 고장코드 비율을 볼 수 있어요)</span></h5>
+        <div class="chart-wrap"><canvas id="md_manuf"></canvas></div></div></div>
+    </div>
+    <div class="qcard hidden" id="manufDrilldownCard">
+      <h5>선택한 제조년월의 고장코드 비율 — <span id="manufDrilldownLabel" class="mono"></span></h5>
+      <div class="chart-wrap"><canvas id="md_manuf_drilldown"></canvas></div>
+    </div>
+    <div class="row">
+      <div class="col-lg-6"><div class="qcard"><h5>OS버전 영향</h5><div class="chart-wrap"><canvas id="md_os"></canvas></div></div></div>
+      <div class="col-lg-6"><div class="qcard">
+        <h5>재현율</h5>
+        <div style="display:flex; gap:32px; font-family:var(--font-mono); padding:20px 4px;">
+          <div><div style="font-size:.72rem;color:var(--ink-soft);">증상재현율</div><div style="font-size:1.6rem;font-weight:700;">${reproRate}%</div></div>
+          <div><div style="font-size:.72rem;color:var(--ink-soft);">총 접수건수</div><div style="font-size:1.6rem;font-weight:700;">${sub.length}</div></div>
+        </div>
+      </div></div>
+    </div>
+  `;
+
+  destroyChart('md_weekly');
+  state.charts.md_weekly = new Chart(document.getElementById('md_weekly'), {
+    type:'line',
+    data:{ labels:wc.map(w=>w.label), datasets:[{label:model, data:wc.map(w=>w.count), borderColor:'#0F8B8D', backgroundColor:'rgba(15,139,141,.15)', fill:true, tension:.25, pointRadius:4, pointHoverRadius:6}] },
+    options: baseOptions({
+      onClick: (evt, elements) => {
+        if(!elements.length) return;
+        const idx = elements[0].index;
+        renderWeekDrilldownForModel(sub, wc[idx]);
+      },
+      onHover: (evt, elements) => { evt.native.target.style.cursor = elements.length ? 'pointer' : 'default'; }
+    })
+  });
+  const mk = (id,key,arr,color,horiz,onClickFn)=>{
+    destroyChart(key);
+    const cfg = {
+      type:'bar', data:{ labels:arr.map(x=>x[0]), datasets:[{data:arr.map(x=>x[1]), backgroundColor:color, borderRadius:4}] },
+      options: baseOptions({ indexAxis: horiz?'y':'x', plugins:{legend:{display:false}} })
+    };
+    if(onClickFn){
+      cfg.options.onClick = (evt, elements) => {
+        if(!elements.length) return;
+        const idx = elements[0].index;
+        const label = arr[idx][0];
+        onClickFn(label);
+      };
+      cfg.options.onHover = (evt, elements) => { evt.native.target.style.cursor = elements.length ? 'pointer' : 'default'; };
+    }
+    state.charts[key] = new Chart(document.getElementById(id), cfg);
+  };
+  mk('md_fault','md_fault_c',faultTop,'#7C5CBF',true, faultCode => renderFaultCodeDrilldown(sub, faultCode));
+  mk('md_paycode','md_paycode_c',laborCodeTop,'#D97757',true);
+  mk('md_manuf','md_manuf_c',manufTop,'#0B6668',false, manufMonth => renderManufMonthDrilldown(sub, manufMonth));
+  mk('md_os','md_os_c',osTop,'#16A34A',false);
+
+  document.getElementById('faultDrilldownCard').classList.add('hidden');
+  document.getElementById('weekDrilldownCard').classList.add('hidden');
+  document.getElementById('manufDrilldownCard').classList.add('hidden');
+}
+
+// 모델 상세에서 주별 추이의 특정 주차(점)를 클릭했을 때, 그 주에 등록된 상세 내역을 보여준다
+function renderWeekDrilldownForModel(sub, weekObj){
+  if(!weekObj) return;
+  const rows = sub.filter(r => r.__weekKey === weekObj.key);
+  const card = document.getElementById('weekDrilldownCard');
+  card.classList.remove('hidden');
+  document.getElementById('weekDrilldownLabel').textContent = `${weekObj.label} · 총 ${rows.length.toLocaleString()}건`;
+  card.scrollIntoView({behavior:'smooth', block:'nearest'});
+
+  const shown = rows.slice(0, 500);
+  let html = `<table class="table table-sm" style="font-size:.8rem; width:100%;">
+    <thead><tr><th>접수일</th><th>접수처</th><th>불량명</th><th>고장코드</th><th>처리코드(공임)</th><th>처리상세</th></tr></thead>
+    <tbody>` +
+    shown.map(r => `<tr>
+      <td class="mono">${escapeHtml(r.__date.toISOString().slice(0,10))}</td>
+      <td>${escapeHtml(r[FIELD.CENTER])}</td>
+      <td>${escapeHtml(r[FIELD.DEFECT])}</td>
+      <td>${escapeHtml(r[FIELD.FAULTCODE])}</td>
+      <td>${escapeHtml(r[FIELD.PAYCODE_LABOR]||'(미기재)')}</td>
+      <td>${escapeHtml(r['처리상세']||'')}</td>
+    </tr>`).join('') +
+    `</tbody></table>`;
+  if(rows.length > 500){
+    html += `<div style="font-size:.72rem;color:var(--ink-soft); padding:6px 4px;">전체 ${rows.length.toLocaleString()}건 중 상위 500건만 표시됩니다.</div>`;
+  }
+  document.getElementById('weekDrilldownContent').innerHTML = html;
+}
+
+// 모델 상세에서 제조년월별 발생의 특정 막대를 클릭했을 때, 그 제조년월의 고장코드 비율을 보여준다
+function renderManufMonthDrilldown(sub, manufMonth){
+  const rows = sub.filter(r => r.__manufMonth === manufMonth);
+  const dist = topN(countBy(rows, r => r[FIELD.FAULTCODE]), 15);
+
+  const card = document.getElementById('manufDrilldownCard');
+  card.classList.remove('hidden');
+  document.getElementById('manufDrilldownLabel').textContent = `${manufMonth} (${rows.length}건)`;
+  card.scrollIntoView({behavior:'smooth', block:'nearest'});
+
+  destroyChart('md_manuf_drilldown_c');
+  state.charts.md_manuf_drilldown_c = new Chart(document.getElementById('md_manuf_drilldown'), {
+    type:'bar',
+    data:{ labels: dist.map(x=>x[0]), datasets:[{ data: dist.map(x=>x[1]), backgroundColor:'#0B6668', borderRadius:4 }] },
+    options: baseOptions({ indexAxis:'y', plugins:{legend:{display:false}} })
+  });
+}
+
+// 모델 상세에서 특정 고장코드 막대를 클릭했을 때, 그 고장코드에 대한 처리코드(공임) 비율을 보여준다
+function renderFaultCodeDrilldown(sub, faultCode){
+  const rows = sub.filter(r => r[FIELD.FAULTCODE] === faultCode);
+  const dist = topN(countBy(rows, r => r[FIELD.PAYCODE_LABOR] || '(미기재)'), 15);
+
+  const card = document.getElementById('faultDrilldownCard');
+  card.classList.remove('hidden');
+  document.getElementById('faultDrilldownLabel').textContent = `${faultCode} (${rows.length}건)`;
+  card.scrollIntoView({behavior:'smooth', block:'nearest'});
+
+  destroyChart('md_fault_drilldown_c');
+  state.charts.md_fault_drilldown_c = new Chart(document.getElementById('md_fault_drilldown'), {
+    type:'bar',
+    data:{ labels: dist.map(x=>x[0]), datasets:[{ data: dist.map(x=>x[1]), backgroundColor:'#F5A623', borderRadius:4 }] },
+    options: baseOptions({ indexAxis:'y', plugins:{legend:{display:false}} })
+  });
+}
+
+// 이 모델에 해당하는 이상징후만 골라 품질지수 칩 아래에 요약해서 보여준다
+function renderModelAnomalySummary(model){
+  const el = document.getElementById('modelAnomalySummary');
+  const list = state.anomalies.filter(a => a.model === model || a.model === '전체');
+  if(!list.length){
+    el.innerHTML = `<div style="font-size:.8rem; color:var(--ink-soft);">이 모델에서 감지된 이상징후가 없습니다.</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="qcard" style="margin-bottom:0;">
+      <h5>🚨 ${escapeHtml(model)} 모델 이상징후</h5>
+      ${list.slice(0,15).map(a => `
+        <div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border); font-size:.82rem;">
+          <span class="badge-anom ${badgeClass(a.type)}">${a.badge}</span>
+          <span style="color:var(--ink-soft); min-width:140px;">${escapeHtml(a.defect)}</span>
+          <span style="flex:1;">${escapeHtml(a.detail)}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+/* ========================================================================
+   8. 이상징후 자동 탐지 (Anomaly Detection)
+   ======================================================================== */
+function detectAnomalies(){
+  const anomalies = [];
+  const data = state.filtered;
+  const weeks = state.weekList.map(w=>w.key);
+  if(weeks.length < 2) { state.anomalies = []; return; }
+
+  const lastWeek = weeks[weeks.length-1];
+  const prevWeek = weeks[weeks.length-2];
+
+  // 이번 주 / 지난 주 데이터를 한 번만 뽑아둔다 — 이후 모든 검사는 이 부분집합 기준으로만 돈다.
+  const thisWeekRows = [];
+  const prevWeekRows = [];
+  data.forEach(r=>{
+    if(r.__weekKey===lastWeek) thisWeekRows.push(r);
+    else if(r.__weekKey===prevWeek) prevWeekRows.push(r);
+  });
+
+  // ①②③④ : (모델,고장코드) 주별 시계열 — 불량명은 자유텍스트라 표기가 조금만 달라도
+  // 다른 항목으로 갈리기 때문에, 실제 표준 분류 체계인 "고장코드" 기준으로 통계를 낸다.
+  const combos = new Map(); // key "model|||faultcode" -> Map(weekKey->count)
+  const comboSampleDefect = new Map(); // key -> 참고용 대표 불량명(마지막에 관측된 값)
+  data.forEach(r=>{
+    const faultCode = r[FIELD.FAULTCODE];
+    if(faultCode === '(미기재)') return; // 코드 미기재 건은 코드 기준 통계에서 제외
+    const key = r[FIELD.MODEL]+'|||'+faultCode;
+    if(!combos.has(key)) combos.set(key, new Map());
+    const m = combos.get(key);
+    m.set(r.__weekKey, (m.get(r.__weekKey)||0)+1);
+    comboSampleDefect.set(key, r[FIELD.DEFECT]);
+  });
+
+  combos.forEach((series, key) => {
+    const [model, faultCode] = key.split('|||');
+    const counts = weeks.map(w => series.get(w)||0);
+    const last = counts[counts.length-1];
+    const prev = counts[counts.length-2];
+    if(last===0) return; // 이번주 발생 없으면 스킵
+
+    // ① 전주 대비 50% 이상 증가 → 경고
+    if(prev>0 && last >= prev*1.5){
+      anomalies.push({type:'WARNING', badge:'경고', model, defect:faultCode, week:lastWeek,
+        detail:`고장코드 '${faultCode}' 전주(${prev}건) 대비 ${(((last-prev)/prev)*100).toFixed(0)}% 증가 (${last}건)`, severity:2});
+    }
+
+    // ② 최근 8주 평균 대비 2배 이상 → 위험
+    const windowStart = Math.max(0, counts.length-9);
+    const priorWindow = counts.slice(windowStart, counts.length-1);
+    const avg8 = priorWindow.length? priorWindow.reduce((a,b)=>a+b,0)/priorWindow.length : 0;
+    if(avg8>0 && last >= avg8*2){
+      anomalies.push({type:'DANGER', badge:'위험', model, defect:faultCode, week:lastWeek,
+        detail:`고장코드 '${faultCode}' 최근 8주 평균(${avg8.toFixed(1)}건) 대비 ${(last/avg8).toFixed(1)}배 급증 (${last}건)`, severity:3});
+    }
+
+    // ③ 처음 등장한 고장코드 → NEW
+    const firstIdx = counts.findIndex(c=>c>0);
+    if(firstIdx === counts.length-1 && counts.filter(c=>c>0).length===1){
+      const sampleDefect = comboSampleDefect.get(key) || '-';
+      anomalies.push({type:'NEW', badge:'NEW', model, defect:`${faultCode} · ${sampleDefect}`, week:lastWeek,
+        detail:`신규 고장코드 '${faultCode}' 이번 주 최초 발생 (${last}건)`, severity:2});
+    }
+
+    // ④ 3주 연속 증가 → TREND
+    if(counts.length>=3){
+      const c1=counts[counts.length-3], c2=counts[counts.length-2], c3=counts[counts.length-1];
+      if(c1 < c2 && c2 < c3 && c1>0){
+        anomalies.push({type:'TREND', badge:'TREND', model, defect:faultCode, week:lastWeek,
+          detail:`고장코드 '${faultCode}' 3주 연속 증가 (${c1} → ${c2} → ${c3}건)`, severity:2});
+      }
+    }
+  });
+
+  // ⑤ 특정 모델에서만 증가 (Model Specific) — 고장코드→모델 분포를 이번주/지난주 각각 한 번만 집계
+  const codeModelLast = new Map(); // faultcode -> Map(model->count)
+  const codeModelPrev = new Map();
+  thisWeekRows.forEach(r=>{
+    const code = r[FIELD.FAULTCODE];
+    if(code === '(미기재)') return;
+    if(!codeModelLast.has(code)) codeModelLast.set(code, new Map());
+    const m = codeModelLast.get(code);
+    m.set(r[FIELD.MODEL], (m.get(r[FIELD.MODEL])||0)+1);
+  });
+  prevWeekRows.forEach(r=>{
+    const code = r[FIELD.FAULTCODE];
+    if(code === '(미기재)') return;
+    if(!codeModelPrev.has(code)) codeModelPrev.set(code, new Map());
+    const m = codeModelPrev.get(code);
+    m.set(r[FIELD.MODEL], (m.get(r[FIELD.MODEL])||0)+1);
+  });
+  codeModelLast.forEach((byModelLast, faultCode) => {
+    if(byModelLast.size !== 1) return; // 이번주 여러 모델에서 동시에 나타나면 "모델 특이적"이 아님
+    const [model, cnt] = Array.from(byModelLast.entries())[0];
+    const prevCnt = (codeModelPrev.get(faultCode) || new Map()).get(model) || 0;
+    if(cnt >= prevCnt + 3){
+      anomalies.push({type:'MODEL_SPECIFIC', badge:'Model Specific', model, defect:faultCode, week:lastWeek,
+        detail:`다른 모델은 증가 없이 ${model} 모델에서만 고장코드 '${faultCode}' 집중 발생 (${cnt}건)`, severity:2});
+    }
+  });
+
+  // ⑥ 특정 버전에서 집중 (Version Issue) — 지도버전/INAVI버전은 분석 대상에서 제외, OS버전만 확인
+  ['OS버전'].forEach(field => {
+    const byCodeVer = new Map();   // faultcode -> Map(버전값->count)
+    const byCodeTotal = new Map(); // faultcode -> 이번 주 총 건수
+    thisWeekRows.forEach(r=>{
+      const code = r[FIELD.FAULTCODE];
+      if(code === '(미기재)') return;
+      byCodeTotal.set(code, (byCodeTotal.get(code)||0)+1);
+      if(!byCodeVer.has(code)) byCodeVer.set(code, new Map());
+      const m = byCodeVer.get(code);
+      m.set(r[field], (m.get(r[field])||0)+1);
+    });
+    byCodeVer.forEach((verMap, faultCode) => {
+      const total = byCodeTotal.get(faultCode) || 0;
+      if(total < 4) return;
+      let topVer=null, topCnt=0;
+      verMap.forEach((c,v)=>{ if(c>topCnt){ topCnt=c; topVer=v; } });
+      if(topVer && topVer!=='(미기재)' && topCnt/total >= 0.7){
+        anomalies.push({type:'VERSION_ISSUE', badge:'Version Issue', model:'전체', defect:faultCode, week:lastWeek,
+          detail:`${field} ${topVer} 사용자에게 고장코드 '${faultCode}' 집중 (${topCnt}/${total}건, ${(topCnt/total*100).toFixed(0)}%)`, severity:2});
+      }
+    });
+  });
+
+  // ⑦ 특정 엔지니어만 많이 처리 (Engineering Check) — 이번 주 부분집합 한 번만 집계
+  {
+    const byEng = countBy(thisWeekRows, r=>r[FIELD.ENGINEER]);
+    const totalEng = thisWeekRows.length;
+    byEng.forEach((cnt, eng) => {
+      if(eng==='(미배정)') return;
+      if(totalEng>=6 && cnt/totalEng >= 0.4){
+        anomalies.push({type:'ENGINEER_CHECK', badge:'Engineering Check', model:'전체', defect:'-', week:lastWeek,
+          detail:`엔지니어 '${eng}'가 이번 주 전체 처리건의 ${(cnt/totalEng*100).toFixed(0)}%(${cnt}/${totalEng}건) 처리 — 편중 확인 필요`, severity:1});
+      }
+    });
+  }
+
+  // ⑧⑨⑩ 재현율 / 회수율 / 유상수리 급증 (모델 단위) — 이번주/지난주 부분집합을 한 번씩만 훑어 모델별 통계를 만든다
+  function accumulateModelStats(rows){
+    const m = new Map();
+    rows.forEach(r=>{
+      const model = r[FIELD.MODEL];
+      if(!m.has(model)) m.set(model, {total:0, repro:0, recall:0, paid:0});
+      const s = m.get(model);
+      s.total++;
+      if(r.__isRepro) s.repro++;
+      if(r.__isRecall) s.recall++;
+      if(r.__isPaid) s.paid++;
+    });
+    return m;
+  }
+  const statsLast = accumulateModelStats(thisWeekRows);
+  const statsPrev = accumulateModelStats(prevWeekRows);
+
+  statsLast.forEach((sLast, model) => {
+    const sPrev = statsPrev.get(model);
+    if(!sPrev || sLast.total<3 || sPrev.total<3) return;
+
+    const reproNow = sLast.repro/sLast.total, reproPrev = sPrev.repro/sPrev.total;
+    if(reproNow - reproPrev >= 0.25){
+      anomalies.push({type:'REPRO_SPIKE', badge:'재현율 급증', model, defect:'-', week:lastWeek,
+        detail:`증상재현율 ${(reproPrev*100).toFixed(0)}% → ${(reproNow*100).toFixed(0)}%로 급증`, severity:2});
+    }
+    const recallNow = sLast.recall/sLast.total, recallPrev = sPrev.recall/sPrev.total;
+    if(recallNow - recallPrev >= 0.25){
+      anomalies.push({type:'RECALL_SPIKE', badge:'회수율 급증', model, defect:'-', week:lastWeek,
+        detail:`회수율 ${(recallPrev*100).toFixed(0)}% → ${(recallNow*100).toFixed(0)}%로 급증`, severity:2});
+    }
+    const paidNow = sLast.paid/sLast.total, paidPrev = sPrev.paid/sPrev.total;
+    if(paidNow - paidPrev >= 0.25){
+      anomalies.push({type:'PAID_SPIKE', badge:'유상수리 급증', model, defect:'-', week:lastWeek,
+        detail:`유상수리 비율 ${(paidPrev*100).toFixed(0)}% → ${(paidNow*100).toFixed(0)}%로 급증`, severity:1});
+    }
+  });
+
+  anomalies.sort((a,b)=>b.severity-a.severity);
+  state.anomalies = anomalies;
+}
+
+function badgeClass(type){
+  return ({
+    WARNING:'badge-warn', DANGER:'badge-danger', NEW:'badge-new', TREND:'badge-trend',
+    MODEL_SPECIFIC:'badge-model', VERSION_ISSUE:'badge-version', ENGINEER_CHECK:'badge-eng',
+    REPRO_SPIKE:'badge-warn', RECALL_SPIKE:'badge-danger', PAID_SPIKE:'badge-warn'
+  })[type] || 'badge-eng';
+}
+
+function renderAnomalyList(){
+  const list = state.anomalies.slice(0,60);
+  if(list.length===0){
+    document.getElementById('anomalyList').innerHTML = '<div style="color:var(--ink-soft);">감지된 이상징후가 없습니다.</div>';
+    return;
+  }
+  document.getElementById('anomalyList').innerHTML = list.map(a => `
+    <div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border);">
+      <span class="badge-anom ${badgeClass(a.type)}">${a.badge}</span>
+      <span style="font-weight:700; min-width:120px;">${escapeHtml(a.model)}</span>
+      <span style="color:var(--ink-soft); min-width:140px;">${escapeHtml(a.defect)}</span>
+      <span style="flex:1; font-size:.8rem;">${escapeHtml(a.detail)}</span>
+    </div>
+  `).join('');
+}
+
+function renderTimeline(){
+  const items = state.anomalies.slice(0,40).map(a => ({
+    week: state.weekList.find(w=>w.key===a.week)?.label || a.week,
+    model:a.model, defect:a.defect, badge:a.badge, detail:a.detail, type:a.type
+  }));
+  if(items.length===0){
+    document.getElementById('timelineList').innerHTML = '<div style="color:var(--ink-soft);">표시할 타임라인 항목이 없습니다.</div>';
+    return;
+  }
+  document.getElementById('timelineList').innerHTML = items.map(it => `
+    <div class="tl-item">
+      <div class="tl-week">${escapeHtml(it.week)}</div>
+      <div class="tl-body">
+        <div class="tt">${escapeHtml(it.model)} · ${escapeHtml(it.defect)} <span class="badge-anom ${badgeClass(it.type)}">${it.badge}</span></div>
+        <div class="dd">${escapeHtml(it.detail)}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+/* ========================================================================
+   9. AI Insight 텍스트 생성
+   ======================================================================== */
+function renderAIInsight(){
+  const top = state.anomalies.slice(0,8);
+  const body = document.getElementById('aiInsightBody');
+  if(top.length===0){
+    body.innerHTML = `<div class="line">현재 데이터 범위 내에서 뚜렷한 이상징후가 감지되지 않았습니다.</div><span class="cursor"></span>`;
+    return;
+  }
+  const lines = top.map(a => {
+    switch(a.type){
+      case 'DANGER': return `${a.model} 모델의 고장코드 '${a.defect}'가 최근 8주 평균 대비 급증했습니다 — ${a.detail}`;
+      case 'WARNING': return `${a.model} 모델의 고장코드 '${a.defect}'가 지난주 대비 크게 증가했습니다 — ${a.detail}`;
+      case 'NEW': return `${a.model} 모델에서 신규 고장코드가 발견됐습니다 — ${a.detail}`;
+      case 'TREND': return `${a.model} 모델의 고장코드 '${a.defect}'가 3주 연속 증가하고 있습니다 — ${a.detail}`;
+      case 'MODEL_SPECIFIC': return `${a.model} 모델에서만 고장코드 '${a.defect}'가 집중적으로 증가했습니다.`;
+      case 'VERSION_ISSUE': return `${a.detail}`;
+      case 'ENGINEER_CHECK': return `${a.detail}`;
+      case 'REPRO_SPIKE': return `${a.model} 모델은 재현율은 증가했지만 회수율 변화는 미미합니다 — ${a.detail}`;
+      case 'RECALL_SPIKE': return `${a.model} 모델의 회수율이 급증했습니다 — ${a.detail}`;
+      case 'PAID_SPIKE': return `${a.model} 모델의 유상수리 비율이 급증했습니다 — ${a.detail}`;
+      default: return a.detail;
+    }
+  });
+  body.innerHTML = lines.map((l,i)=>`<div class="line" style="animation-delay:${i*0.08}s">${escapeHtml(l)}</div>`).join('') + '<span class="cursor"></span>';
+}
+
+/* ========================================================================
+   10. 데이터 테이블 (DataTables)
+   ======================================================================== */
+function renderTable(){
+  const cols = [FIELD.RECEIPT, FIELD.DATE, '__weekLabel', FIELD.MODEL, FIELD.DEFECT, FIELD.FAULTCODE,
+    FIELD.OS, FIELD.INAVI, FIELD.MAPVER, FIELD.CENTER, FIELD.ENGINEER, FIELD.WARRANTY];
+  const labelMap = {'__weekLabel':'주차'};
+
+  const s_model = document.getElementById('s_model').value.trim().toLowerCase();
+  const s_defect = document.getElementById('s_defect').value.trim().toLowerCase();
+  const s_faultcode = document.getElementById('s_faultcode').value.trim().toLowerCase();
+  const s_receipt = document.getElementById('s_receipt').value.trim().toLowerCase();
+  const s_engineer = document.getElementById('s_engineer').value.trim().toLowerCase();
+
+  let rows = state.filtered.filter(r =>
+    (!s_model || r[FIELD.MODEL].toLowerCase().includes(s_model)) &&
+    (!s_defect || r[FIELD.DEFECT].toLowerCase().includes(s_defect)) &&
+    (!s_faultcode || r[FIELD.FAULTCODE].toLowerCase().includes(s_faultcode)) &&
+    (!s_receipt || (r[FIELD.RECEIPT]||'').toLowerCase().includes(s_receipt)) &&
+    (!s_engineer || r[FIELD.ENGINEER].toLowerCase().includes(s_engineer))
+  );
+
+  if(state.dataTable){ state.dataTable.destroy(); document.getElementById('mainTable').innerHTML=''; }
+
+  const theadHtml = '<thead><tr>' + cols.map(c=>`<th>${escapeHtml(labelMap[c]||c)}</th>`).join('') + '</tr></thead>';
+  document.getElementById('mainTable').innerHTML = theadHtml;
+
+  const tableData = rows.map(r => cols.map(c => c===FIELD.DATE ? r.__date.toISOString().slice(0,10) : (r[c]||'')));
+
+  state.dataTable = $('#mainTable').DataTable({
+    data: tableData,
+    columns: cols.map(()=>({})),
+    pageLength: 25,
+    order: [],
+    scrollX: true,
+    deferRender: true,
+    processing: true,
+    dom: 'Bfrtip',
+    buttons: [
+      { extend:'csv', text:'CSV 다운로드' },
+      { extend:'excel', text:'Excel 다운로드' }
+    ]
+  });
+  state.tableDirty = false;
+}
+
+/* ========================================================================
+   11. 렌더 총괄
+   ======================================================================== */
+function renderAll(){
+  renderKPI();
+  detectAnomalies();
+  renderAIInsight();
+  renderAllCharts();
+  renderWeeklyOverviewSelect();
+  renderMonthlyTrendChart();
+  renderMonthlyOverviewSelect();
+  renderModelDetailSelect();
+  renderAnomalyList();
+  renderTimeline();
+  // 데이터 테이블은 무겁기 때문에(특히 데이터가 수만 건 이상일 때) 탭을 열 때만 만든다
+  state.tableDirty = true;
+  if(document.getElementById('tab-table') && !document.getElementById('tab-table').classList.contains('hidden')){
+    renderTable();
+  }
+}
+
+/* ========================================================================
+   12. 탭 전환 / 테마 토글 / 이벤트 바인딩
+   ======================================================================== */
+function setupTabs(){
+  document.querySelectorAll('#mainTabs .nav-link').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#mainTabs .nav-link').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.tab-pane').forEach(p=>p.classList.add('hidden'));
+      document.getElementById(btn.dataset.tab).classList.remove('hidden');
+      if(btn.dataset.tab === 'tab-table' && state.tableDirty && state.data.length){
+        showLoading('데이터 테이블을 구성하는 중입니다…');
+        setTimeout(() => { renderTable(); hideLoading(); }, 20);
+      }
+    });
+  });
+}
+
+function setupTheme(){
+  document.getElementById('themeToggle').addEventListener('click', () => {
+    const html = document.documentElement;
+    const isDark = html.getAttribute('data-theme') === 'dark';
+    html.setAttribute('data-theme', isDark ? 'light' : 'dark');
+    document.getElementById('themeToggle').textContent = isDark ? '🌙 Dark Mode' : '☀️ Light Mode';
+    if(state.data.length) renderAllCharts(); // 축 색상 갱신
+  });
+}
+
+function setupEvents(){
+  document.getElementById('btnApplyFilters').addEventListener('click', applyFilters);
+  document.getElementById('btnResetFilters').addEventListener('click', resetFilters);
+  document.getElementById('modelDetailSelect').addEventListener('change', e => renderModelDetail(e.target.value));
+  document.getElementById('weeklyOverviewSelect').addEventListener('change', e => renderWeeklyOverview(e.target.value));
+  document.getElementById('monthlyOverviewSelect').addEventListener('change', e => renderMonthlyOverview(e.target.value));
+  ['s_model','s_defect','s_faultcode','s_receipt','s_engineer'].forEach(id=>{
+    document.getElementById(id).addEventListener('input', debounce(renderTable, 300));
+  });
+}
+
+function debounce(fn, ms){
+  let t; return (...args) => { clearTimeout(t); t = setTimeout(()=>fn(...args), ms); };
+}
+
+/* ------------------------- 초기화 ------------------------- */
+document.addEventListener('DOMContentLoaded', async () => {
+  const trackedCfg = loadTrackedModelConfig();
+  state.trackedModels = trackedCfg.models;
+  state.trackedModelsActive = trackedCfg.active;
+  document.getElementById('trackedModelsActive').checked = state.trackedModelsActive;
+  renderTrackedModelChips();
+  setupTrackedModelControls();
+
+  const excludedCfg = loadExcludedFaultCodeConfig();
+  state.excludedFaultCodes = excludedCfg.codes;
+  state.excludedFaultCodesActive = excludedCfg.active;
+  document.getElementById('excludedCodesActive').checked = state.excludedFaultCodesActive;
+  renderExcludedCodeChips();
+  setupExcludedCodeControls();
+
+  setupUpload();
+  setupTabs();
+  setupTheme();
+  setupEvents();
+  setupAccumControls();
+  setupAutoFetchControls();
+
+  // 공유 백업(서버에 올려둔 고정 파일)을 먼저 시도해보고, 없으면(또는 file://라서 막히면)
+  // 기존 방식(이 브라우저에 저장된 누적 데이터 또는 임베딩된 데이터)으로 넘어간다
+  const gotShared = await tryAutoFetchSharedBackup();
+  if(!gotShared){
+    tryLoadExistingAccumulation();
+  }
+});
+</script>
+</body>
+</html>
