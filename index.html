@@ -409,8 +409,8 @@ function showToast(msg){
 /*        callback URL Supabase shows on that same page as an authorized   */
 /*        redirect URI. Without this step the Google button will error.    */
 /* ---------------------------------------------------------------------- */
-const SUPABASE_URL = "";
-const SUPABASE_ANON_KEY = "";
+const SUPABASE_URL = "https://ecpmlmrvlcdfjbtkgfry.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_CR2uOp08VnICCrkPnQ7MIA_E5_P6R0F";
 
 let sb = null, sbUser = null, sbStatus = "disabled"; // disabled | signedOut | signedIn | syncing
 function sbEnabled(){ return !!(SUPABASE_URL && SUPABASE_ANON_KEY); }
