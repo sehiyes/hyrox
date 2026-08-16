@@ -2332,32 +2332,108 @@ function computeGoalPlan(){
   }
 
   const scenarios=computeGoalScenarios();
-  let probability, feasibility;
-  if(totalGapSec<=0){ probability=95; feasibility="already-met"; }
-  else if(targetSec>=scenarios.C.predicted){ probability=88; feasibility="safe"; }
-  else if(targetSec>=scenarios.B.predicted){ probability=65; feasibility="realistic"; }
-  else if(targetSec>=scenarios.A.predicted){ probability=35; feasibility="challenge"; }
-  else { probability=12; feasibility="unrealistic"; }
 
-  // V3 (spec §27): even if the HPI-trend-based scenario check above looked optimistic, if the segment
-  // model shows the gap exceeds the AGGRESSIVE ceiling summed across all 17 segments, the honest read
-  // is "달성 가능성이 낮음" — never respond to an extreme target by silently implying more intensity fixes it.
-  if(segmentGap && !segmentGap.alreadyMet && segmentGap.feasibility==="beyond-model"){
-    feasibility="unrealistic"; probability=Math.min(probability,15);
+  /* ---------------------------------------------------------------------- */
+  /* GOAL FEASIBILITY V2 (this pass) — continuous score replacing the fixed  */
+  /* 95/88/65/35/12 ladder, and the unconditional "beyond-model -> cap 15%"  */
+  /* override. Reuses ONLY existing signals: segmentGap's realistic/         */
+  /* aggressive ceilings (now genuinely time-horizon-aware via               */
+  /* computeTimeHorizonFactor() above), each top-gap segment's               */
+  /* calculateTrainability() (headroom+trend, unchanged), hpiTrendPerWeek(), */
+  /* calcPredictionConfidence(), current fatigue, and buildRaceDnaInsights() */
+  /* (== computePeerAnalysis(), the SAME Race DNA source Dashboard/Race DNA  */
+  /* page use — no separate benchmark/threshold here). Prediction itself     */
+  /* ("얼마나 좋아질 수 있는가") is untouched; this is purely the Goal       */
+  /* Planning layer question ("그 개선량과 남은 기간이 이 목표에 얼마나       */
+  /* 현실적인가") — kept structurally separate per the request.              */
+  /* ---------------------------------------------------------------------- */
+  const confInfo=calcPredictionConfidence();
+  let probability, feasibility, feasibilityV2=null;
+  if(totalGapSec<=0){ probability=95; feasibility="already-met"; }
+  else {
+    const weeksToRaceForGap = segmentGap ? segmentGap.weeksToRace : 8;
+    const sumRealistic = segmentGap ? (segmentGap.sumRealistic||0) : 0;
+    const sumAggressive = segmentGap ? (segmentGap.sumAggressive||0) : 0;
+    const topSegs = segmentGap && !segmentGap.alreadyMet ? segmentGap.segments.slice(0,5) : [];
+    const avgTrainability = topSegs.length ? mean(topSegs.map(s=>s.trainability)) : 0.5;
+
+    // 1) gap-difficulty term — continuous position within realistic/aggressive zones, not a step ladder
+    let gapScore;
+    if(sumRealistic<=0 && sumAggressive<=0) gapScore=50; // no segment data at all -> neutral
+    else if(totalGapSec<=sumRealistic) gapScore = 65 + (sumRealistic>0 ? (1-totalGapSec/sumRealistic) : 0)*30; // 65..95
+    else if(totalGapSec<=sumAggressive){
+      const frac = sumAggressive>sumRealistic ? (totalGapSec-sumRealistic)/(sumAggressive-sumRealistic) : 1;
+      gapScore = 65 - frac*30; // 35..65
+    } else {
+      const excessRatio = sumAggressive>0 ? (totalGapSec-sumAggressive)/sumAggressive : 1;
+      gapScore = clamp(35 - excessRatio*30, 3, 35); // 3..35, degrades further the more it exceeds the ceiling
+    }
+
+    // 2) bounded adjustments (each individually small — nudges, not drivers)
+    const trainabilityAdj = (avgTrainability-0.5)*16; // -8..+8
+    const trend = hpiTrendPerWeek();
+    const trendAdj = trend==null ? 0 : clamp(trend*5, -10, 10);
+    const fatigueAdj = hpiResult.fatigue>70 ? -8 : 0;
+    const confAdj = (confInfo.confidence-0.5)*10; // -5..+5
+
+    // 3) Asia DNA (reuses buildRaceDnaInsights() == computePeerAnalysis() — no separate calc). Only
+    // nudges when the segments actually DRIVING this gap are ALSO real, measured Asia-relative
+    // weaknesses (genuine improvable opportunity) or already Asia-relative strengths (raw gap-vs-own-
+    // bench may overstate real room). No adjustment when data is illustrative-only or doesn't overlap.
+    let asiaDnaAdj = 0, asiaDnaNote = null;
+    try{
+      const raceDna = buildRaceDnaInsights();
+      if(raceDna && topSegs.length){
+        const topKeys = topSegs.map(s=>s.key);
+        const matched = raceDna.segments.filter(ds=>topKeys.includes(ds.key) && ds.isRealPeerData);
+        if(matched.length){
+          const avgPct = mean(matched.map(s=>s.percentile));
+          if(avgPct<40){ asiaDnaAdj=6; asiaDnaNote=`Asia 동일 그룹 대비 실측 하위권(${round1(avgPct)}%ile)인 구간이 Gap을 주도 — 개선 여력 있음`; }
+          else if(avgPct>70){ asiaDnaAdj=-6; asiaDnaNote=`Asia 동일 그룹 대비 이미 상위권(${round1(avgPct)}%ile)인 구간 — 추가 개선 여력은 제한적일 수 있음`; }
+        }
+      }
+    }catch(e){}
+
+    probability = clamp(Math.round(gapScore+trainabilityAdj+trendAdj+fatigueAdj+confAdj+asiaDnaAdj), 3, 95);
+
+    // qualitative label — weeksToRace/trainability are checked TOGETHER before defaulting to
+    // "unrealistic": a target beyond the aggressive ceiling with a SHORT remaining runway is genuinely
+    // low-probability, but the same excess gap with a LONG runway (>20wk — one block past the 12-24wk
+    // long-horizon tier computeTimeHorizonFactor() itself uses, not a fresh cutoff) AND real
+    // trainability evidence is a distinct category: "장기적으로 도전 가능" — never silently promoted to
+    // "safe", but not flattened into the same "어려움" bucket as a short-runway impossible target either.
+    const beyondCeiling = segmentGap && !segmentGap.alreadyMet && segmentGap.feasibility==="beyond-model";
+    const LONG_HORIZON_WEEKS = 20;
+    if(beyondCeiling && weeksToRaceForGap>LONG_HORIZON_WEEKS && avgTrainability>=0.45){
+      feasibility="long-horizon-challenge"; probability=clamp(probability,15,45);
+    } else if(probability>=80) feasibility="safe";
+    else if(probability>=55) feasibility="realistic";
+    else if(probability>=30) feasibility="challenge";
+    else feasibility="unrealistic";
+
+    feasibilityV2 = { gapScore:round1(gapScore), trainabilityAdj:round1(trainabilityAdj), trendAdj:round1(trendAdj),
+      fatigueAdj, confAdj:round1(confAdj), asiaDnaAdj, asiaDnaNote, avgTrainability:round1(avgTrainability),
+      weeksToRace:round1(weeksToRaceForGap), hpiTrend:trend!=null?round1(trend):null };
   }
 
+  // milestone checkpoints (spec: LONG-TERM GOAL RE-EVALUATION) — for goals more than 12 weeks out,
+  // add 24/36wk checkpoints on top of the existing 4/8/12wk ones (same predictTime() calls, just more
+  // of them) so a 52-week goal is shown as a staged path, not a single far-future number confirmed once.
   const weeksToRace=daysToRace()!=null ? Math.max(0,daysToRace()/7) : null;
-  const milestones=[4,8,12].map(w=>({ weeks:w, predicted:predictTime(hpiResult,w).predicted }));
+  const milestoneWeeksList = weeksToRace!=null && weeksToRace>12
+    ? [4,8,12,24,36].filter(w=>w<weeksToRace)
+    : [4,8,12];
+  const milestones=milestoneWeeksList.map(w=>({ weeks:w, predicted:predictTime(hpiResult,w).predicted,
+    note: w>12 ? "장기 체크포인트 — 해당 시점의 실제 HPI/훈련 데이터로 재계산 예정" : null }));
 
   const priorityTop3=priority.slice(0,3).map(p=>p.label.replace(" Index",""));
 
   // never overstate certainty on thin data: widen the probability into a range and flag it as an
   // estimate rather than showing a single confident-looking percentage.
-  const confInfo=calcPredictionConfidence();
   const probLow=clamp(probability-Math.round((1-confInfo.confidence)*25),3,95);
   const probHigh=clamp(probability+Math.round((1-confInfo.confidence)*25),3,95);
 
-  return { targetSec, currentSec, totalGapSec, decomposition, segmentGap, probability, probLow, probHigh, feasibility, scenarios, milestones,
+  return { targetSec, currentSec, totalGapSec, decomposition, segmentGap, probability, probLow, probHigh, feasibility, feasibilityV2, scenarios, milestones,
     weeksToRace, priorityTop3, baselineSource:baseline.source, confidence:confInfo.confidence, confidenceLabel:confInfo.label, missingData:confInfo.missing,
     goalAwareDebug:baseline.debug };
 }
@@ -2734,20 +2810,55 @@ function calculateTrainability(indexKey){
 // time-to-race (compressed near race day — spec §28), and data confidence (a segment resolved only
 // from a benchmark-reference, with zero real measurement, cannot claim a large realistic gain —
 // we simply don't know the true current level well enough).
+/* ---------------------------------------------------------------------- */
+/* GOAL FEASIBILITY V2 — TIME HORIZON MODEL (this pass)                    */
+/*   Replaces the old flat `clamp(weeksToRace/12, 0.25, 1)` — which made    */
+/*   12 weeks and 52 weeks produce an IDENTICAL improvement ceiling — with  */
+/*   a piecewise curve: 0-4/4-8/8-12wk build up to the same 1.0 ceiling the */
+/*   old formula reached at 12wk (unchanged for anyone racing within 12    */
+/*   weeks — no regression there), then 12-24wk and 24-52wk add FURTHER     */
+/*   room, but ONLY in proportion to calculateTrainability()'s existing     */
+/*   headroom+trend blend for that specific index — long time alone never   */
+/*   manufactures improvement; it only unlocks room that real trainability  */
+/*   evidence already supports. No new signal is introduced — trainability  */
+/*   is calculateTrainability()'s own unmodified 0..1 output.               */
+/* ---------------------------------------------------------------------- */
+function computeTimeHorizonFactor(weeksToRace, indexKey){
+  let base;
+  if(weeksToRace<=4) base = (weeksToRace/4)*0.35;
+  else if(weeksToRace<=8) base = 0.35 + ((weeksToRace-4)/4)*0.30;
+  else if(weeksToRace<=12) base = 0.65 + ((weeksToRace-8)/4)*0.35;
+  else base = 1.0;
+  if(weeksToRace<=12) return clamp(base, 0.05, 1);
+
+  // beyond 12wk: extra long-horizon room, gated by real trainability evidence for THIS index (reuses
+  // calculateTrainability() as-is — no separate long-horizon signal invented).
+  const trainability = calculateTrainability(indexKey);
+  const evidenceMultiplier = clamp((trainability-0.3)/0.4, 0, 1); // 0 at trainability<=0.3, 1 at trainability>=0.7
+  let longTermExtra;
+  if(weeksToRace<=24){
+    longTermExtra = ((weeksToRace-12)/12) * 0.30 * evidenceMultiplier; // 12-24wk: up to +0.30
+  } else {
+    const extra24 = 0.30*evidenceMultiplier;
+    const extra52 = ((Math.min(weeksToRace,52)-24)/28) * 0.15 * evidenceMultiplier; // 24-52wk: up to +0.15 more, diminishing
+    longTermExtra = extra24 + extra52;
+  }
+  return clamp(1.0 + longTermExtra, 0.05, 1.45);
+}
 function calculateSegmentPotential(seg, weeksToRace){
   const indexKey=segmentIndexKey(seg);
   const currentSec = seg.sec!=null ? seg.sec : seg.benchmark;
   const hasRealData = seg.sec!=null;
   const gapToBenchSec = Math.max(0, currentSec - seg.benchmark);
   const trainability = calculateTrainability(indexKey);
-  const timeFactor = clamp(weeksToRace/12, 0.25, 1); // 12wk+ = full scope; compresses as race nears
+  const timeFactor = computeTimeHorizonFactor(weeksToRace, indexKey); // was: clamp(weeksToRace/12, 0.25, 1) — saturated at 12wk
   const dataConfidence = hasRealData ? (seg.isFresh?1:0.75) : 0.35;
 
   const conservativeSec = gapToBenchSec * clamp(0.12*trainability*timeFactor*dataConfidence, 0, 0.6);
   const realisticSec    = gapToBenchSec * clamp(0.30*trainability*timeFactor*dataConfidence, 0, 0.75);
   const aggressiveSec   = gapToBenchSec * clamp(0.50*trainability*timeFactor*dataConfidence, 0, 0.9);
 
-  return { ...seg, indexKey, currentSec, gapToBenchSec, trainability, hasRealData,
+  return { ...seg, indexKey, currentSec, gapToBenchSec, trainability, hasRealData, timeFactor,
     conservativeSec, realisticSec, aggressiveSec,
     confidence: hasRealData ? (seg.isFresh?"high":"medium") : "low" };
 }
@@ -3776,7 +3887,151 @@ function runHpsAudit(){
         });
       }
 
+      // spec §11 — Dashboard Coach ↔ Race DNA consistency audit (this pass)
+      {
+        const dna = buildRaceDnaInsights();
+        if(dna){
+          // TEST — Dashboard Coach와 Race DNA의 개선 필요 구간 일치: buildCoachInsights()가 만드는 "Asia
+          // DNA — 개선 필요" 카드가 정확히 dna.biggestLosses[0]/improvementsTop3와 같은 값을 참조하는지.
+          const ruleResultForDna = evaluateRules();
+          const coachInsights = buildCoachInsights(ruleResultForDna, dna);
+          const dnaCard = coachInsights.find(i=>i.source==="asia-dna" && i.category==="Asia DNA — 개선 필요");
+          const biggest = dna.biggestLosses[0];
+          if(biggest){
+            log("TEST — Dashboard Coach와 Race DNA의 개선 필요 구간 일치", !!dnaCard && dnaCard.evidence[0].includes(biggest.label),
+              `Race DNA biggestLosses[0]=${biggest.label}(${fmtTime(Math.abs(biggest.timeLossSec))}), Dashboard Coach 카드=${dnaCard?dnaCard.evidence[0]:"카드 없음"}`);
+          } else {
+            log("TEST — Dashboard Coach와 Race DNA의 개선 필요 구간 일치", true, "biggestLosses 없음(기록 손실 데이터 없음) — 스킵");
+          }
+
+          // TEST — Dashboard Coach가 Asia benchmark를 우선 사용하는지: ASIA/Global row가 있는 segment에
+          // 대해 buildRaceDnaInsights()가 넘기는 segments[].benchmarkSource가 STATIC_FALLBACK이 아닌지.
+          const ageBand = deriveAgeBand(STATE.profile.age);
+          const benchGender = deriveBenchmarkGender();
+          const withAsiaRow = dna.segments.filter(s=>{
+            const key = s.key==="roxzone"?"transition":s.key;
+            return !!queryDerivedBenchmark(STATE.profile.division, benchGender, ageBand, key);
+          });
+          const wronglyStatic = withAsiaRow.filter(s=>s.benchmarkSource==="STATIC_FALLBACK");
+          log("TEST — Dashboard Coach가 Asia benchmark를 우선 사용", wronglyStatic.length===0,
+            withAsiaRow.length ? `ASIA/Global row 있는 segment ${withAsiaRow.length}개 중 STATIC_FALLBACK ${wronglyStatic.length}개 (${wronglyStatic.map(s=>s.label).join(", ")||"없음"})` : "현재 조건에 해당하는 ASIA/Global row 없음 — 구조만 확인");
+
+          // TEST — Asia 데이터 부족 시 과장 금지: isRealPeerData=false인 segment는 카드 문구에 "참고
+          // 기준"/"reference estimate" 계열 표현이 들어가야 하고, "실제 데이터"인 것처럼 단정하지 않는지.
+          const unreal = dna.segments.filter(s=>!s.isRealPeerData);
+          const dnaCardHonest = !dnaCard || dnaCard.isRealData || dnaCard.evidence.some(e=>e.includes("참고 기준")||e.includes("reference estimate"));
+          log("TEST — Asia 데이터 부족 시 과장 금지 (실제 데이터처럼 표현하지 않음)", dnaCardHonest,
+            `dna.isRealData=${dna.isRealData}, unreal segment 수=${unreal.length}, 카드 문구=${dnaCard?dnaCard.evidence[0].slice(0,40)+"...":"카드 없음"}`);
+        } else {
+          log("TEST — Dashboard Coach ↔ Race DNA 일치/Asia 우선/과장 금지", true, "현재 Division에 race 데이터 없음 — buildRaceDnaInsights() 스킵");
+        }
+
+        // TEST — Safety Override: Critical fatigue/recovery/pain 상황에서 Asia DNA 카드보다 Safety
+        // Override가 우선되는지 (Asia DNA 카드가 suppressCategories에 걸리면 제외되는지 직접 검증).
+        const criticalFired = [{ id:"FAT-1", category:"Fatigue", priority:"Critical", reasonText:"synthetic test", actionText:"휴식" }];
+        const fakeRuleResult = { fired: criticalFired };
+        const suppressionCheck = computeSafetyOverrideSuppression(criticalFired);
+        const fakeDna = { isRealData:true, group:{gender:"male",ageGroup:"30-34",division:"Open"},
+          biggestLosses:[{ key:"row", label:"Row", timeLossSec:60, impactPct:40 }],
+          strengthsTop3:[{ label:"Sandbag Lunge", score:82 }], segments:[], improvementsTop3:[], priorityStations:[], totalLossSec:60 };
+        const safetyTestInsights = buildCoachInsights(fakeRuleResult, fakeDna);
+        const dnaImprovementSuppressed = !safetyTestInsights.some(i=>i.category==="Asia DNA — 개선 필요");
+        log("TEST — Safety Override가 Asia DNA 개선 카드보다 우선 (FAT-1 발동 시 Station 계열 DNA 카드 억제)",
+          suppressionCheck.active && dnaImprovementSuppressed,
+          `suppression.active=${suppressionCheck.active}, DNA 개선 카드 억제됨=${dnaImprovementSuppressed}, 카드 목록=[${safetyTestInsights.map(i=>i.category).join(", ")}]`);
+      }
+
       STATE.profile.gender = snapGender; STATE.profile.age = snapAge;
+    }
+
+    // ── Goal Feasibility V2 audit (spec: TEST Goal-1~7) ─────────────────────
+    STATE.profile.division = snapDivision; STATE.profile.goalDivision = snapGoal;
+    {
+      const snapTargetDate = STATE.profile.targetDate, snapTargetTime = STATE.profile.targetTime, snapHpiHistory = STATE.hpiHistory;
+      const daysAgoISO = (n)=>{ const d=new Date(); d.setDate(d.getDate()-n); return d.toISOString().slice(0,10); };
+      try{
+        const hpiNow = calcHPI();
+        // pick a target ~20% faster than current baseline so it's guaranteed to land beyond the
+        // realistic ceiling at short horizons (exercises the "beyond-model" path deliberately)
+        const baselineSec = getCurrentPerformanceBaseline(hpiNow).value;
+        const aggressiveTargetSec = Math.round(baselineSec*0.8);
+        STATE.profile.targetTime = fmtTime(aggressiveTargetSec);
+
+        const setWeeksOut = (weeks)=>{ const d=new Date(); d.setDate(d.getDate()+Math.round(weeks*7)); STATE.profile.targetDate=d.toISOString().slice(0,10); };
+
+        setWeeksOut(8); const plan8 = computeGoalPlan();
+        setWeeksOut(52); const plan52 = computeGoalPlan();
+        setWeeksOut(12); const plan12 = computeGoalPlan();
+        setWeeksOut(24); const plan24 = computeGoalPlan();
+
+        // TEST Goal-1: 52주 목표의 가능성이 8주보다 낮아지는 현상이 없어야 함
+        if(plan8 && plan52){
+          log("TEST Goal-1 — 동일 목표에서 52주 가능성이 8주보다 낮지 않음", plan52.probability>=plan8.probability,
+            `8주 probability=${plan8.probability} (${plan8.feasibility}), 52주 probability=${plan52.probability} (${plan52.feasibility})`);
+        }
+
+        // TEST Goal-2: 12주 vs 24주 vs 52주에서 시간 증가가 실제 모델에 반영되는지 (sumAggressive가 늘어나는지)
+        if(plan12 && plan24 && plan52 && plan12.segmentGap && plan24.segmentGap && plan52.segmentGap){
+          const agg12=plan12.segmentGap.sumAggressive||0, agg24=plan24.segmentGap.sumAggressive||0, agg52=plan52.segmentGap.sumAggressive||0;
+          log("TEST Goal-2 — 12주<24주<52주로 갈수록 Aggressive 개선 합이 실제로 커짐", agg12<=agg24 && agg24<=agg52 && agg12<agg52,
+            `12주 sumAggressive=${round1(agg12)}s, 24주=${round1(agg24)}s, 52주=${round1(agg52)}s`);
+        }
+
+        // TEST Goal-3: 52주 뒤 + beyond-model이어도 probability<=15%로 고정되지 않는지
+        if(plan52 && plan52.segmentGap && plan52.segmentGap.feasibility==="beyond-model"){
+          log("TEST Goal-3 — 52주+beyond-model이어도 probability가 15%로 하드캡되지 않음", plan52.probability>15,
+            `52주 probability=${plan52.probability}, feasibility=${plan52.feasibility}`);
+        } else {
+          log("TEST Goal-3 — 52주+beyond-model 조건", true, `현재 조건에서 beyond-model 아님(${plan52?plan52.segmentGap?.feasibility:"plan 없음"}) — 시간 지평 확장으로 이미 ceiling을 벗어난 것일 수 있음, 스킵`);
+        }
+
+        // TEST Goal-7: 12개월(52주) vs 12주 목표가 동일한 improvement ceiling을 쓰면 BUG
+        if(plan12 && plan52 && plan12.segmentGap && plan52.segmentGap){
+          const identical = Math.abs((plan12.segmentGap.sumAggressive||0)-(plan52.segmentGap.sumAggressive||0))<0.5;
+          log("TEST Goal-7 — 12개월 목표가 12주와 동일한 improvement ceiling을 쓰지 않음 (동일하면 BUG)", !identical,
+            `12주 sumAggressive=${round1(plan12.segmentGap.sumAggressive||0)}s, 52주=${round1(plan52.segmentGap.sumAggressive||0)}s`);
+        }
+
+        // TEST Goal-4: HPI 상승 추세 + 높은 trainability + 충분한 기간이면 큰 Gap이라도 "어려움" 고정 아님
+        STATE.hpiHistory = [
+          { id:"synth-h1", date: daysAgoISO(56), hpi:45, running:40, engine:45, strengthEnd:45, skill:45, recovery:70, raceExec:50, fatigue:30 },
+          { id:"synth-h2", date: daysAgoISO(0),  hpi:60, running:60, engine:55, strengthEnd:55, skill:55, recovery:70, raceExec:55, fatigue:30 },
+        ];
+        setWeeksOut(52);
+        const planRising = computeGoalPlan();
+        if(planRising){
+          log("TEST Goal-4 — HPI 상승추세+충분한 기간이면 큰 Gap도 '어려움' 고정 아님", planRising.feasibility!=="unrealistic",
+            `feasibility=${planRising.feasibility}, probability=${planRising.probability}, hpiTrend=${planRising.feasibilityV2?.hpiTrend}`);
+        }
+
+        // TEST Goal-5: HPI 하락 추세 + 낮은 trainability + 큰 Gap이면 52주가 남아도 과도하게 낙관 안 함
+        STATE.hpiHistory = [
+          { id:"synth-h3", date: daysAgoISO(56), hpi:60, running:60, engine:55, strengthEnd:55, skill:55, recovery:50, raceExec:55, fatigue:60 },
+          { id:"synth-h4", date: daysAgoISO(0),  hpi:45, running:42, engine:48, strengthEnd:48, skill:48, recovery:45, raceExec:48, fatigue:70 },
+        ];
+        setWeeksOut(52);
+        const planFalling = computeGoalPlan();
+        if(planFalling){
+          log("TEST Goal-5 — HPI 하락추세+낮은 trainability+큰 Gap이면 52주가 남아도 과도하게 낙관 안 함", planFalling.probability<70,
+            `feasibility=${planFalling.feasibility}, probability=${planFalling.probability}, hpiTrend=${planFalling.feasibilityV2?.hpiTrend}`);
+        }
+
+        // TEST Goal-6: Asia DNA에서 개선 여력이 큰 영역이 실제 feasibility 계산에 반영되는지 —
+        // asiaDnaAdj가 0이 아닌 케이스가 실제로 존재/작동하는지 구조적으로 확인
+        STATE.hpiHistory = snapHpiHistory;
+        setWeeksOut(24);
+        const planForDna = computeGoalPlan();
+        if(planForDna && planForDna.feasibilityV2){
+          log("TEST Goal-6 — Asia DNA 반영 필드(asiaDnaAdj)가 feasibilityV2에 노출됨", "asiaDnaAdj" in planForDna.feasibilityV2,
+            `asiaDnaAdj=${planForDna.feasibilityV2.asiaDnaAdj}, note=${planForDna.feasibilityV2.asiaDnaNote||"(현재 조건에서 매칭 없음)"}`);
+        } else {
+          log("TEST Goal-6 — Asia DNA 반영 필드", true, "목표 기록 미설정 또는 이미 달성 — feasibilityV2 없음, 스킵");
+        }
+      } finally {
+        STATE.profile.targetDate = snapTargetDate;
+        STATE.profile.targetTime = snapTargetTime;
+        STATE.hpiHistory = snapHpiHistory;
+      }
     }
   } finally {
     STATE.profile.division = snapDivision; STATE.profile.goalDivision = snapGoal;
@@ -4305,7 +4560,14 @@ function computeSafetyOverrideSuppression(fired){
   const active = criticalIds.some(id=>["INJ-1","FAT-1","REC-1","TAP-1","TAP-2","RACE-1"].includes(id));
   return { active, suppressCategories: active ? ["Running","HYROX Station","Strength","Weekly Planning"] : [] };
 }
-function buildCoachInsights(ruleResult){
+// Which existing rule category a Race DNA segment key most closely maps to, purely so Safety Override
+// suppression (above) can apply to Asia-DNA-based insight cards exactly the same way it already
+// applies to rule-based ones — a suppressed category stays suppressed regardless of which mechanism
+// (Rule Engine or Race DNA) produced the card.
+const DNA_CATEGORY_FOR_SEGMENT_KEY = { run:"Running", ski:"HYROX Station", sledPush:"HYROX Station",
+  sledPull:"HYROX Station", burpee:"HYROX Station", row:"HYROX Station", carry:"HYROX Station",
+  lunge:"HYROX Station", wallball:"HYROX Station", roxzone:"HYROX Station" };
+function buildCoachInsights(ruleResult, raceDnaInsights){
   const byCategory = {};
   ruleResult.fired.forEach(r=>{ (byCategory[r.category] = byCategory[r.category]||[]).push(r); });
   const suppression = computeSafetyOverrideSuppression(ruleResult.fired);
@@ -4320,9 +4582,63 @@ function buildCoachInsights(ruleResult){
       actions: [...new Set(rules.map(r=>r.actionText))],
       ruleCount: rules.length,
       ruleIds: rules.map(r=>r.id), // internal/debug only — never render
+      source: "rule",
     };
   });
   if(suppression.active) insights = insights.filter(ins=>!suppression.suppressCategories.includes(ins.category));
+
+  /* ---------------------------------------------------------------------- */
+  /* spec §1/§2/§6 — Asia DNA insight cards. Built ONLY from                 */
+  /* buildRaceDnaInsights() (== computePeerAnalysis(), the same source of    */
+  /* truth the Race DNA page renders) — no separate benchmark/threshold/     */
+  /* percentile calculation lives here. Priority order requested:            */
+  /*   ① Critical safety (rank 0, existing, untouched)                       */
+  /*   ② Asia DNA large loss / improvement area (rank 0.5 — ahead of every   */
+  /*      ordinary rule-engine High/Medium/Low card, but never ahead of an   */
+  /*      active Critical safety override)                                  */
+  /*   ③ Asia DNA relative strength (rank 0.6)                               */
+  /*   ④/⑤ Training Priority / general Rule Engine — unchanged, still their  */
+  /*      existing ranks (1/2/3) below                                       */
+  /* Text follows the 데이터→판단→근거→행동 structure (spec §6). Numbers are  */
+  /* NEVER fabricated — if isRealData is false, the card explicitly says     */
+  /* "참고 기준(reference estimate)" instead of presenting the number as a    */
+  /* real Asia percentile/ranking (spec §5, same REAL/REFERENCE distinction  */
+  /* as the Race DNA page). If Safety Override has suppressed the rule       */
+  /* category this segment maps to, the matching DNA card is suppressed too. */
+  /* ---------------------------------------------------------------------- */
+  if(raceDnaInsights){
+    const biggest = raceDnaInsights.biggestLosses[0];
+    if(biggest){
+      const mappedCategory = DNA_CATEGORY_FOR_SEGMENT_KEY[biggest.key] || "HYROX Station";
+      const suppressed = suppression.active && suppression.suppressCategories.includes(mappedCategory);
+      if(!suppressed){
+        const g = raceDnaInsights.group || {};
+        const groupLabel = `Asia ${g.gender==="female"?"여성":"남성"} · ${g.ageGroup||""} · ${g.division||""}`;
+        insights.push({
+          category:"Asia DNA — 개선 필요", emoji:"📊", title:"Asia 동일 그룹 대비 최대 기록 손실",
+          priority:"High", priorityLabel:PRIORITY_NATURAL.High, priorityRank:0.5,
+          evidence:[ raceDnaInsights.isRealData
+            ? `${groupLabel} 기준과 비교했을 때 ${biggest.label}에서 약 ${fmtTime(Math.abs(biggest.timeLossSec))}의 기록 손실이 발생하고 있습니다 (전체 손실 중 ${biggest.impactPct}%).`
+            : `${groupLabel} 실측 비교 데이터가 부족하여 참고 기준(reference estimate)으로 판단합니다 — ${biggest.label}에서 약 ${fmtTime(Math.abs(biggest.timeLossSec))} 손실 추정치입니다.` ],
+          actions:[ `이번 주에는 ${biggest.label}의 기술 효율과 고강도 지속능력을 우선 보완하는 것이 가장 효과적입니다.` ],
+          ruleCount:1, ruleIds:[], source:"asia-dna",
+        });
+      }
+    }
+    const topStrength = raceDnaInsights.strengthsTop3[0];
+    if(topStrength){
+      insights.push({
+        category:"Asia DNA — 강점", emoji:"✅", title:"Asia 동일 그룹 대비 강점",
+        priority:"Low", priorityLabel:PRIORITY_NATURAL.Low, priorityRank:0.6,
+        evidence:[ raceDnaInsights.isRealData
+          ? `${topStrength.label}은(는) 동일 그룹 대비 상위권 수행력입니다 (내부 점수 ${topStrength.score}점).`
+          : `실측 비교 데이터가 부족한 상태의 참고 추정치입니다 — ${topStrength.label}이(가) 상대적으로 안정적인 구간입니다.` ],
+        actions:[ `현재 페이스/기술을 유지하면서 다른 구간에 이번 주 훈련을 집중해도 좋습니다.` ],
+        ruleCount:1, ruleIds:[], source:"asia-dna",
+      });
+    }
+  }
+
   insights.sort((a,b)=>a.priorityRank-b.priorityRank);
   return insights;
 }
@@ -5127,9 +5443,16 @@ function buildCoachContext(){
   const painR = getPainRestrictions();
   const reasoning = buildTopRecommendationReasoning(ruleResult);
   const topRule = ruleResult.fired[0] || null;
+  // spec §8: full Race DNA payload, sourced ONLY from buildRaceDnaInsights() (== computePeerAnalysis())
+  // — never recomputed here. null fields stay null when the underlying data doesn't exist; nothing is
+  // fabricated to fill out the shape.
   let raceDna = null;
-  try{ const peer = computePeerAnalysis(); if(peer) raceDna = { type:peer.raceDna.id, label:peer.raceDna.label,
-    strengthIdx:peer.strengthIdx, isRealData:peer.dataSource.isReal }; } catch(e){ raceDna = null; }
+  try{
+    const dna = buildRaceDnaInsights();
+    if(dna) raceDna = { type:dna.type, label:dna.label, isRealData:dna.isRealData, peerSource:dna.peerSource,
+      strengthsTop3:dna.strengthsTop3, improvementsTop3:dna.improvementsTop3, biggestLosses:dna.biggestLosses,
+      totalLossSec:dna.totalLossSec, priorityStations:dna.priorityStations, segments:dna.segments };
+  } catch(e){ raceDna = null; }
 
   return {
     generatedAt: new Date().toISOString(),
@@ -5744,6 +6067,35 @@ function classifyRaceDna(s){
   return RACE_DNA_TYPES.find(t=>{ try{ return t.test(s); }catch(e){ return false; } }) || RACE_DNA_TYPES[RACE_DNA_TYPES.length-1];
 }
 
+// spec item 7 — SINGLE shared Race DNA insight builder. Wraps computePeerAnalysis() only; recomputes
+// nothing. Reused by Dashboard Coach Insight, the Race DNA page itself, Training Priority, and Weekly
+// Plan, so "강점/개선 필요/기록 손실" can never differ between screens — they all read this one object.
+//   computePeerAnalysis() -> buildRaceDnaInsights() -> { strengthsTop3, improvementsTop3, biggestLosses,
+//   raceDnaType, peerSource, segments, ... } -> Dashboard Coach / Race DNA Page / Training Priority / Weekly Plan
+function buildRaceDnaInsights(){
+  const peer = computePeerAnalysis();
+  if(!peer) return null;
+  const strengthsTop3 = buildStrengthsTop3(peer.segments);
+  const improvementsTop3 = buildImprovementTop3(peer.impactList, peer.race);
+  const biggestLosses = peer.impactList.filter(c=>c.timeLoss>0).slice(0,3)
+    .map(c=>({ key:c.key, label:c.label, timeLossSec:c.timeLoss, impactPct: round1(c.impactPct) }));
+  const priorityStations = peer.impactList.filter(c=>c.key!=="run").slice(0,3).map(c=>c.key);
+  // REAL PEER DATA vs REFERENCE ESTIMATE (spec §5/§10), per-segment — reuses the EXISTING peerIsReal
+  // flag queryPeerSegmentStats() already computes (real ASIA/Global row, or EXTERNAL_RACE_DB with
+  // n>=MIN_REAL_SAMPLE); no new threshold, no new logic, just surfaced per segment for consumers.
+  const segments = peer.segments.filter(s=>s.actual!=null).map(s=>({
+    key:s.key, label:s.label, actual:s.actual, peerMean:s.peerMean,
+    percentile:s.percentile!=null?round1(s.percentile):null, timeLoss:s.timeLoss,
+    benchmarkSource:s.benchmarkSource||null, sampleN:s.sampleN||null, isRealPeerData: !!s.peerIsReal,
+  }));
+  return {
+    type: peer.raceDna.id, label: peer.raceDna.label, isRealData: peer.dataSource.isReal,
+    peerSource: peer.dataSource.sourceLabel, group: peer.group, race: peer.race,
+    strengthsTop3, improvementsTop3, biggestLosses, totalLossSec: peer.totalLossSec,
+    priorityStations, strengthIdx: peer.strengthIdx, segments, impactList: peer.impactList,
+  };
+}
+
 /* ---------------------------------------------------------------------- */
 /* PHASE 4 — RACE DNA: Historical / Current Adjustment / Current /          */
 /*     Projected / Confidence / Source (doc 16 §2-3)                        */
@@ -5940,37 +6292,6 @@ function svgBottleneckBars(items, w=560){
       <rect x="230" y="${y+3}" width="220" height="14" rx="4" fill="#1C1C1F"/>
       <rect x="230" y="${y+3}" width="${barW}" height="14" rx="4" fill="${color}"/>
       <text x="460" y="${y+13}" font-family="JetBrains Mono" font-size="11" fill="${color}">${it.gapPct>=0?"+":""}${round1(it.gapPct)}%</text>`;
-  });
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${rows}</svg>`;
-}
-
-/* ---------------------------------------------------------------------- */
-/* DASHBOARD "개선 필요 구간 Top" — peer-benchmark based (this pass)         */
-/*     Reuses computePeerAnalysis().impactList AS-IS (same function DNA     */
-/*     page uses — same Division/Gender/AgeBand/ASIA·Global benchmark       */
-/*     resolution chain, so Dashboard and DNA can never disagree about      */
-/*     which comparison group or benchmark source was used). Bars are       */
-/*     sized/colored by impactPct (each station's weighted share of total   */
-/*     time lost vs the peer group), never by a raw static-BENCH gap% —     */
-/*     that raw comparison (which can read like "+573.9%" for a segment     */
-/*     with almost no benchmark time, e.g. Transition) still exists, but    */
-/*     only in its own separate "기준 대비 현황" section (기록 예측 페이지's   */
-/*     "개선 필요 구간 상세", unchanged) — never as the Dashboard headline.  */
-/* ---------------------------------------------------------------------- */
-function svgPeerImpactBars(impactList, w=560){
-  const list = (impactList||[]).filter(it=>it.timeLoss>0).slice(0,6);
-  if(!list.length) return `<div class="empty-note">동일 그룹(성별·연령대·Division) 대비 개선이 필요한 구간이 없거나, 비교할 대회 기록이 부족합니다</div>`;
-  const rowH=30; const h=list.length*rowH+10;
-  const maxPct=Math.max(5,...list.map(it=>it.impactPct));
-  let rows="";
-  list.forEach((it,i)=>{
-    const y=i*rowH+8;
-    const barW=Math.min(220,(it.impactPct/maxPct)*220);
-    const color = it.impactPct>20? "#FF4D4D" : it.impactPct>10? "#FFB020" : "#33D17A";
-    rows+=`<text x="0" y="${y+13}" font-family="Inter" font-size="11.5" fill="#F5F4F1">${escapeHtml(it.label)}</text>
-      <rect x="230" y="${y+3}" width="220" height="14" rx="4" fill="#1C1C1F"/>
-      <rect x="230" y="${y+3}" width="${barW}" height="14" rx="4" fill="${color}"/>
-      <text x="460" y="${y+13}" font-family="JetBrains Mono" font-size="11" fill="${color}">+${fmtTime(it.timeLoss)} · ${round1(it.impactPct)}%</text>`;
   });
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${rows}</svg>`;
 }
@@ -6677,20 +6998,19 @@ function renderFitnessSurveyModal(){
 /* ---------------------------------------------------------------------- */
 function renderDashboard(wrap){
   const hpiResult=calcHPI();
-  // analyzeBottleneck() is kept only for the Rule Engine (buildRuleContext) and the
-  // Prediction page's separate "기준 대비 현황" (raw static-BENCH gap%) section — the
-  // Dashboard's own "개선 필요 구간 Top" now reads from computePeerAnalysis().impactList
-  // instead, so it never shows a raw BENCH-relative number (e.g. "+573.9%") as if it
-  // were the headline metric. Both this page and the DNA page call the exact same
-  // computePeerAnalysis(), so they always agree on Division/Gender/AgeBand/benchmark source.
-  const peerAnalysis = computePeerAnalysis();
+  const bottleneck=analyzeBottleneck(hpiResult);
   const ruleResult=evaluateRules();
   const race=latestRace();
   const dLeft=daysToRace();
   const phase=currentPhase();
   const pred = predictTime(hpiResult,0);
   const topRules = ruleResult.fired.slice(0,4);
-  const insights = buildCoachInsights(ruleResult);
+  // spec §9: Dashboard no longer computes its own DNA/benchmark judgement — buildRaceDnaInsights()
+  // wraps computePeerAnalysis() (same source of truth as the Race DNA page) and is threaded into
+  // buildCoachInsights() so Asia DNA comparisons factor into "코치의 핵심 판단" itself, not just the
+  // separate Race DNA page.
+  const raceDnaInsights = buildRaceDnaInsights();
+  const insights = buildCoachInsights(ruleResult, raceDnaInsights);
 
   const ds=dataStatus();
   const coach=coachLevelInfo();
@@ -6757,8 +7077,8 @@ function renderDashboard(wrap){
       </div>
       <div class="card">
         <div class="row-between"><h2 class="section-title">개선 필요 구간 Top</h2></div>
-        <p class="lead" style="margin-bottom:10px;">동일 그룹(성별·연령대·Division) 대비 시간 손실 영향도 기준, 큰 순서대로</p>
-        ${peerAnalysis ? svgPeerImpactBars(peerAnalysis.impactList) : `<div class="empty-note">HYROX 대회 기록(러닝 8구간 + 스테이션)을 등록하면 동일 그룹 대비 개선 필요 구간이 표시됩니다</div>`}
+        <p class="lead" style="margin-bottom:10px;">벤치마크 대비 시간 초과율(%) 기준, 큰 순서대로</p>
+        ${svgBottleneckBars(bottleneck.items.slice(0,6))}
       </div>
     </div>
 
@@ -7445,236 +7765,70 @@ function ocrErrorText(e){
 function defaultTlOcrState(){ return { images:[], status:"idle", progress:0, warnings:[], rawText:"" }; }
 let TL_OCR_STATE = defaultTlOcrState();
 let TL_OCR_DRAFT = null; // editable fields after parsing, null until something's been read
-
-/* ---------------------------------------------------------------------- */
-/* TRAINING LOG OCR — REWRITE (2026-08 pass)                               */
-/*   Root-cause fix for "거리/시간 항목을 찾지 못했습니다" false errors:      */
-/*   the OLD pipeline required distance+duration together (running-shaped   */
-/*   assumption) and concatenated all images into one blob before a single  */
-/*   label-scan. This version:                                              */
-/*     1) classifies workout TYPE first (classifyWorkoutType), distance is  */
-/*        NEVER required for any type — only date+type+duration are.       */
-/*     2) OCRs each image independently, then MERGES the resulting partial  */
-/*        field-sets into one candidate record (mergeOcrFieldSets) instead  */
-/*        of letting one image's missing field fail the whole batch.        */
-/*     3) supports both "label→value" AND "value→label" layouts (Garmin/    */
-/*        Apple "big number, caption below" tiles read in reverse order),   */
-/*        and many more date/duration phrasings (see parseFlexibleDate /    */
-/*        parseFlexibleDuration).                                           */
-/*     4) never silently defaults an unresolved date to today — flags it    */
-/*        "날짜 확인 필요" and leaves the field blank for the person to fill. */
-/*     5) shows a 🟢/🟡/🔴 confidence read (computeOcrConfidence) before      */
-/*        save, with the specific reasons.                                  */
-/* ---------------------------------------------------------------------- */
-
-// Internal detected category (fine-grained, for display/confidence only) →
-// mapped to the app's existing STATE.trainingLog type enum, which stays
-// unchanged so HPI/ACWR/load-by-type keep working exactly as before:
-// run | interval | strength | wod | conditioning | recovery
-const OCR_DETECTED_TO_STATE_TYPE = {
-  run:"run", cycling:"conditioning", walking:"conditioning", hiking:"conditioning",
-  strength:"strength", hiit:"wod", wod:"wod", hyrox_wod:"wod",
-  ski:"conditioning", row:"conditioning", cardio:"conditioning", other:"conditioning",
+const TL_OCR_TYPE_KEYWORDS = { run:["run","running","달리기","러닝"], interval:["interval","인터벌"], strength:["strength","weight","웨이트","근력"],
+  wod:["wod","hyrox","crossfit"], conditioning:["conditioning","컨디셔닝","row","ski","erg"], recovery:["recovery","회복","rest"] };
+function tlOcrGuessType(text){
+  const low=text.toLowerCase();
+  for(const [type,kws] of Object.entries(TL_OCR_TYPE_KEYWORDS)){ if(kws.some(k=>low.includes(k))) return type; }
+  return "run"; // most common source for these screenshots
+}
+// label -> field, with common Garmin/Strava/watch-app synonyms (English + Korean)
+const TL_OCR_LABEL_MAP = {
+  distanceKm: ["distance","거리","km","킬로미터"],
+  durationMin: ["time","duration","moving time","시간","운동시간","소요시간"],
+  avgPaceSecKm: ["avg pace","average pace","pace","평균 페이스","페이스"],
+  avgHr: ["avg hr","average hr","avg heart rate","평균 심박","평균심박"],
+  maxHr: ["max hr","maximum hr","max heart rate","최대 심박","최고심박"],
+  intensityRpe: ["rpe","perceived exertion","자각강도"],
 };
-const OCR_DETECTED_LABEL_KO = {
-  run:"러닝", cycling:"사이클링", walking:"걷기", hiking:"하이킹", strength:"근력 운동",
-  hiit:"HIIT", wod:"WOD", hyrox_wod:"HYROX WOD", ski:"SkiErg", row:"로잉",
-  cardio:"카디오", other:"기타 운동",
-};
-// Ordered rule list — first match wins. Specific/compound phrases ("weight
-// training", "실내 사이클링") are checked before generic ones ("workout",
-// "카디오"), and strength-signal keywords (sets/reps/exercise names) can
-// override a generic title like "Evening Workout".
-const WORKOUT_TYPE_RULES = [
-  { type:"hyrox_wod", kws:["hyrox"] },
-  { type:"strength", kws:["weight training","웨이트 트레이닝","웨이트","strength training","근력 운동","근력운동","kettlebell","케틀벨","bench press","벤치프레스","squat","스쿼트","deadlift","데드리프트","total sets","total reps","세트 수","반복 횟수"] },
-  { type:"hiit", kws:["hiit","interval training","인터벌 트레이닝"] },
-  { type:"cycling", kws:["cycling","사이클링","사이클","spin","spinning","바이크","bike ride","indoor bike"] },
-  { type:"row", kws:["rowing","로잉","row erg","skierg row"] },
-  { type:"ski", kws:["skierg","ski erg","스키에르그"] },
-  { type:"hiking", kws:["hiking","하이킹","등산"] },
-  { type:"walking", kws:["walking","걷기","산책"] },
-  { type:"wod", kws:["crossfit","크로스핏","circuit","서킷"] },
-  { type:"cardio", kws:["cardio","카디오"] },
-  { type:"run", kws:["running","러닝","달리기","조깅","jogging","run "] },
-  { type:"wod", kws:["workout","운동"] }, // generic catch-all, checked before returning null
-];
-function classifyWorkoutType(text){
-  const low = String(text||"").toLowerCase();
-  for(const rule of WORKOUT_TYPE_RULES){
-    if(rule.kws.some(k=>low.includes(k.toLowerCase()))) return rule.type;
-  }
-  return null; // unresolved — caller applies the distance+pace heuristic, then falls back to "other"
-}
-
-const OCR_MONTH_NAMES = ["january","february","march","april","may","june","july","august","september","october","november","december"];
-function ocrMonthNameToNum(name){
-  const abbr = OCR_MONTH_NAMES.findIndex(m=>m.slice(0,3)===String(name).toLowerCase().slice(0,3));
-  return abbr>=0 ? abbr+1 : null;
-}
-// Returns { date:"YYYY-MM-DD"|null, needsConfirmation:bool, note:string|null }
-// Never silently defaults to today when nothing resolves (spec item 3).
-function parseFlexibleDate(text, todayISOStr){
-  const t = String(text||"");
-  // ISO / dot / slash: 2026-08-13, 2026.08.13, 2026/08/13
-  let m = t.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
-  if(m) return { date:`${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`, needsConfirmation:false, note:null };
-  // "August 13, 2026" / "Aug 13, 2026" / "...at 6:38 PM" (time part ignored)
-  m = t.match(/\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b/);
-  if(m){ const mo=ocrMonthNameToNum(m[1]); if(mo) return { date:`${m[3]}-${String(mo).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`, needsConfirmation:false, note:null }; }
-  // Korean "8월 13일" (연도 없음 → 올해로 가정, 참고용 note)
-  m = t.match(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/);
-  if(m){ const year=todayISOStr.slice(0,4); return { date:`${year}-${String(m[1]).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`, needsConfirmation:false,
-    note:"연도 정보가 없어 올해로 가정했습니다 — 확인해주세요." }; }
-  // 상대 날짜: 어제/Yesterday, 오늘/Today
-  if(/어제|yesterday/i.test(t)){ const d=new Date(todayISOStr); d.setDate(d.getDate()-1);
-    return { date:d.toISOString().slice(0,10), needsConfirmation:false, note:"'어제'로 표시되어 있어 인식 시점 기준으로 계산했습니다 — 확인해주세요." }; }
-  if(/오늘|today/i.test(t)){ return { date:todayISOStr, needsConfirmation:false, note:"'오늘'로 표시되어 있어 인식 시점 날짜를 사용했습니다 — 확인해주세요." }; }
-  // 요일만 있고 절대 날짜가 없는 경우 (예: "화요일 - 오후 8:49") → 확정하지 않음
-  return { date:null, needsConfirmation:true, note:null };
-}
-
-// hh:mm:ss or mm:ss → minutes (float, 1 decimal)
-function hmsToMinutes(str){
-  const s=String(str).trim();
-  const m3 = s.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
-  if(m3) return Math.round((Number(m3[1])*3600+Number(m3[2])*60+Number(m3[3]))/6)/10;
-  const m2 = s.match(/^(\d{1,3}):(\d{2})$/);
-  if(m2) return Math.round((Number(m2[1])*60+Number(m2[2]))/6)/10;
-  return null;
-}
-// Label BEFORE value — "총 시간  1:00:13", "Elapsed Time  40:42"
-const DURATION_LABEL_PATTERNS = [
-  /총\s*시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
-  /elapsed\s*time[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
-  /moving\s*time[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
-  /이동\s*시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
-  /\btime\b[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
-  /시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
-];
-// Value BEFORE label — many "big stat number, caption below" widgets (Apple
-// Health/Garmin summary tiles) OCR in this order instead: "31:24 ... 시간"
-const DURATION_LABEL_PATTERNS_REVERSED = [
-  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}elapsed\s*time/i,
-  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}\btime\b/i,
-  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}총\s*시간/,
-  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}시간/,
-];
-function parseFlexibleDuration(text){
-  for(const re of DURATION_LABEL_PATTERNS){
-    const m = text.match(re);
-    if(m){ const min = hmsToMinutes(m[1]); if(min!=null) return { minutes:min, matchedText:m[1] }; }
-  }
-  for(const re of DURATION_LABEL_PATTERNS_REVERSED){
-    const m = text.match(re);
-    if(m){ const min = hmsToMinutes(m[1]); if(min!=null) return { minutes:min, matchedText:m[1] }; }
-  }
-  // fallback: a standalone hh:mm:ss/mm:ss value with no adjacent label at all —
-  // used only when nothing labeled matched (e.g. a bare "1:41:23" overlay on a
-  // map). Skips the first ~25 characters (usually a phone status-bar clock)
-  // and prefers the LAST match, since duration stats typically render after
-  // distance/pace in these apps.
-  const body = text.length>25 ? text.slice(25) : text;
-  const hmsMatches = [...body.matchAll(/\b(\d{1,2}:\d{2}:\d{2})\b/g)];
-  if(hmsMatches.length){ const v=hmsMatches[hmsMatches.length-1][1]; const min=hmsToMinutes(v); if(min!=null) return { minutes:min, matchedText:v }; }
-  const msMatches = [...body.matchAll(/\b(\d{1,3}:\d{2})\b/g)];
-  if(msMatches.length){ const v=msMatches[msMatches.length-1][1]; const min=hmsToMinutes(v); if(min!=null) return { minutes:min, matchedText:v }; }
-  return null;
-}
-
-// All remaining fields are OPTIONAL for every workout type (spec item 1/12).
-const DISTANCE_LABEL_PATTERNS = [
-  /distance[^\d]{0,6}([\d.]+)\s*(km|mi)?/i,
-  /거리[^\d]{0,6}([\d.]+)\s*(km|킬로미터)?/,
-  /([\d.]+)\s*(km|킬로미터)[^\d]{0,6}거리/,
-];
-function parseFlexibleDistanceKm(text){
-  for(const re of DISTANCE_LABEL_PATTERNS){
-    const m=text.match(re);
-    if(m){ const v=parseFloat(m[1]); if(!isNaN(v)&&v>0) return v; }
-  }
-  const bare = text.match(/([\d]{1,3}\.\d{1,2})\s*(km|킬로미터)/i);
-  if(bare){ const v=parseFloat(bare[1]); if(!isNaN(v)) return v; }
-  return null;
-}
-function parseFlexiblePaceSecKm(text){
-  const m = text.match(/(?:pace|페이스)[^\d]{0,10}(\d{1,2})['’:](\d{2})/i) || text.match(/(\d{1,2})['’](\d{2})''?\s*\/?\s*km/i);
-  if(m) return Number(m[1])*60+Number(m[2]);
-  return null;
-}
-const AVG_HR_PATTERNS = [/avg\.?\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /average\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /평균\s*심박수?[^\d]{0,6}(\d{2,3})/, /(\d{2,3})\s*bpm[^\d]{0,10}평균/, /(\d{2,3})[^\d]{0,10}평균\s*심박/];
-const MAX_HR_PATTERNS = [/max\.?\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /maximum\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /최[대고]\s*심박수?[^\d]{0,6}(\d{2,3})/, /(\d{2,3})[^\d]{0,10}최[대고]\s*심박/];
-function ocrFirstMatchNum(text, patterns){
-  for(const re of patterns){ const m=text.match(re); if(m) return Number(m[1]); }
-  return null;
-}
-function parseFlexibleCalories(text){
-  const m = text.match(/(?:calories|칼로리|cal)[^\d]{0,6}(\d{2,4})/i);
-  return m ? Number(m[1]) : null;
-}
 function tlOcrParseNumber(str){ const m=String(str).match(/[\d]+\.?\d*/); return m ? parseFloat(m[0]) : null; }
-
-// Parses ONE image's OCR text into a partial field set. Never throws, never
-// requires distance. Merging across images happens in mergeOcrFieldSets().
-function parseTrainingLogOcrText(text, todayISOStr){
-  todayISOStr = todayISOStr || todayISO();
-  const detected = classifyWorkoutType(text);
-  const distanceKm = parseFlexibleDistanceKm(text);
-  const paceSecKm = parseFlexiblePaceSecKm(text);
-  // heuristic: distance+pace present but no keyword hit at all → very likely a run
-  const finalDetected = detected || ((distanceKm && paceSecKm) ? "run" : null);
-  const durationParsed = parseFlexibleDuration(text);
-  const dateParsed = parseFlexibleDate(text, todayISOStr);
-  const avgHr = ocrFirstMatchNum(text, AVG_HR_PATTERNS);
-  const maxHr = ocrFirstMatchNum(text, MAX_HR_PATTERNS);
-  const calories = parseFlexibleCalories(text);
-  return {
-    detectedType: finalDetected,
-    date: dateParsed.date, dateNeedsConfirmation: dateParsed.needsConfirmation, dateNote: dateParsed.note,
-    durationMin: durationParsed ? durationParsed.minutes : null,
-    distanceKm: distanceKm,
-    avgPaceSecKm: paceSecKm != null ? paceSecKm : (distanceKm && durationParsed ? Math.round((durationParsed.minutes*60)/distanceKm) : null),
-    avgHr, maxHr, calories,
-  };
-}
-
-// Combines several per-image partial field sets into ONE candidate record
-// (spec item 5). First image (upload order) with a real value for a field
-// wins that field; later images only fill gaps. detectedType prefers the
-// most SPECIFIC non-null value over a generic "wod"/"other" guess.
-const TYPE_SPECIFICITY = { hyrox_wod:5, strength:5, cycling:4, ski:4, row:4, hiit:4, hiking:3, walking:3, run:3, cardio:2, wod:1, other:0 };
-function mergeOcrFieldSets(list){
-  const merged = { detectedType:null, date:null, dateNeedsConfirmation:false, dateNote:null,
-    durationMin:null, distanceKm:null, avgPaceSecKm:null, avgHr:null, maxHr:null, calories:null };
-  list.forEach(f=>{
-    if(f.detectedType && (merged.detectedType==null || (TYPE_SPECIFICITY[f.detectedType]||0) > (TYPE_SPECIFICITY[merged.detectedType]||0))) merged.detectedType = f.detectedType;
-    if(merged.date==null && f.date){ merged.date=f.date; merged.dateNote=f.dateNote; }
-    if(f.dateNeedsConfirmation && merged.date==null) merged.dateNeedsConfirmation = true;
-    if(merged.durationMin==null && f.durationMin!=null) merged.durationMin = f.durationMin;
-    if(merged.distanceKm==null && f.distanceKm!=null) merged.distanceKm = f.distanceKm;
-    if(merged.avgPaceSecKm==null && f.avgPaceSecKm!=null) merged.avgPaceSecKm = f.avgPaceSecKm;
-    if(merged.avgHr==null && f.avgHr!=null) merged.avgHr = f.avgHr;
-    if(merged.maxHr==null && f.maxHr!=null) merged.maxHr = f.maxHr;
-    if(merged.calories==null && f.calories!=null) merged.calories = f.calories;
-  });
-  if(merged.date!=null) merged.dateNeedsConfirmation = false;
-  return merged;
-}
-
-// Returns { level, emoji, label, reasons:[...] } — spec item 8.
-function computeOcrConfidence(merged){
-  const reasons=[];
-  if(merged.durationMin==null) return { level:"red", emoji:"🔴", label:"핵심 정보 부족", reasons:["운동시간을 인식하지 못했습니다"] };
-  let level="green";
-  if(!merged.date || merged.dateNeedsConfirmation){ level="yellow"; reasons.push("날짜 확인 필요"); }
-  if(!merged.detectedType){ level="yellow"; reasons.push("운동 유형을 명확히 인식하지 못해 기본값으로 채웠습니다"); }
-  if(merged.distanceKm==null && merged.avgHr==null && merged.calories==null){
-    reasons.push("거리·심박 등 추가 정보 없음 (운동시간 기준으로는 정상 등록 가능)");
+function tlOcrParseDuration(str){ // "45:30" -> 45.5 min, "1:02:15" -> 62.25 min, "42 min" -> 42
+  const s=String(str).trim();
+  const hmsMatch=s.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if(hmsMatch){
+    if(hmsMatch[3]!==undefined) return Math.round((Number(hmsMatch[1])*3600+Number(hmsMatch[2])*60+Number(hmsMatch[3]))/6)/10;
+    return Math.round((Number(hmsMatch[1])*60+Number(hmsMatch[2]))/6)/10;
   }
-  if(level==="green" && !reasons.length) reasons.push("날짜·유형·운동시간이 모두 명확히 인식되었습니다");
-  return { level, emoji: level==="green"?"🟢":"🟡", label: level==="green"?"높은 신뢰도":"일부 확인 필요", reasons };
+  const numMatch=s.match(/(\d+\.?\d*)/);
+  return numMatch ? parseFloat(numMatch[1]) : null;
 }
-
+function tlOcrParsePace(str){ // "5:32" or "5:32/km" -> seconds per km
+  const m=String(str).match(/(\d{1,2}):(\d{2})/);
+  return m ? Number(m[1])*60+Number(m[2]) : null;
+}
+function parseTrainingLogOcrText(text){
+  const lines = text.split("\n").map(l=>l.trim()).filter(Boolean);
+  const fields = { date:null, type:tlOcrGuessType(text), distanceKm:null, durationMin:null, avgPaceSecKm:null, avgHr:null, maxHr:null, intensityRpe:null };
+  const warnings=[];
+  // date: look for YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY, or "Aug 14, 2026"-style patterns
+  const dateMatch = text.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/) || text.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+  if(dateMatch){
+    if(dateMatch[1].length===4) fields.date = `${dateMatch[1]}-${String(dateMatch[2]).padStart(2,"0")}-${String(dateMatch[3]).padStart(2,"0")}`;
+    else fields.date = `${dateMatch[3]}-${String(dateMatch[1]).padStart(2,"0")}-${String(dateMatch[2]).padStart(2,"0")}`;
+  }
+  lines.forEach((line, idx)=>{
+    const low=line.toLowerCase();
+    for(const [field, labels] of Object.entries(TL_OCR_LABEL_MAP)){
+      if(fields[field]!=null) continue; // first match wins, don't overwrite
+      const hitLabel = labels.find(l=>low.includes(l));
+      if(!hitLabel) continue;
+      // value can be on the same line (after the label) or the next line
+      const sameLine = line.slice(low.indexOf(hitLabel)+hitLabel.length).trim();
+      const candidate = sameLine || (lines[idx+1]||"");
+      if(field==="distanceKm") fields.distanceKm = tlOcrParseNumber(candidate);
+      else if(field==="durationMin") fields.durationMin = tlOcrParseDuration(candidate);
+      else if(field==="avgPaceSecKm") fields.avgPaceSecKm = tlOcrParsePace(candidate);
+      else if(field==="avgHr") fields.avgHr = tlOcrParseNumber(candidate);
+      else if(field==="maxHr") fields.maxHr = tlOcrParseNumber(candidate);
+      else if(field==="intensityRpe"){ const n=tlOcrParseNumber(candidate); fields.intensityRpe = (n!=null && n>=1 && n<=10) ? Math.round(n) : null; }
+    }
+  });
+  // derive pace from distance+duration if pace itself wasn't found directly (never invents distance/duration)
+  if(fields.avgPaceSecKm==null && fields.distanceKm && fields.durationMin) fields.avgPaceSecKm = Math.round((fields.durationMin*60)/fields.distanceKm);
+  if(!fields.distanceKm && !fields.durationMin) warnings.push("거리/시간 항목을 찾지 못했습니다 — 아래에서 직접 입력해주세요.");
+  if(!fields.date) warnings.push("날짜를 인식하지 못했습니다 — 오늘 날짜로 채워뒀으니 확인해주세요.");
+  return { fields, warnings };
+}
 async function runTrainingLogOcrPipeline(){
   if(!window.Tesseract){ TL_OCR_STATE.status="error"; TL_OCR_STATE.warnings=["OCR 엔진 스크립트를 불러오지 못했습니다 (네트워크 문제일 수 있어요). 다시 시도해주세요."]; renderAll(); return; }
   TL_OCR_STATE.status="processing"; TL_OCR_STATE.progress=0; TL_OCR_STATE.rawText=""; renderAll();
@@ -7684,80 +7838,38 @@ async function runTrainingLogOcrPipeline(){
     TL_OCR_STATE.warnings=["이 미리보기 화면은 보안 정책상 OCR에 필요한 웹 워커 실행이 막혀 있어요. 파일을 다운로드한 뒤 Safari나 Chrome 같은 일반 브라우저 앱에서 직접 열어 다시 시도해주세요."];
     renderAll(); return;
   }
-  const todayISOStr = todayISO();
-  const perImageFields = [];
-  let combinedRawText = "";
-  const imageErrors=[];
-  // spec item 5: OCR every image independently, THEN merge — one image's
-  // missing field never fails the whole batch, and a second image can
-  // supply the fields the first one lacked (e.g. one has type/HR, the
-  // other has the date/title).
+  let combinedText=""; const imageErrors=[];
   for(let i=0;i<TL_OCR_STATE.images.length;i++){
     try{
       const canvas=await preprocessForOcr(TL_OCR_STATE.images[i].dataUrl);
-      // most Garmin/Apple Health/Strava screenshots here are Korean-labeled
-      // ("평균 페이스", "고도 상승", "총 시간"...) — English-only OCR can't
-      // read those at all, which was silently degrading every field below.
-      // Falls back to English-only if the Korean traineddata fails to fetch
-      // (e.g. offline), rather than failing the whole image.
-      const recognizeOpts = {
+      const { data }=await Tesseract.recognize(canvas, "eng", {
         logger:(m)=>{ if(m.status==="recognizing text"){ TL_OCR_STATE.progress=Math.round(((i+m.progress)/TL_OCR_STATE.images.length)*100);
           const el=document.getElementById("tl-ocr-progress-text"); if(el) el.textContent=`기록을 읽고 있어요… (${TL_OCR_STATE.progress}%)`; } }
-      };
-      let data;
-      try{ ({ data } = await Tesseract.recognize(canvas, "eng+kor", recognizeOpts)); }
-      catch(langErr){ console.warn("eng+kor OCR failed, falling back to eng-only", langErr); ({ data } = await Tesseract.recognize(canvas, "eng", recognizeOpts)); }
-      const text = data.text || "";
-      combinedRawText += `\n----- 이미지 ${i+1} -----\n${text}`;
-      perImageFields.push(parseTrainingLogOcrText(text, todayISOStr));
+      });
+      combinedText += "\n"+(data.text||"");
     }catch(e){ console.warn("Training log OCR failed on image", i, e); imageErrors.push(`이미지 ${i+1}: ${ocrErrorText(e)}`); }
   }
-  TL_OCR_STATE.rawText=combinedRawText.trim();
-  if(!perImageFields.length){
+  TL_OCR_STATE.rawText=combinedText.trim();
+  if(!combinedText.trim()){
     TL_OCR_STATE.status="error";
     TL_OCR_STATE.warnings = imageErrors.length ? imageErrors : ["OCR 엔진이 이미지에서 아무 글자도 읽지 못했습니다. 화면 캡처가 선명한지 확인 후 다시 시도해주세요."];
     renderAll(); return;
   }
-
-  const merged = mergeOcrFieldSets(perImageFields);
-  const confidence = computeOcrConfidence(merged);
-
-  // spec item 9: rewritten warning copy — distance-missing is informational,
-  // never an error; duration-missing gets the exact required sentence.
-  const warnings=[];
-  if(merged.durationMin==null) warnings.push("운동시간을 확인하지 못했습니다. 운동시간을 직접 입력해주세요.");
-  if(!merged.date) warnings.push("날짜를 정확히 인식하지 못했습니다 — 아래에서 직접 확인해주세요.");
-  else if(merged.dateNote) warnings.push(merged.dateNote);
-  if(merged.distanceKm==null) warnings.push("거리 정보 없음 — 이 운동 유형에서는 정상입니다.");
-  warnings.push(...imageErrors);
-
-  const stateType = OCR_DETECTED_TO_STATE_TYPE[merged.detectedType] || "conditioning";
-  // NEVER auto-saved — lands in an editable draft the user must review and confirm.
-  // Date intentionally left blank (never silently defaulted to today) when unresolved.
-  TL_OCR_DRAFT = { date: merged.date || "", dateNeedsConfirmation: !merged.date,
-    type: stateType, detectedTypeLabel: merged.detectedType ? OCR_DETECTED_LABEL_KO[merged.detectedType] : null,
-    distanceKm: merged.distanceKm, durationMin: merged.durationMin, avgPaceSecKm: merged.avgPaceSecKm,
-    avgHr: merged.avgHr, maxHr: merged.maxHr, intensityRpe: null, calories: merged.calories, confidence };
-  TL_OCR_STATE.status="done"; TL_OCR_STATE.warnings=warnings;
+  const { fields, warnings } = parseTrainingLogOcrText(combinedText);
+  // NEVER auto-saved — lands in an editable draft the user must review and confirm (spec requirement)
+  TL_OCR_DRAFT = { date: fields.date||todayISO(), type: fields.type, distanceKm: fields.distanceKm, durationMin: fields.durationMin,
+    avgPaceSecKm: fields.avgPaceSecKm, avgHr: fields.avgHr, maxHr: fields.maxHr, intensityRpe: fields.intensityRpe };
+  TL_OCR_STATE.status="done"; TL_OCR_STATE.warnings=[...warnings, ...imageErrors];
   renderAll();
 }
 function saveTlOcrDraft(){
   if(!TL_OCR_DRAFT) return;
   const d=TL_OCR_DRAFT;
-  // spec item 12: minimum unit is date + type + duration. Distance is optional.
-  if(!d.date || !/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 입력해주세요 (YYYY-MM-DD)"); return; }
-  if(d.durationMin==null || d.durationMin===""){ showToast("운동시간을 확인하지 못했습니다. 운동시간을 직접 입력해주세요."); return; }
-  const noteParts=[];
-  if(d.detectedTypeLabel) noteParts.push(`OCR 인식: ${d.detectedTypeLabel}`);
-  if(d.calories!=null && d.calories!=="") noteParts.push(`칼로리 ${d.calories}`);
-  const candidateEntry = { date:d.date, type:d.type||"conditioning",
-    distanceKm: d.distanceKm!=null && d.distanceKm!=="" ? Number(d.distanceKm) : null,
-    durationMin: Number(d.durationMin),
-    avgPaceSecKm: d.avgPaceSecKm!=null && d.avgPaceSecKm!=="" ? Number(d.avgPaceSecKm) : null,
-    avgHr: d.avgHr!=null && d.avgHr!=="" ? Number(d.avgHr) : null,
-    maxHr: d.maxHr!=null && d.maxHr!=="" ? Number(d.maxHr) : null,
-    intensityRpe: d.intensityRpe!=null && d.intensityRpe!=="" ? Number(d.intensityRpe) : null,
-    note: noteParts.join(" · "),
+  const candidateEntry = { date:d.date||todayISO(), type:d.type||"run",
+    distanceKm: d.distanceKm!=null?Number(d.distanceKm):null, durationMin: d.durationMin!=null?Number(d.durationMin):null,
+    avgPaceSecKm: d.avgPaceSecKm!=null?Number(d.avgPaceSecKm):null,
+    avgHr: d.avgHr!=null?Number(d.avgHr):null, maxHr: d.maxHr!=null?Number(d.maxHr):null,
+    intensityRpe: d.intensityRpe!=null?Number(d.intensityRpe):null,
     source:"ocr" }; // spec: source clearly tagged, distinct from manual/quick/csv/apple
   // 훈련기록 중복값 등록 방지 — 같은 날짜·유형·거리(시간)의 기록이 이미 있으면 저장하지 않고 draft를 보존
   if(isDuplicateTrainingLogEntry(candidateEntry, STATE.trainingLog)){
@@ -8632,21 +8744,21 @@ function renderTrainingLogTab(wrap){
 
     <div class="card">
       <h2 class="section-title">최근 기록 (${STATE.trainingLog.length})</h2>
-      ${STATE.trainingLog.length? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;"><table style="margin-top:10px;min-width:820px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
+      ${STATE.trainingLog.length? `<table style="margin-top:10px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
         <tbody>${[...STATE.trainingLog].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,60).map(t=>`<tr>
-          <td style="white-space:nowrap;">${t.date}</td><td style="white-space:nowrap;">${typeLabel(t.type)}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.distanceKm?t.distanceKm+"km":"—"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.durationMin??"—"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.avgPaceSecKm?fmtPace(t.avgPaceSecKm):"—"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.avgHr||"—"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.maxHr||"—"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.restingHr||"—"}</td>
-          <td class="num mono" style="white-space:nowrap;${t.hrDrift!=null&&t.hrDrift!==""?(Number(t.hrDrift)>5?`color:var(--red);`:``):`color:var(--gray-dim);font-size:10px;`}">${t.hrDrift!=null&&t.hrDrift!==""?`${Number(t.hrDrift)>=0?"+":""}${t.hrDrift}%`:"데이터 부족"}</td>
-          <td class="num mono" style="white-space:nowrap;">${t.intensityRpe??"—"}</td>
-          <td style="white-space:nowrap;">${t.painFlag?`<span class="badge crit">${escapeHtml(t.painArea||"통증")}</span>`:""}</td>
-          <td style="white-space:nowrap;"><span class="chip" style="font-size:9px;padding:2px 7px;">${t.source==="csv"?"CSV":t.source==="apple"?"Apple":t.source==="quick"?"빠른기록":t.source==="ocr"?"OCR":"수기"}</span></td>
-          <td style="white-space:nowrap;"><span class="list-remove" data-del-tl="${t.id}">✕</span></td>
-        </tr>`).join("")}</tbody></table></div>`
+          <td>${t.date}</td><td>${typeLabel(t.type)}</td>
+          <td class="num mono">${t.distanceKm?t.distanceKm+"km":"—"}</td>
+          <td class="num mono">${t.durationMin??"—"}</td>
+          <td class="num mono">${t.avgPaceSecKm?fmtPace(t.avgPaceSecKm):"—"}</td>
+          <td class="num mono">${t.avgHr||"—"}</td>
+          <td class="num mono">${t.maxHr||"—"}</td>
+          <td class="num mono">${t.restingHr||"—"}</td>
+          <td class="num mono" style="${t.hrDrift!=null&&t.hrDrift!==""?(Number(t.hrDrift)>5?`color:var(--red);`:``):`color:var(--gray-dim);font-size:10px;`}">${t.hrDrift!=null&&t.hrDrift!==""?`${Number(t.hrDrift)>=0?"+":""}${t.hrDrift}%`:"데이터 부족"}</td>
+          <td class="num mono">${t.intensityRpe??"—"}</td>
+          <td>${t.painFlag?`<span class="badge crit">${escapeHtml(t.painArea||"통증")}</span>`:""}</td>
+          <td><span class="chip" style="font-size:9px;padding:2px 7px;">${t.source==="csv"?"CSV":t.source==="apple"?"Apple":t.source==="quick"?"빠른기록":"수기"}</span></td>
+          <td><span class="list-remove" data-del-tl="${t.id}">✕</span></td>
+        </tr>`).join("")}</tbody></table>`
         : `<div class="empty-note">훈련 기록이 없습니다</div>`}
     </div>
   `;
@@ -8659,18 +8771,9 @@ function renderTlOcrDraftForm(){
   const typeOptions = ["run","interval","strength","wod","conditioning","recovery"];
   return `
     <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);">
-      ${d.confidence ? `
-        <div class="reason-line" style="margin-bottom:10px;font-family:var(--font-body);color:${
-          d.confidence.level==="green"?"var(--green)":d.confidence.level==="yellow"?"var(--amber)":"var(--red)"};">
-          ${d.confidence.emoji} ${d.confidence.label}${d.confidence.reasons.length? " — "+d.confidence.reasons.map(escapeHtml).join(" · ") : ""}
-        </div>` : ""}
-      ${d.detectedTypeLabel ? `
-        <div class="reason-line" style="margin-bottom:10px;font-family:var(--font-body);">
-          인식된 운동 유형: <b style="color:var(--orange);">${escapeHtml(d.detectedTypeLabel)}</b> (아래 드롭다운에서 바꿀 수 있어요)
-        </div>` : ""}
       <div class="lead" style="color:var(--green);margin-bottom:10px;">아래 내용을 확인·수정한 뒤 저장해주세요 — 자동으로 저장되지 않습니다.</div>
       <div class="grid grid-3">
-        ${field(d.dateNeedsConfirmation? "날짜 (확인 필요)" : "날짜", `<input id="tlo-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="${d.dateNeedsConfirmation?"YYYY-MM-DD 직접 입력":""}" style="${d.dateNeedsConfirmation?"border-color:var(--amber);":""}" value="${escapeHtml(d.date||"")}">`)}
+        ${field("날짜", `<input id="tlo-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date||"")}">`)}
         ${field("운동 종류", `<select id="tlo-type">${typeOptions.map(t=>`<option value="${t}" ${d.type===t?"selected":""}>${typeLabel(t)}</option>`).join("")}</select>`)}
         ${field("거리 (km)", `<input id="tlo-distance" type="number" step="0.1" value="${d.distanceKm??""}">`)}
         ${field("시간 (분)", `<input id="tlo-duration" type="number" step="0.1" value="${d.durationMin??""}">`)}
@@ -8690,7 +8793,6 @@ function bindTlOcrDraftForm(wrap){
   if(!TL_OCR_DRAFT) return;
   const bind=(id,field,parse)=>wrap.querySelector(id)?.addEventListener("change",(e)=>{ TL_OCR_DRAFT[field]=parse?parse(e.target.value):e.target.value; });
   bind("#tlo-date","date");
-  wrap.querySelector("#tlo-date")?.addEventListener("change",(e)=>{ if(TL_OCR_DRAFT && e.target.value) TL_OCR_DRAFT.dateNeedsConfirmation=false; });
   bind("#tlo-type","type");
   bind("#tlo-distance","distanceKm",v=>v===""?null:Number(v));
   bind("#tlo-duration","durationMin",v=>v===""?null:Number(v));
@@ -8903,6 +9005,7 @@ const FEASIBILITY_META = {
   "safe": { emoji:"🟢", label:"높은 가능성", color:"var(--green)", msg:"현재 데이터 기준으로 무난히 달성 가능한 목표입니다." },
   "realistic": { emoji:"🟡", label:"현실적 도전", color:"var(--orange)", msg:"꾸준히 훈련하면 현실적으로 도달 가능한 목표입니다." },
   "challenge": { emoji:"🟠", label:"공격적 목표", color:"var(--amber)", msg:"달성하려면 우선순위 영역에 집중한 훈련이 필요합니다. 불가능하지는 않지만 여유는 크지 않습니다." },
+  "long-horizon-challenge": { emoji:"🔵", label:"장기적으로 도전 가능", color:"#4DA6FF", msg:"현재 기준으로는 공격적인 목표지만, 남은 기간이 충분하고 관련 지표의 개선 추세가 뒷받침되고 있어 장기적으로는 도전해볼 수 있는 목표입니다. 12/24/36주 체크포인트에서 다시 확인하세요." },
   "unrealistic": { emoji:"🔴", label:"현재 데이터 기준 어려움", color:"var(--red)", msg:"현재 데이터와 남은 기간을 기준으로 이 목표는 달성 가능성이 낮습니다. 아래 대안 목표를 참고해주세요." },
 };
 let GOAL_GAP_EXPANDED = null; // key of the currently expanded "목표 기록을 위한 개선 계획" row, or null
