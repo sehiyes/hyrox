@@ -976,6 +976,25 @@ function recentRecovery(days=7){
   return STATE.trainingLog.filter(l=>new Date(l.date)>=cutoff)
     .map(l=>({ date:l.date, rpe:l.intensityRpe, painFlag:!!l.painFlag, painArea:l.painArea||"" }));
 }
+// Duplicate detection for trainingLog entries (spec: 훈련기록 중복값 등록 방지). Two entries are
+// treated as "the same real session already logged" when they share the exact date, the exact type,
+// AND their distance/duration are close enough to plausibly be the same workout (small tolerance —
+// GPS/manual rounding — not an exact-float match, which would miss near-identical re-entries; not a
+// loose match either, which would wrongly block two genuinely different same-day sessions of the same
+// type, e.g. an easy run + a separate interval session both logged as "run"-adjacent same day). Only
+// checks fields every entry point already provides (date/type/distanceKm/durationMin) — no new fields.
+function isDuplicateTrainingLogEntry(candidate, existingList){
+  const closeEnough = (a,b,tol)=>{
+    if(a==null && b==null) return true;
+    if(a==null || b==null) return false;
+    return Math.abs(Number(a)-Number(b))<=tol;
+  };
+  return existingList.some(e =>
+    e.date===candidate.date && e.type===candidate.type &&
+    closeEnough(e.distanceKm, candidate.distanceKm, 0.15) &&
+    closeEnough(e.durationMin, candidate.durationMin, 3)
+  );
+}
 function recentTraining(days=7){
   const cutoff=new Date(); cutoff.setDate(cutoff.getDate()-days);
   return STATE.trainingLog.filter(r=>new Date(r.date)>=cutoff);
@@ -3649,15 +3668,21 @@ function runHpsAudit(){
         log("TEST I — ASIA 존재+illustrative fallback 조합 자동 검출", wronglyIllustrative.length===0,
           wronglyIllustrative.length? `BUG: ${wronglyIllustrative.map(s=>`${s.label}(source=${s.benchmarkSource})`).join(", ")}` : "해당 없음");
 
-        // TEST J — Ski/Row가 비현실적으로 낮은 값(2분대)으로 돌아가지 않는지, 혹은 돌아간다면 그 source가
-        // 최소한 ASIA/GLOBAL_* 실측이지 STATIC_FALLBACK의 illustrative 0.46 배율 경로가 아닌지 확인
+        // TEST J — Ski/Row가 비현실적으로 낮은 값(2분대)으로 돌아가지 않는지 (강화: STATIC_FALLBACK로
+        // 노출되는 경우 그 값 자체가 realistic floor 이상이어야 하고, floor 미만이면 반드시 UNAVAILABLE
+        // (peerMean=null, "데이터 부족" 표시)로 차단되어 있어야 함 — 150~159초 근접 구간도 놓치지 않음)
         ["ski","row"].forEach(k=>{
           const s = peer.segments.find(x=>x.key===k);
-          if(s && s.peerMean!=null){
-            const suspiciouslyLow = s.peerMean < 150; // <2:30 for a 1000m Ski/Row is not realistic for any adult division
-            const explainedByRealData = s.benchmarkSource && s.benchmarkSource!=="STATIC_FALLBACK";
-            log(`TEST J — ${s.label} 기준값이 비현실적으로 낮지 않음 (또는 실측 데이터로 설명 가능)`, !suspiciouslyLow || explainedByRealData,
-              `기준=${fmtTime(s.peerMean)}, source=${s.benchmarkSource||"?"}, n=${s.sampleN??"?"}`);
+          if(!s) return;
+          if(s.benchmarkSource==="STATIC_FALLBACK"){
+            log(`TEST J — ${s.label} STATIC_FALLBACK로 노출된 값이 realistic floor(160초) 이상`, s.peerMean!=null && s.peerMean>=160,
+              `peerMean=${s.peerMean!=null?fmtTime(s.peerMean):"null"}, source=STATIC_FALLBACK`);
+          } else if(s.benchmarkSource==="UNAVAILABLE"){
+            log(`TEST J — ${s.label} 비현실적 illustrative 값이 실제로 차단되고 데이터 부족으로 표시됨`, s.peerMean===null && s.percentile===null && s.timeLoss===null,
+              `peerMean=${s.peerMean}, percentile=${s.percentile}, timeLoss=${s.timeLoss} (모두 null이어야 정상)`);
+          } else {
+            log(`TEST J — ${s.label} 실제 derived/participant 벤치마크 사용 중 (STATIC_FALLBACK 아님)`, true,
+              `peerMean=${s.peerMean!=null?fmtTime(s.peerMean):"?"}, source=${s.benchmarkSource}, n=${s.sampleN??"?"}`);
           }
         });
 
@@ -3723,6 +3748,34 @@ function runHpsAudit(){
       log("TEST K — DERIVED_BENCHMARK_FALLBACK_ORDER가 ASIA를 최우선으로 시도", DERIVED_BENCHMARK_FALLBACK_ORDER[0]==="ASIA",
         `순서=${DERIVED_BENCHMARK_FALLBACK_ORDER.join(" → ")}`);
 
+      // spec item 9 — synthetic profile audit: Open Doubles + 여성 + 30-39, Ski/Row benchmark를 직접 계산.
+      // derived row가 있으면 그걸 쓰고, 없으면 비현실적 illustrative 값(2분대) 대신 반드시
+      // peerMean=null·"데이터 부족"으로 차단되어야 한다 — 여기서만큼은 스냅샷 없이 직접 큐리 파라미터로
+      // 검증한다(STATE.profile을 바꾸지 않고 queryDerivedBenchmark/queryPeerSegmentStats에 그룹을 직접 전달).
+      {
+        const synthGroup = { gender:"female", ageGroup:"30-34", division:"Open Doubles" };
+        const synthAgeBand = "30-39";
+        ["ski","row"].forEach(k=>{
+          const seg = PEER_SEGMENTS.find(s=>s.key===k);
+          const derivedRow = queryDerivedBenchmark("Open Doubles","W",synthAgeBand,k);
+          // queryPeerSegmentStats reads STATE.profile.division/age/gender internally for the derived
+          // lookup — temporarily set to the exact synthetic profile, call, then restore immediately.
+          const snapDiv2=STATE.profile.division, snapAge2=STATE.profile.age, snapGender2=STATE.profile.gender;
+          STATE.profile.division="Open Doubles"; STATE.profile.age=32; STATE.profile.gender="female";
+          const stats = queryPeerSegmentStats(seg, synthGroup);
+          STATE.profile.division=snapDiv2; STATE.profile.age=snapAge2; STATE.profile.gender=snapGender2;
+          if(derivedRow && derivedRow.p50){
+            log(`TEST 9 — synthetic Open Doubles·여성·30-39 ${seg.label}: derived row 존재 시 derived 사용`,
+              stats.mean===derivedRow.p50 && stats.benchmarkSource===derivedRow.benchmark_source,
+              `mean=${stats.mean!=null?fmtTime(stats.mean):"null"}, source=${stats.benchmarkSource}, 기대 source=${derivedRow.benchmark_source}`);
+          } else {
+            log(`TEST 9 — synthetic Open Doubles·여성·30-39 ${seg.label}: derived row 없을 때 fake 2분대 값 노출 안 됨`,
+              stats.mean===null || stats.mean>=160,
+              `mean=${stats.mean!=null?fmtTime(stats.mean):"null"}, source=${stats.benchmarkSource} (derived row 없음 확인됨)`);
+          }
+        });
+      }
+
       STATE.profile.gender = snapGender; STATE.profile.age = snapAge;
     }
   } finally {
@@ -3738,6 +3791,60 @@ function runHpsAudit(){
 // Open Doubles + 1x Open) onto STATE.races, checks division isolation + multi-race aggregation, then
 // restores STATE.races exactly — try/finally guarantees restoration even if an assertion throws.
 // Run from the browser console: runHpsSyntheticAudit()
+// spec (this pass, items 7-9) — prints the exact requested trace for all 8 stations, using the
+// LIVE STATE.profile (whatever the browser's real, saved profile currently is) — NOT a synthetic
+// swap. This is what the person should run themselves; it reads their own real DERIVED_BENCHMARK/
+// profile/race data, which this environment cannot see or execute against.
+// Run from the browser console: runHpsBenchmarkResolverTrace()
+function runHpsBenchmarkResolverTrace(){
+  const division = STATE.profile.division;
+  const benchGender = deriveBenchmarkGender();
+  const ageBand = deriveAgeBand(STATE.profile.age);
+  console.log(`[HPS RESOLVER TRACE] Profile: Division=${division}, Gender=${benchGender}, AgeBand=${ageBand}, DERIVED_BENCHMARK.length=${DERIVED_BENCHMARK.length}`);
+  if(!DERIVED_BENCHMARK.length){
+    console.log(`[HPS RESOLVER TRACE] ⚠ DERIVED_BENCHMARK가 비어 있습니다 — derived_benchmark.json이 아직 이 브라우저에 import되지 않았습니다.`);
+    console.log(`[HPS RESOLVER TRACE] Settings 탭 -> "📊 Derived Benchmark (Asia/Global 실측 percentile)" 카드에서 파일을 가져와야 ASIA benchmark가 조회됩니다. 파일을 이미 가져왔다면, 그 파일에 ${division}/${benchGender}/${ageBand} 조합의 row가 아예 없을 수 있습니다 (아래 개별 station 결과에서 derivedRowExists로 확인).`);
+  }
+  const peer = computePeerAnalysis();
+  const predModel = buildRaceSegmentModel();
+  const rows = [];
+  STATIONS.forEach(st=>{
+    const derivedRow = queryDerivedBenchmark(division, benchGender, ageBand, st.key);
+    const peerSeg = peer ? peer.segments.find(s=>s.key===st.key) : null;
+    const predSeg = predModel.segments.find(s=>s.key===st.key);
+    const dnaP50 = peerSeg ? peerSeg.peerMean : null;
+    const predP50 = predSeg ? predSeg.benchmark : null;
+    const bothNull = dnaP50==null && predP50==null;
+    const match = bothNull || (dnaP50!=null && predP50!=null && Math.abs(dnaP50-predP50)<0.5);
+    const line = `${st.label}
+  Division=${division}
+  Gender=${benchGender}
+  AgeBand=${ageBand}
+  DNA benchmarkSource=${peerSeg?.benchmarkSource ?? "N/A"}
+  DNA sampleN=${peerSeg?.sampleN ?? "N/A"}
+  DNA P50=${dnaP50!=null?fmtTime(dnaP50):"null"}
+  Prediction benchmarkSource=${predSeg?.benchmarkSource ?? "N/A"}
+  Prediction P50=${predP50!=null?fmtTime(predP50):"null"}
+  personalActual=${peerSeg?.actual!=null?fmtTime(peerSeg.actual):"null"}
+  basis=${peerSeg?.basis ?? "null"}
+  derivedRowExists=${!!derivedRow}${derivedRow?` (source=${derivedRow.benchmark_source}, n=${derivedRow.sample_n})`:""}
+  MATCH=${match?"PASS":"FAIL"}`;
+    console.log(`[HPS RESOLVER TRACE] ${line}`);
+    rows.push({ station:st.label, division, gender:benchGender, ageBand,
+      dnaSource:peerSeg?.benchmarkSource ?? null, dnaSampleN:peerSeg?.sampleN ?? null, dnaP50,
+      predSource:predSeg?.benchmarkSource ?? null, predP50,
+      personalActual:peerSeg?.actual ?? null, basis:peerSeg?.basis ?? null,
+      derivedRowExists:!!derivedRow, match });
+  });
+  const staticFallbackRows = rows.filter(r=>r.dnaSource==="STATIC_FALLBACK");
+  if(staticFallbackRows.length){
+    console.log(`[HPS RESOLVER TRACE] Source=STATIC_FALLBACK로 남은 station: ${staticFallbackRows.map(r=>r.station).join(", ")} — 원인: 이 station들은 derivedRowExists=false (DERIVED_BENCHMARK에 ${division}/${benchGender}/${ageBand} 조합의 row가 5단계 chain 어디에도 없음) 이면서 EXTERNAL_RACE_DB도 30건 미만이라 illustrative model로 내려간 것입니다. Ski/Row라면 160초 미만인 경우에만 UNAVAILABLE로 추가 차단되고, 그 외 station은 이 값 그대로 표시됩니다(항목 5 스펙: 다른 station까지 임의로 floor를 적용하지 말라는 요청에 따름).`);
+  }
+  const failMatch = rows.filter(r=>!r.match);
+  console.log(`[HPS RESOLVER TRACE] DNA vs Prediction P50 MATCH: ${rows.length-failMatch.length}/${rows.length} PASS${failMatch.length?` — FAIL: ${failMatch.map(r=>r.station).join(", ")}`:""}`);
+  return rows;
+}
+
 function runHpsSyntheticAudit(){
   const results=[]; const log=(name,pass,detail)=>{ results.push({name,pass,detail}); console.log(`[HPS AUDIT-SYNTH] ${pass?"PASS":"FAIL"} — ${name}: ${detail}`); };
   const snapRaces = STATE.races; // keep original array reference to restore exactly
@@ -3764,6 +3871,7 @@ function runHpsSyntheticAudit(){
       `Open races=[${openRaces.map(r=>r.id).join(",")}]`);
 
     const snapDivision=STATE.profile.division;
+    const snapGoalDivision=STATE.profile.goalDivision;
     STATE.profile.division="Open Doubles";
     const rowHistOD = getPersonalSegmentHistory(PEER_SEGMENTS.find(s=>s.key==="row"));
 
@@ -3858,11 +3966,15 @@ function runHpsSyntheticAudit(){
     STATE.races = snapRaces; // always restore, even if an assertion above threw
     STATE.stationTests = snapStationTests;
     STATE.simulationTests = snapSimulationTests;
+    STATE.profile.division = snapDivision;
+    STATE.profile.goalDivision = snapGoalDivision;
   }
-  // STATE.races/stationTests/simulationTests가 synthetic test 종료 후 반드시 원상복구되었는지 최종 확인
-  log("STATE.races/stationTests/simulationTests가 synthetic test 종료 후 원상복구됨",
-    STATE.races===snapRaces && STATE.races.length===snapRaceCount && STATE.stationTests===snapStationTests && STATE.simulationTests===snapSimulationTests,
-    `races.length=${STATE.races.length} (원본=${snapRaceCount}), synthetic 잔존 여부=${STATE.races.some(r=>r.id?.startsWith?.("synth")) || STATE.stationTests.some(t=>t.id?.startsWith?.("synth")) || STATE.simulationTests.some(t=>t.id?.startsWith?.("synth"))}`);
+  // STATE.races/stationTests/simulationTests/profile.division/profile.goalDivision이 synthetic test
+  // 종료 후 반드시 원상복구되었는지 최종 확인 (spec item 10)
+  log("STATE 전체(races/stationTests/simulationTests/division/goalDivision)가 synthetic test 종료 후 원상복구됨",
+    STATE.races===snapRaces && STATE.races.length===snapRaceCount && STATE.stationTests===snapStationTests
+      && STATE.simulationTests===snapSimulationTests && STATE.profile.division===snapDivision && STATE.profile.goalDivision===snapGoalDivision,
+    `races.length=${STATE.races.length} (원본=${snapRaceCount}), division=${STATE.profile.division}(원본=${snapDivision}), goalDivision=${STATE.profile.goalDivision}(원본=${snapGoalDivision}), synthetic 잔존 여부=${STATE.races.some(r=>r.id?.startsWith?.("synth")) || STATE.stationTests.some(t=>t.id?.startsWith?.("synth")) || STATE.simulationTests.some(t=>t.id?.startsWith?.("synth"))}`);
   const failed=results.filter(r=>!r.pass);
   console.log(`[HPS AUDIT-SYNTH] ${results.length-failed.length}/${results.length} passed. STATE.races restored (synthetic data removed).`);
   return { results, passed:results.length-failed.length, total:results.length };
@@ -4798,8 +4910,41 @@ function generateWeeklyPlan(ruleResult){
   let ratioSlots=[];
   for(let i=0;i<counts.run;i++) ratioSlots.push(i===0 && counts.run>1 ? "long":"run");
   for(let i=0;i<counts.strength;i++) ratioSlots.push("strength");
-  for(let i=0;i<counts.wod;i++) ratioSlots.push(i===0 && hasSevereStationGap ? "station":"wod");
+  for(let i=0;i<counts.wod;i++) ratioSlots.push("wod");
   for(let i=0;i<counts.recovery;i++) ratioSlots.push(i===0?"rest":"recovery");
+
+  /* ---------------------------------------------------------------------- */
+  /* PHASE 5 STEP 5-B — Adaptive slot reallocation (Running only, this pass) */
+  /*   REPLACE only, never ADD — total slot count is unchanged. Operates    */
+  /*   exclusively on the non-mandatory ratioSlots just built above, so     */
+  /*   Critical/Mandatory sessions (reservedMandatory) and whatever deload  */
+  /*   already removed from `counts` (above) are never touched — priority   */
+  /*   order per spec: Critical/Mandatory > Safety/Deload > Running         */
+  /*   independent training (here) > existing severe Station gap (below,    */
+  /*   unchanged) > other priority add-ons (unchanged, add-on layer only).  */
+  /*                                                                        */
+  /*   Running: WOD-embedded running distance is deliberately NOT counted   */
+  /*   as independent running — reuses the EXISTING isRunType() definition  */
+  /*   (run/interval/long/tt only, "wod" already excluded — no redefinition)*/
+  /*   so doing HYROX WODs, however many, never satisfies this check. If    */
+  /*   Running is anywhere in this week's Training Priority top3 AND no     */
+  /*   independent running happened in the last 7 days, the FIRST available */
+  /*   non-mandatory "wod" slot is REPLACED with "run". No slot is added;   */
+  /*   if there is no spare "wod" slot, nothing happens this week (the      */
+  /*   existing mandatory RUN-1 interval reservation, if it fired, already  */
+  /*   covers the "some independent running this week" case separately).   */
+  /*   StrengthEnd -> Strength REPLACE and Target Gap feasibility-based     */
+  /*   allocation are explicitly OUT of scope for this pass (per review) —  */
+  /*   calculateTargetGap()/feasibility keep flowing through unchanged      */
+  /*   elsewhere (Goal Setting), just not consulted here yet.               */
+  /* ---------------------------------------------------------------------- */
+  const hasRecentIndependentRunning = recentTraining(7).some(l=>isRunType(l.type));
+  const runningReplace = { applied:false, fromSlot:null };
+  if(top3.includes("running") && !hasRecentIndependentRunning){
+    const i = ratioSlots.indexOf("wod");
+    if(i>=0){ ratioSlots[i]="run"; runningReplace.applied=true; runningReplace.fromSlot="wod"; }
+  }
+
   let slots=[...reservedMandatory, ...ratioSlots];
   while(slots.length<openDayCount) slots.push("recovery");
   slots=slots.slice(0,openDayCount); // safe now — mandatory sessions are already at the front, never truncated away
@@ -4860,6 +5005,10 @@ function generateWeeklyPlan(ruleResult){
 
   const days = finalSlots.map((type,i)=> type==="__box__" ? boxSlot(i) : sessionSlot(type||"recovery", WEEKDAYS[i], ctx, painR));
   if(planWarnings.length) days.planWarnings=planWarnings; // attached for the UI to surface (spec §8), non-breaking for existing array consumers
+  // Step 5-B adaptive-reallocation trace — non-breaking (new field, existing array consumers untouched).
+  // Lets Backtest/debug tooling see WHETHER/WHY a REPLACE happened without re-deriving it.
+  days.adaptiveReallocation = { running: runningReplace,
+    hasRecentIndependentRunning, top3, hasSevereStationGap };
   return days;
 }
 // spec §8: re-checks the finished week against the same invariants the plan is SUPPOSED to satisfy,
@@ -5175,22 +5324,71 @@ async function clearExternalRaceDb(){ EXTERNAL_RACE_DB=[]; await persistExternal
 /*     into a prediction, not just Station Priority.                        */
 /*     Never merges Asia+Global; follows the fixed 6-step fallback chain.   */
 /* ---------------------------------------------------------------------- */
-let DERIVED_BENCHMARK = [];       // benchmark_rows[] from the imported derived_benchmark.json
+let DERIVED_BENCHMARK = [];       // benchmark_rows[] — loaded from the static asset or a manual import
 let DERIVED_BENCHMARK_META = null; // { versions: {...} } from the same file, for the DNA page's status display
-async function loadDerivedBenchmark(){
-  const stored = await StorageService.get("hps:derivedBenchmark:v1", null);
-  if(stored && Array.isArray(stored.benchmark_rows)){ DERIVED_BENCHMARK=stored.benchmark_rows; DERIVED_BENCHMARK_META=stored.versions||null; }
-}
-async function importDerivedBenchmark(jsonText){
-  let parsed;
-  try{ parsed=JSON.parse(jsonText); }catch(e){ return { ok:false, error:"JSON 파싱 실패: "+(e.message||e) }; }
-  if(!Array.isArray(parsed.benchmark_rows)) return { ok:false, error:"benchmark_rows 배열을 찾을 수 없습니다 — Phase 2 파이프라인 산출물(derived_benchmark.json) 형식이어야 합니다." };
-  DERIVED_BENCHMARK = parsed.benchmark_rows;
-  DERIVED_BENCHMARK_META = parsed.versions || null;
-  await StorageService.set("hps:derivedBenchmark:v1", { benchmark_rows:DERIVED_BENCHMARK, versions:DERIVED_BENCHMARK_META });
+// { status: "loading"|"loaded"|"failed", source: "static-asset"|"manual-import"|null, count, error? } —
+// drives the Settings-page status line (spec item 7: "로딩 중"/"Loaded"/"로드 실패" must reflect what
+// actually happened, not just DERIVED_BENCHMARK.length).
+let DERIVED_BENCHMARK_LOAD_STATE = { status:"loading", source:null, count:0 };
+
+// SINGLE shared apply function (spec: "수동 import와 자동 fetch가 서로 다른 파싱/변환 로직을 사용하면
+// 안 됩니다") — both autoLoadDerivedBenchmark() (static asset, on every app load) and
+// importDerivedBenchmark() (manual file picker, unchanged as a fallback per item 8) funnel through
+// this ONE function to actually mutate DERIVED_BENCHMARK/DERIVED_BENCHMARK_META/LOAD_STATE, so they
+// can never validate or normalize the JSON differently from each other.
+function applyDerivedBenchmarkData(parsedJson, sourceLabel){
+  if(!parsedJson || !Array.isArray(parsedJson.benchmark_rows)){
+    return { ok:false, error:"benchmark_rows 배열을 찾을 수 없습니다 — Phase 2 파이프라인 산출물(derived_benchmark.json) 형식이어야 합니다." };
+  }
+  DERIVED_BENCHMARK = parsedJson.benchmark_rows;
+  DERIVED_BENCHMARK_META = parsedJson.versions || null;
+  DERIVED_BENCHMARK_LOAD_STATE = { status:"loaded", source:sourceLabel, count:DERIVED_BENCHMARK.length };
   return { ok:true, count: DERIVED_BENCHMARK.length, versions: DERIVED_BENCHMARK_META };
 }
-async function clearDerivedBenchmark(){ DERIVED_BENCHMARK=[]; DERIVED_BENCHMARK_META=null; await StorageService.set("hps:derivedBenchmark:v1", null); }
+// AUTOMATIC static-asset load (this pass, spec items 1-6/9): tries ./derived_benchmark.json — deployed
+// alongside index.html as a plain static file (e.g. on GitHub Pages, same relative path so it works
+// regardless of the repo/subpath the site is served from) — on every app load, BEFORE the first render.
+// Never persisted into StorageService/localStorage (item 9): it's a static asset the browser's normal
+// HTTP cache already handles efficiently on repeat visits, so there is no reason to duplicate that JSON
+// into app storage every load. If the fetch fails for ANY reason (404, offline, file:// protocol with
+// no server, CORS, malformed JSON), this falls back to whatever was previously imported manually via
+// StorageService (item 6/8) — old behavior, completely unchanged — so a prior manual import still
+// works even when the static asset isn't reachable. If neither exists, DERIVED_BENCHMARK stays empty
+// and every downstream resolver (queryDerivedBenchmark/getSegmentBenchmarkSec/DNA benchmark resolver)
+// already handles that (existing ASIA->Global->STATIC_FALLBACK/UNAVAILABLE chain, untouched).
+async function autoLoadDerivedBenchmark(){
+  DERIVED_BENCHMARK_LOAD_STATE = { status:"loading", source:null, count:0 };
+  try{
+    const res = await fetch("./derived_benchmark.json", { cache:"no-cache" });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const parsedJson = await res.json();
+    const result = applyDerivedBenchmarkData(parsedJson, "static-asset");
+    if(!result.ok) throw new Error(result.error || "파싱 실패");
+    return result;
+  }catch(e){
+    const stored = await StorageService.get("hps:derivedBenchmark:v1", null);
+    if(stored && Array.isArray(stored.benchmark_rows)){
+      const result = applyDerivedBenchmarkData(stored, "manual-import");
+      DERIVED_BENCHMARK_LOAD_STATE.source = "manual-import (static asset fetch 실패 — 이전에 수동으로 가져온 데이터 사용)";
+      return result;
+    }
+    DERIVED_BENCHMARK_LOAD_STATE = { status:"failed", source:null, count:0, error:e.message||String(e) };
+    return { ok:false, error:e.message||String(e) };
+  }
+}
+// manual file-picker import (unchanged entry point/signature — item 8: kept as a fallback the person
+// can still use if the static asset fetch fails, or to override it) — now just parses the JSON text
+// and delegates the actual mutation to the shared applyDerivedBenchmarkData() above. Still persisted
+// to StorageService so autoLoadDerivedBenchmark()'s fallback path can find it on a future load where
+// the static asset isn't reachable.
+async function importDerivedBenchmark(jsonText){
+  let parsedJson;
+  try{ parsedJson=JSON.parse(jsonText); }catch(e){ return { ok:false, error:"JSON 파싱 실패: "+(e.message||e) }; }
+  const result = applyDerivedBenchmarkData(parsedJson, "manual-import");
+  if(result.ok) await StorageService.set("hps:derivedBenchmark:v1", { benchmark_rows:DERIVED_BENCHMARK, versions:DERIVED_BENCHMARK_META });
+  return result;
+}
+async function clearDerivedBenchmark(){ DERIVED_BENCHMARK=[]; DERIVED_BENCHMARK_META=null; DERIVED_BENCHMARK_LOAD_STATE={status:"failed",source:null,count:0}; await StorageService.set("hps:derivedBenchmark:v1", null); }
 
 // same 10-year age-band scheme as the offline pipeline (build_derived_benchmark.py A-5) — derived
 // only, never overwrites the user's own age field.
@@ -5296,6 +5494,22 @@ function queryPeerSegmentStats(seg, group){
   const source = realValues.length>0
     ? `예시 벤치마크 모델 (실제 데이터 ${realValues.length}건 — ${MIN_REAL_SAMPLE}건 미만이라 percentile 미표시, 데이터 부족)`
     : PEER_DATA_SOURCE.sourceLabel;
+
+  // SkiErg/Row unrealistic-STATIC_FALLBACK guard (this pass): when no real ASIA/Global/participant-DB
+  // benchmark exists at all, the illustrative PEER_SEGMENTS formula (base × PEER_CALIBRATION_SCALE ×
+  // gender/division multipliers, including Open/Pro Doubles' 0.46 station factor) can land well under
+  // any plausible real 1000m Ski/Row time — observed: 2:30/2:39. That is NOT a real benchmark, so it is
+  // never shown as one. UNREALISTIC_STATION_FLOOR_SEC=160s (2:40) is set with margin above both
+  // observed cases (150s/159s) rather than a strict "<150s" cutoff, so near-boundary illustrative
+  // values are also caught, not just the literal below-2:30 case. Scoped ONLY to ski/row per spec —
+  // every other station's illustrative fallback is untouched. Never fires once a real derived/
+  // participant benchmark was found above; this block only runs after those have already failed.
+  const UNREALISTIC_STATION_FLOOR_SEC = 160;
+  if((seg.key==="ski"||seg.key==="row") && illustrativeMean<UNREALISTIC_STATION_FLOOR_SEC){
+    return { mean:null, sd:null, n:realValues.length||null, isReal:false,
+      source:`동일 그룹 기준 데이터 부족 (illustrative 추정치 ${fmtTime(illustrativeMean)}가 비현실적으로 낮아 표시 차단됨)`,
+      benchmarkSource:"UNAVAILABLE", sampleN:realValues.length||null };
+  }
   return { mean:illustrativeMean, sd:illustrativeSd, n:realValues.length||null, isReal:false, source, benchmarkSource:"STATIC_FALLBACK", sampleN:realValues.length||null };
 }
 const PEER_SEGMENTS = [
@@ -5457,6 +5671,10 @@ function computePeerAnalysis(){
       actual = null; basis = null;
     }
     if(actual==null) return { ...seg, actual:null, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, personalHistory, basis, z:null, percentile:null, star:null, timeLoss:null };
+    // spec item 4 (this pass): when no real benchmark exists at all (peerMean===null, e.g. the
+    // Ski/Row unrealistic-STATIC_FALLBACK guard above), z/percentile/timeLoss must ALSO stay null —
+    // "내 기록"이 있어도 비교할 실제 기준이 없으면 점수를 매기지 않습니다 (fabricated comparison 금지).
+    if(peerMean==null || peerSd==null) return { ...seg, actual, peerMean:null, peerSd:null, peerN, peerIsReal, benchmarkSource, sampleN, personalHistory, basis, z:null, percentile:null, star:null, timeLoss:null };
     const z = (peerMean-actual)/peerSd;
     const percentile = clamp(normalCdf(z)*100, 0.5, 99.5);
     const timeLoss = actual-peerMean;
@@ -5475,7 +5693,7 @@ function computePeerAnalysis(){
   const impactCandidates = [];
   if(runTimeLoss!=null) impactCandidates.push({ key:"run", label:"Running (8구간 합)", timeLoss:runTimeLoss, weight:IMPACT_WEIGHTS.run });
   ["ski","sledPush","sledPull","burpee","row","carry","lunge","wallball"].forEach(k=>{
-    const s=byKey(k); if(s && s.actual!=null) impactCandidates.push({ key:k, label:s.label, timeLoss:s.timeLoss, weight:IMPACT_WEIGHTS[k] });
+    const s=byKey(k); if(s && s.actual!=null && s.timeLoss!=null) impactCandidates.push({ key:k, label:s.label, timeLoss:s.timeLoss, weight:IMPACT_WEIGHTS[k] });
   });
   const totalWeightedLoss = impactCandidates.reduce((sum,c)=>sum+Math.max(0,c.timeLoss)*c.weight,0);
   const impactList = impactCandidates.map(c=>({ ...c, impactPct: totalWeightedLoss>0 ? (Math.max(0,c.timeLoss)*c.weight/totalWeightedLoss)*100 : 0 }))
@@ -6145,7 +6363,7 @@ function submitQuickLog(entry){
   let hrDrift="";
   const fh=Number(entry.firstHalfAvgHr), sh=Number(entry.secondHalfAvgHr);
   if(fh && sh) hrDrift = round1(((sh-fh)/fh)*100);
-  STATE.trainingLog.push({ id:uid(), date:entry.date||todayISO(), type,
+  const candidateEntry = { date:entry.date||todayISO(), type,
     distanceKm:parsed.distanceKm, durationMin:parsed.durationMin,
     avgPaceSecKm:(parsed.distanceKm && parsed.durationMin)? Math.round((parsed.durationMin*60)/parsed.distanceKm) : null,
     avgHr:Number(entry.avgHr)||null, maxHr:Number(entry.maxHr)||null, restingHr:Number(entry.restingHr)||null,
@@ -6153,7 +6371,10 @@ function submitQuickLog(entry){
     hrDrift, recoveryDrop:"", intensityRpe:entry.rpe,
     painFlag:entry.painFlag==="yes", painArea:(entry.painArea||"").trim(),
     note:noteParts.join(" · "), source:entry.detailOpen?"manual":"quick",
-    ...intervalFields });
+    ...intervalFields };
+  // 훈련기록 중복값 등록 방지 — 같은 날짜·같은 유형·비슷한 거리/시간이면 이미 등록된 것으로 보고 건너뜀
+  if(isDuplicateTrainingLogEntry(candidateEntry, STATE.trainingLog)) return { ok:false, duplicate:true };
+  STATE.trainingLog.push({ id:uid(), ...candidateEntry });
   // 최고 심박은 러닝 페이지의 심박존 계산용 Max HR 추정에도 쓰일 수 있도록, 여기 입력한 값이 기존
   // 추정치(최근 평균심박×1.05)보다 크면 그대로 신뢰(실측값이 추정치보다 우선). restingHr은 기존
   // restingHrLog(Apple Health 안정시 심박과 동일한 저장소)에 함께 적재해 심박 기준값 추정에 반영됩니다.
@@ -6173,6 +6394,7 @@ function submitQuickLog(entry){
   }
   recordHpiSnapshot();
   persist();
+  return { ok:true, duplicate:false };
 }
 function openQuickLogModal(){
   const savedDraft = loadLocalDraft("quicklog");
@@ -6345,7 +6567,11 @@ function renderQuickLogModal(){
   panel.querySelector("#qld-painarea")?.addEventListener("change",(e)=>{ QL_DRAFT.painArea=e.target.value; });
   panel.querySelector("#qld-note")?.addEventListener("change",(e)=>{ QL_DRAFT.note=e.target.value; });
   panel.querySelector("#ql-save")?.addEventListener("click",()=>{
-    submitQuickLog(QL_DRAFT);
+    const result = submitQuickLog(QL_DRAFT);
+    if(result.duplicate){
+      showToast("같은 날짜·유형·거리(시간)의 기록이 이미 있어 저장하지 않았습니다");
+      return; // keep the modal + draft so the person can adjust the date/details if it's actually a different session
+    }
     clearLocalDraft("quicklog");
     closeModal();
     showToast("오늘 운동 기록이 저장되었습니다");
@@ -7182,70 +7408,236 @@ function ocrErrorText(e){
 function defaultTlOcrState(){ return { images:[], status:"idle", progress:0, warnings:[], rawText:"" }; }
 let TL_OCR_STATE = defaultTlOcrState();
 let TL_OCR_DRAFT = null; // editable fields after parsing, null until something's been read
-const TL_OCR_TYPE_KEYWORDS = { run:["run","running","달리기","러닝"], interval:["interval","인터벌"], strength:["strength","weight","웨이트","근력"],
-  wod:["wod","hyrox","crossfit"], conditioning:["conditioning","컨디셔닝","row","ski","erg"], recovery:["recovery","회복","rest"] };
-function tlOcrGuessType(text){
-  const low=text.toLowerCase();
-  for(const [type,kws] of Object.entries(TL_OCR_TYPE_KEYWORDS)){ if(kws.some(k=>low.includes(k))) return type; }
-  return "run"; // most common source for these screenshots
-}
-// label -> field, with common Garmin/Strava/watch-app synonyms (English + Korean)
-const TL_OCR_LABEL_MAP = {
-  distanceKm: ["distance","거리","km","킬로미터"],
-  durationMin: ["time","duration","moving time","시간","운동시간","소요시간"],
-  avgPaceSecKm: ["avg pace","average pace","pace","평균 페이스","페이스"],
-  avgHr: ["avg hr","average hr","avg heart rate","평균 심박","평균심박"],
-  maxHr: ["max hr","maximum hr","max heart rate","최대 심박","최고심박"],
-  intensityRpe: ["rpe","perceived exertion","자각강도"],
+
+/* ---------------------------------------------------------------------- */
+/* TRAINING LOG OCR — REWRITE (2026-08 pass)                               */
+/*   Root-cause fix for "거리/시간 항목을 찾지 못했습니다" false errors:      */
+/*   the OLD pipeline required distance+duration together (running-shaped   */
+/*   assumption) and concatenated all images into one blob before a single  */
+/*   label-scan. This version:                                              */
+/*     1) classifies workout TYPE first (classifyWorkoutType), distance is  */
+/*        NEVER required for any type — only date+type+duration are.       */
+/*     2) OCRs each image independently, then MERGES the resulting partial  */
+/*        field-sets into one candidate record (mergeOcrFieldSets) instead  */
+/*        of letting one image's missing field fail the whole batch.        */
+/*     3) supports both "label→value" AND "value→label" layouts (Garmin/    */
+/*        Apple "big number, caption below" tiles read in reverse order),   */
+/*        and many more date/duration phrasings (see parseFlexibleDate /    */
+/*        parseFlexibleDuration).                                           */
+/*     4) never silently defaults an unresolved date to today — flags it    */
+/*        "날짜 확인 필요" and leaves the field blank for the person to fill. */
+/*     5) shows a 🟢/🟡/🔴 confidence read (computeOcrConfidence) before      */
+/*        save, with the specific reasons.                                  */
+/* ---------------------------------------------------------------------- */
+
+// Internal detected category (fine-grained, for display/confidence only) →
+// mapped to the app's existing STATE.trainingLog type enum, which stays
+// unchanged so HPI/ACWR/load-by-type keep working exactly as before:
+// run | interval | strength | wod | conditioning | recovery
+const OCR_DETECTED_TO_STATE_TYPE = {
+  run:"run", cycling:"conditioning", walking:"conditioning", hiking:"conditioning",
+  strength:"strength", hiit:"wod", wod:"wod", hyrox_wod:"wod",
+  ski:"conditioning", row:"conditioning", cardio:"conditioning", other:"conditioning",
 };
-function tlOcrParseNumber(str){ const m=String(str).match(/[\d]+\.?\d*/); return m ? parseFloat(m[0]) : null; }
-function tlOcrParseDuration(str){ // "45:30" -> 45.5 min, "1:02:15" -> 62.25 min, "42 min" -> 42
+const OCR_DETECTED_LABEL_KO = {
+  run:"러닝", cycling:"사이클링", walking:"걷기", hiking:"하이킹", strength:"근력 운동",
+  hiit:"HIIT", wod:"WOD", hyrox_wod:"HYROX WOD", ski:"SkiErg", row:"로잉",
+  cardio:"카디오", other:"기타 운동",
+};
+// Ordered rule list — first match wins. Specific/compound phrases ("weight
+// training", "실내 사이클링") are checked before generic ones ("workout",
+// "카디오"), and strength-signal keywords (sets/reps/exercise names) can
+// override a generic title like "Evening Workout".
+const WORKOUT_TYPE_RULES = [
+  { type:"hyrox_wod", kws:["hyrox"] },
+  { type:"strength", kws:["weight training","웨이트 트레이닝","웨이트","strength training","근력 운동","근력운동","kettlebell","케틀벨","bench press","벤치프레스","squat","스쿼트","deadlift","데드리프트","total sets","total reps","세트 수","반복 횟수"] },
+  { type:"hiit", kws:["hiit","interval training","인터벌 트레이닝"] },
+  { type:"cycling", kws:["cycling","사이클링","사이클","spin","spinning","바이크","bike ride","indoor bike"] },
+  { type:"row", kws:["rowing","로잉","row erg","skierg row"] },
+  { type:"ski", kws:["skierg","ski erg","스키에르그"] },
+  { type:"hiking", kws:["hiking","하이킹","등산"] },
+  { type:"walking", kws:["walking","걷기","산책"] },
+  { type:"wod", kws:["crossfit","크로스핏","circuit","서킷"] },
+  { type:"cardio", kws:["cardio","카디오"] },
+  { type:"run", kws:["running","러닝","달리기","조깅","jogging","run "] },
+  { type:"wod", kws:["workout","운동"] }, // generic catch-all, checked before returning null
+];
+function classifyWorkoutType(text){
+  const low = String(text||"").toLowerCase();
+  for(const rule of WORKOUT_TYPE_RULES){
+    if(rule.kws.some(k=>low.includes(k.toLowerCase()))) return rule.type;
+  }
+  return null; // unresolved — caller applies the distance+pace heuristic, then falls back to "other"
+}
+
+const OCR_MONTH_NAMES = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+function ocrMonthNameToNum(name){
+  const abbr = OCR_MONTH_NAMES.findIndex(m=>m.slice(0,3)===String(name).toLowerCase().slice(0,3));
+  return abbr>=0 ? abbr+1 : null;
+}
+// Returns { date:"YYYY-MM-DD"|null, needsConfirmation:bool, note:string|null }
+// Never silently defaults to today when nothing resolves (spec item 3).
+function parseFlexibleDate(text, todayISOStr){
+  const t = String(text||"");
+  // ISO / dot / slash: 2026-08-13, 2026.08.13, 2026/08/13
+  let m = t.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
+  if(m) return { date:`${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`, needsConfirmation:false, note:null };
+  // "August 13, 2026" / "Aug 13, 2026" / "...at 6:38 PM" (time part ignored)
+  m = t.match(/\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b/);
+  if(m){ const mo=ocrMonthNameToNum(m[1]); if(mo) return { date:`${m[3]}-${String(mo).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`, needsConfirmation:false, note:null }; }
+  // Korean "8월 13일" (연도 없음 → 올해로 가정, 참고용 note)
+  m = t.match(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/);
+  if(m){ const year=todayISOStr.slice(0,4); return { date:`${year}-${String(m[1]).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`, needsConfirmation:false,
+    note:"연도 정보가 없어 올해로 가정했습니다 — 확인해주세요." }; }
+  // 상대 날짜: 어제/Yesterday, 오늘/Today
+  if(/어제|yesterday/i.test(t)){ const d=new Date(todayISOStr); d.setDate(d.getDate()-1);
+    return { date:d.toISOString().slice(0,10), needsConfirmation:false, note:"'어제'로 표시되어 있어 인식 시점 기준으로 계산했습니다 — 확인해주세요." }; }
+  if(/오늘|today/i.test(t)){ return { date:todayISOStr, needsConfirmation:false, note:"'오늘'로 표시되어 있어 인식 시점 날짜를 사용했습니다 — 확인해주세요." }; }
+  // 요일만 있고 절대 날짜가 없는 경우 (예: "화요일 - 오후 8:49") → 확정하지 않음
+  return { date:null, needsConfirmation:true, note:null };
+}
+
+// hh:mm:ss or mm:ss → minutes (float, 1 decimal)
+function hmsToMinutes(str){
   const s=String(str).trim();
-  const hmsMatch=s.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if(hmsMatch){
-    if(hmsMatch[3]!==undefined) return Math.round((Number(hmsMatch[1])*3600+Number(hmsMatch[2])*60+Number(hmsMatch[3]))/6)/10;
-    return Math.round((Number(hmsMatch[1])*60+Number(hmsMatch[2]))/6)/10;
-  }
-  const numMatch=s.match(/(\d+\.?\d*)/);
-  return numMatch ? parseFloat(numMatch[1]) : null;
+  const m3 = s.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+  if(m3) return Math.round((Number(m3[1])*3600+Number(m3[2])*60+Number(m3[3]))/6)/10;
+  const m2 = s.match(/^(\d{1,3}):(\d{2})$/);
+  if(m2) return Math.round((Number(m2[1])*60+Number(m2[2]))/6)/10;
+  return null;
 }
-function tlOcrParsePace(str){ // "5:32" or "5:32/km" -> seconds per km
-  const m=String(str).match(/(\d{1,2}):(\d{2})/);
-  return m ? Number(m[1])*60+Number(m[2]) : null;
-}
-function parseTrainingLogOcrText(text){
-  const lines = text.split("\n").map(l=>l.trim()).filter(Boolean);
-  const fields = { date:null, type:tlOcrGuessType(text), distanceKm:null, durationMin:null, avgPaceSecKm:null, avgHr:null, maxHr:null, intensityRpe:null };
-  const warnings=[];
-  // date: look for YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY, or "Aug 14, 2026"-style patterns
-  const dateMatch = text.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/) || text.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
-  if(dateMatch){
-    if(dateMatch[1].length===4) fields.date = `${dateMatch[1]}-${String(dateMatch[2]).padStart(2,"0")}-${String(dateMatch[3]).padStart(2,"0")}`;
-    else fields.date = `${dateMatch[3]}-${String(dateMatch[1]).padStart(2,"0")}-${String(dateMatch[2]).padStart(2,"0")}`;
+// Label BEFORE value — "총 시간  1:00:13", "Elapsed Time  40:42"
+const DURATION_LABEL_PATTERNS = [
+  /총\s*시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
+  /elapsed\s*time[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
+  /moving\s*time[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
+  /이동\s*시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
+  /\btime\b[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/i,
+  /시간[^\d]{0,6}(\d{1,2}:\d{2}(?::\d{2})?)/,
+];
+// Value BEFORE label — many "big stat number, caption below" widgets (Apple
+// Health/Garmin summary tiles) OCR in this order instead: "31:24 ... 시간"
+const DURATION_LABEL_PATTERNS_REVERSED = [
+  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}elapsed\s*time/i,
+  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}\btime\b/i,
+  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}총\s*시간/,
+  /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,8}시간/,
+];
+function parseFlexibleDuration(text){
+  for(const re of DURATION_LABEL_PATTERNS){
+    const m = text.match(re);
+    if(m){ const min = hmsToMinutes(m[1]); if(min!=null) return { minutes:min, matchedText:m[1] }; }
   }
-  lines.forEach((line, idx)=>{
-    const low=line.toLowerCase();
-    for(const [field, labels] of Object.entries(TL_OCR_LABEL_MAP)){
-      if(fields[field]!=null) continue; // first match wins, don't overwrite
-      const hitLabel = labels.find(l=>low.includes(l));
-      if(!hitLabel) continue;
-      // value can be on the same line (after the label) or the next line
-      const sameLine = line.slice(low.indexOf(hitLabel)+hitLabel.length).trim();
-      const candidate = sameLine || (lines[idx+1]||"");
-      if(field==="distanceKm") fields.distanceKm = tlOcrParseNumber(candidate);
-      else if(field==="durationMin") fields.durationMin = tlOcrParseDuration(candidate);
-      else if(field==="avgPaceSecKm") fields.avgPaceSecKm = tlOcrParsePace(candidate);
-      else if(field==="avgHr") fields.avgHr = tlOcrParseNumber(candidate);
-      else if(field==="maxHr") fields.maxHr = tlOcrParseNumber(candidate);
-      else if(field==="intensityRpe"){ const n=tlOcrParseNumber(candidate); fields.intensityRpe = (n!=null && n>=1 && n<=10) ? Math.round(n) : null; }
-    }
+  for(const re of DURATION_LABEL_PATTERNS_REVERSED){
+    const m = text.match(re);
+    if(m){ const min = hmsToMinutes(m[1]); if(min!=null) return { minutes:min, matchedText:m[1] }; }
+  }
+  // fallback: a standalone hh:mm:ss/mm:ss value with no adjacent label at all —
+  // used only when nothing labeled matched (e.g. a bare "1:41:23" overlay on a
+  // map). Skips the first ~25 characters (usually a phone status-bar clock)
+  // and prefers the LAST match, since duration stats typically render after
+  // distance/pace in these apps.
+  const body = text.length>25 ? text.slice(25) : text;
+  const hmsMatches = [...body.matchAll(/\b(\d{1,2}:\d{2}:\d{2})\b/g)];
+  if(hmsMatches.length){ const v=hmsMatches[hmsMatches.length-1][1]; const min=hmsToMinutes(v); if(min!=null) return { minutes:min, matchedText:v }; }
+  const msMatches = [...body.matchAll(/\b(\d{1,3}:\d{2})\b/g)];
+  if(msMatches.length){ const v=msMatches[msMatches.length-1][1]; const min=hmsToMinutes(v); if(min!=null) return { minutes:min, matchedText:v }; }
+  return null;
+}
+
+// All remaining fields are OPTIONAL for every workout type (spec item 1/12).
+const DISTANCE_LABEL_PATTERNS = [
+  /distance[^\d]{0,6}([\d.]+)\s*(km|mi)?/i,
+  /거리[^\d]{0,6}([\d.]+)\s*(km|킬로미터)?/,
+  /([\d.]+)\s*(km|킬로미터)[^\d]{0,6}거리/,
+];
+function parseFlexibleDistanceKm(text){
+  for(const re of DISTANCE_LABEL_PATTERNS){
+    const m=text.match(re);
+    if(m){ const v=parseFloat(m[1]); if(!isNaN(v)&&v>0) return v; }
+  }
+  const bare = text.match(/([\d]{1,3}\.\d{1,2})\s*(km|킬로미터)/i);
+  if(bare){ const v=parseFloat(bare[1]); if(!isNaN(v)) return v; }
+  return null;
+}
+function parseFlexiblePaceSecKm(text){
+  const m = text.match(/(?:pace|페이스)[^\d]{0,10}(\d{1,2})['’:](\d{2})/i) || text.match(/(\d{1,2})['’](\d{2})''?\s*\/?\s*km/i);
+  if(m) return Number(m[1])*60+Number(m[2]);
+  return null;
+}
+const AVG_HR_PATTERNS = [/avg\.?\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /average\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /평균\s*심박수?[^\d]{0,6}(\d{2,3})/, /(\d{2,3})\s*bpm[^\d]{0,10}평균/, /(\d{2,3})[^\d]{0,10}평균\s*심박/];
+const MAX_HR_PATTERNS = [/max\.?\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /maximum\s*heart\s*rate[^\d]{0,6}(\d{2,3})/i, /최[대고]\s*심박수?[^\d]{0,6}(\d{2,3})/, /(\d{2,3})[^\d]{0,10}최[대고]\s*심박/];
+function ocrFirstMatchNum(text, patterns){
+  for(const re of patterns){ const m=text.match(re); if(m) return Number(m[1]); }
+  return null;
+}
+function parseFlexibleCalories(text){
+  const m = text.match(/(?:calories|칼로리|cal)[^\d]{0,6}(\d{2,4})/i);
+  return m ? Number(m[1]) : null;
+}
+function tlOcrParseNumber(str){ const m=String(str).match(/[\d]+\.?\d*/); return m ? parseFloat(m[0]) : null; }
+
+// Parses ONE image's OCR text into a partial field set. Never throws, never
+// requires distance. Merging across images happens in mergeOcrFieldSets().
+function parseTrainingLogOcrText(text, todayISOStr){
+  todayISOStr = todayISOStr || todayISO();
+  const detected = classifyWorkoutType(text);
+  const distanceKm = parseFlexibleDistanceKm(text);
+  const paceSecKm = parseFlexiblePaceSecKm(text);
+  // heuristic: distance+pace present but no keyword hit at all → very likely a run
+  const finalDetected = detected || ((distanceKm && paceSecKm) ? "run" : null);
+  const durationParsed = parseFlexibleDuration(text);
+  const dateParsed = parseFlexibleDate(text, todayISOStr);
+  const avgHr = ocrFirstMatchNum(text, AVG_HR_PATTERNS);
+  const maxHr = ocrFirstMatchNum(text, MAX_HR_PATTERNS);
+  const calories = parseFlexibleCalories(text);
+  return {
+    detectedType: finalDetected,
+    date: dateParsed.date, dateNeedsConfirmation: dateParsed.needsConfirmation, dateNote: dateParsed.note,
+    durationMin: durationParsed ? durationParsed.minutes : null,
+    distanceKm: distanceKm,
+    avgPaceSecKm: paceSecKm != null ? paceSecKm : (distanceKm && durationParsed ? Math.round((durationParsed.minutes*60)/distanceKm) : null),
+    avgHr, maxHr, calories,
+  };
+}
+
+// Combines several per-image partial field sets into ONE candidate record
+// (spec item 5). First image (upload order) with a real value for a field
+// wins that field; later images only fill gaps. detectedType prefers the
+// most SPECIFIC non-null value over a generic "wod"/"other" guess.
+const TYPE_SPECIFICITY = { hyrox_wod:5, strength:5, cycling:4, ski:4, row:4, hiit:4, hiking:3, walking:3, run:3, cardio:2, wod:1, other:0 };
+function mergeOcrFieldSets(list){
+  const merged = { detectedType:null, date:null, dateNeedsConfirmation:false, dateNote:null,
+    durationMin:null, distanceKm:null, avgPaceSecKm:null, avgHr:null, maxHr:null, calories:null };
+  list.forEach(f=>{
+    if(f.detectedType && (merged.detectedType==null || (TYPE_SPECIFICITY[f.detectedType]||0) > (TYPE_SPECIFICITY[merged.detectedType]||0))) merged.detectedType = f.detectedType;
+    if(merged.date==null && f.date){ merged.date=f.date; merged.dateNote=f.dateNote; }
+    if(f.dateNeedsConfirmation && merged.date==null) merged.dateNeedsConfirmation = true;
+    if(merged.durationMin==null && f.durationMin!=null) merged.durationMin = f.durationMin;
+    if(merged.distanceKm==null && f.distanceKm!=null) merged.distanceKm = f.distanceKm;
+    if(merged.avgPaceSecKm==null && f.avgPaceSecKm!=null) merged.avgPaceSecKm = f.avgPaceSecKm;
+    if(merged.avgHr==null && f.avgHr!=null) merged.avgHr = f.avgHr;
+    if(merged.maxHr==null && f.maxHr!=null) merged.maxHr = f.maxHr;
+    if(merged.calories==null && f.calories!=null) merged.calories = f.calories;
   });
-  // derive pace from distance+duration if pace itself wasn't found directly (never invents distance/duration)
-  if(fields.avgPaceSecKm==null && fields.distanceKm && fields.durationMin) fields.avgPaceSecKm = Math.round((fields.durationMin*60)/fields.distanceKm);
-  if(!fields.distanceKm && !fields.durationMin) warnings.push("거리/시간 항목을 찾지 못했습니다 — 아래에서 직접 입력해주세요.");
-  if(!fields.date) warnings.push("날짜를 인식하지 못했습니다 — 오늘 날짜로 채워뒀으니 확인해주세요.");
-  return { fields, warnings };
+  if(merged.date!=null) merged.dateNeedsConfirmation = false;
+  return merged;
 }
+
+// Returns { level, emoji, label, reasons:[...] } — spec item 8.
+function computeOcrConfidence(merged){
+  const reasons=[];
+  if(merged.durationMin==null) return { level:"red", emoji:"🔴", label:"핵심 정보 부족", reasons:["운동시간을 인식하지 못했습니다"] };
+  let level="green";
+  if(!merged.date || merged.dateNeedsConfirmation){ level="yellow"; reasons.push("날짜 확인 필요"); }
+  if(!merged.detectedType){ level="yellow"; reasons.push("운동 유형을 명확히 인식하지 못해 기본값으로 채웠습니다"); }
+  if(merged.distanceKm==null && merged.avgHr==null && merged.calories==null){
+    reasons.push("거리·심박 등 추가 정보 없음 (운동시간 기준으로는 정상 등록 가능)");
+  }
+  if(level==="green" && !reasons.length) reasons.push("날짜·유형·운동시간이 모두 명확히 인식되었습니다");
+  return { level, emoji: level==="green"?"🟢":"🟡", label: level==="green"?"높은 신뢰도":"일부 확인 필요", reasons };
+}
+
 async function runTrainingLogOcrPipeline(){
   if(!window.Tesseract){ TL_OCR_STATE.status="error"; TL_OCR_STATE.warnings=["OCR 엔진 스크립트를 불러오지 못했습니다 (네트워크 문제일 수 있어요). 다시 시도해주세요."]; renderAll(); return; }
   TL_OCR_STATE.status="processing"; TL_OCR_STATE.progress=0; TL_OCR_STATE.rawText=""; renderAll();
@@ -7255,7 +7647,14 @@ async function runTrainingLogOcrPipeline(){
     TL_OCR_STATE.warnings=["이 미리보기 화면은 보안 정책상 OCR에 필요한 웹 워커 실행이 막혀 있어요. 파일을 다운로드한 뒤 Safari나 Chrome 같은 일반 브라우저 앱에서 직접 열어 다시 시도해주세요."];
     renderAll(); return;
   }
-  let combinedText=""; const imageErrors=[];
+  const todayISOStr = todayISO();
+  const perImageFields = [];
+  let combinedRawText = "";
+  const imageErrors=[];
+  // spec item 5: OCR every image independently, THEN merge — one image's
+  // missing field never fails the whole batch, and a second image can
+  // supply the fields the first one lacked (e.g. one has type/HR, the
+  // other has the date/title).
   for(let i=0;i<TL_OCR_STATE.images.length;i++){
     try{
       const canvas=await preprocessForOcr(TL_OCR_STATE.images[i].dataUrl);
@@ -7263,31 +7662,64 @@ async function runTrainingLogOcrPipeline(){
         logger:(m)=>{ if(m.status==="recognizing text"){ TL_OCR_STATE.progress=Math.round(((i+m.progress)/TL_OCR_STATE.images.length)*100);
           const el=document.getElementById("tl-ocr-progress-text"); if(el) el.textContent=`기록을 읽고 있어요… (${TL_OCR_STATE.progress}%)`; } }
       });
-      combinedText += "\n"+(data.text||"");
+      const text = data.text || "";
+      combinedRawText += `\n----- 이미지 ${i+1} -----\n${text}`;
+      perImageFields.push(parseTrainingLogOcrText(text, todayISOStr));
     }catch(e){ console.warn("Training log OCR failed on image", i, e); imageErrors.push(`이미지 ${i+1}: ${ocrErrorText(e)}`); }
   }
-  TL_OCR_STATE.rawText=combinedText.trim();
-  if(!combinedText.trim()){
+  TL_OCR_STATE.rawText=combinedRawText.trim();
+  if(!perImageFields.length){
     TL_OCR_STATE.status="error";
     TL_OCR_STATE.warnings = imageErrors.length ? imageErrors : ["OCR 엔진이 이미지에서 아무 글자도 읽지 못했습니다. 화면 캡처가 선명한지 확인 후 다시 시도해주세요."];
     renderAll(); return;
   }
-  const { fields, warnings } = parseTrainingLogOcrText(combinedText);
-  // NEVER auto-saved — lands in an editable draft the user must review and confirm (spec requirement)
-  TL_OCR_DRAFT = { date: fields.date||todayISO(), type: fields.type, distanceKm: fields.distanceKm, durationMin: fields.durationMin,
-    avgPaceSecKm: fields.avgPaceSecKm, avgHr: fields.avgHr, maxHr: fields.maxHr, intensityRpe: fields.intensityRpe };
-  TL_OCR_STATE.status="done"; TL_OCR_STATE.warnings=[...warnings, ...imageErrors];
+
+  const merged = mergeOcrFieldSets(perImageFields);
+  const confidence = computeOcrConfidence(merged);
+
+  // spec item 9: rewritten warning copy — distance-missing is informational,
+  // never an error; duration-missing gets the exact required sentence.
+  const warnings=[];
+  if(merged.durationMin==null) warnings.push("운동시간을 확인하지 못했습니다. 운동시간을 직접 입력해주세요.");
+  if(!merged.date) warnings.push("날짜를 정확히 인식하지 못했습니다 — 아래에서 직접 확인해주세요.");
+  else if(merged.dateNote) warnings.push(merged.dateNote);
+  if(merged.distanceKm==null) warnings.push("거리 정보 없음 — 이 운동 유형에서는 정상입니다.");
+  warnings.push(...imageErrors);
+
+  const stateType = OCR_DETECTED_TO_STATE_TYPE[merged.detectedType] || "conditioning";
+  // NEVER auto-saved — lands in an editable draft the user must review and confirm.
+  // Date intentionally left blank (never silently defaulted to today) when unresolved.
+  TL_OCR_DRAFT = { date: merged.date || "", dateNeedsConfirmation: !merged.date,
+    type: stateType, detectedTypeLabel: merged.detectedType ? OCR_DETECTED_LABEL_KO[merged.detectedType] : null,
+    distanceKm: merged.distanceKm, durationMin: merged.durationMin, avgPaceSecKm: merged.avgPaceSecKm,
+    avgHr: merged.avgHr, maxHr: merged.maxHr, intensityRpe: null, calories: merged.calories, confidence };
+  TL_OCR_STATE.status="done"; TL_OCR_STATE.warnings=warnings;
   renderAll();
 }
 function saveTlOcrDraft(){
   if(!TL_OCR_DRAFT) return;
   const d=TL_OCR_DRAFT;
-  STATE.trainingLog.push({ id:uid(), date:d.date||todayISO(), type:d.type||"run",
-    distanceKm: d.distanceKm!=null?Number(d.distanceKm):null, durationMin: d.durationMin!=null?Number(d.durationMin):null,
-    avgPaceSecKm: d.avgPaceSecKm!=null?Number(d.avgPaceSecKm):null,
-    avgHr: d.avgHr!=null?Number(d.avgHr):null, maxHr: d.maxHr!=null?Number(d.maxHr):null,
-    intensityRpe: d.intensityRpe!=null?Number(d.intensityRpe):null,
-    source:"ocr" }); // spec: source clearly tagged, distinct from manual/quick/csv/apple
+  // spec item 12: minimum unit is date + type + duration. Distance is optional.
+  if(!d.date || !/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 입력해주세요 (YYYY-MM-DD)"); return; }
+  if(d.durationMin==null || d.durationMin===""){ showToast("운동시간을 확인하지 못했습니다. 운동시간을 직접 입력해주세요."); return; }
+  const noteParts=[];
+  if(d.detectedTypeLabel) noteParts.push(`OCR 인식: ${d.detectedTypeLabel}`);
+  if(d.calories!=null && d.calories!=="") noteParts.push(`칼로리 ${d.calories}`);
+  const candidateEntry = { date:d.date, type:d.type||"conditioning",
+    distanceKm: d.distanceKm!=null && d.distanceKm!=="" ? Number(d.distanceKm) : null,
+    durationMin: Number(d.durationMin),
+    avgPaceSecKm: d.avgPaceSecKm!=null && d.avgPaceSecKm!=="" ? Number(d.avgPaceSecKm) : null,
+    avgHr: d.avgHr!=null && d.avgHr!=="" ? Number(d.avgHr) : null,
+    maxHr: d.maxHr!=null && d.maxHr!=="" ? Number(d.maxHr) : null,
+    intensityRpe: d.intensityRpe!=null && d.intensityRpe!=="" ? Number(d.intensityRpe) : null,
+    note: noteParts.join(" · "),
+    source:"ocr" }; // spec: source clearly tagged, distinct from manual/quick/csv/apple
+  // 훈련기록 중복값 등록 방지 — 같은 날짜·유형·거리(시간)의 기록이 이미 있으면 저장하지 않고 draft를 보존
+  if(isDuplicateTrainingLogEntry(candidateEntry, STATE.trainingLog)){
+    showToast("같은 날짜·유형·거리(시간)의 기록이 이미 있어 저장하지 않았습니다");
+    return;
+  }
+  STATE.trainingLog.push({ id:uid(), ...candidateEntry });
   recordHpiSnapshot(); persist();
   TL_OCR_DRAFT=null; TL_OCR_STATE=defaultTlOcrState();
   showToast("OCR로 읽은 훈련 기록을 저장했습니다");
@@ -7780,8 +8212,13 @@ function renderQuickTestTab(wrap){
     const opt=QUICK_TEST_OPTIONS.find(o=>o.key===key);
     if(opt.isRunning){
       const sec=parseTimeToSec(timeStr);
-      STATE.trainingLog.push({ id:uid(), date, type:"tt", distanceKm:1, durationMin:round1(sec/60),
-        avgPaceSecKm:sec, intensityRpe:null, painFlag:false, note:"Quick Calibration Test (1km TT)", source:"manual" });
+      const candidateEntry = { date, type:"tt", distanceKm:1, durationMin:round1(sec/60),
+        avgPaceSecKm:sec, intensityRpe:null, painFlag:false, note:"Quick Calibration Test (1km TT)", source:"manual" };
+      if(isDuplicateTrainingLogEntry(candidateEntry, STATE.trainingLog)){
+        statusEl.style.color="var(--amber)"; statusEl.textContent="같은 날짜의 1km TT 기록이 이미 있어 저장하지 않았습니다.";
+        return;
+      }
+      STATE.trainingLog.push({ id:uid(), ...candidateEntry });
     } else {
       STATE.stationTests.push({ id:uid(), date, values:{ [key]:timeStr }, source:"quick", division:STATE.profile.division });
     }
@@ -8177,9 +8614,18 @@ function renderTlOcrDraftForm(){
   const typeOptions = ["run","interval","strength","wod","conditioning","recovery"];
   return `
     <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);">
+      ${d.confidence ? `
+        <div class="reason-line" style="margin-bottom:10px;font-family:var(--font-body);color:${
+          d.confidence.level==="green"?"var(--green)":d.confidence.level==="yellow"?"var(--amber)":"var(--red)"};">
+          ${d.confidence.emoji} ${d.confidence.label}${d.confidence.reasons.length? " — "+d.confidence.reasons.map(escapeHtml).join(" · ") : ""}
+        </div>` : ""}
+      ${d.detectedTypeLabel ? `
+        <div class="reason-line" style="margin-bottom:10px;font-family:var(--font-body);">
+          인식된 운동 유형: <b style="color:var(--orange);">${escapeHtml(d.detectedTypeLabel)}</b> (아래 드롭다운에서 바꿀 수 있어요)
+        </div>` : ""}
       <div class="lead" style="color:var(--green);margin-bottom:10px;">아래 내용을 확인·수정한 뒤 저장해주세요 — 자동으로 저장되지 않습니다.</div>
       <div class="grid grid-3">
-        ${field("날짜", `<input id="tlo-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date||"")}">`)}
+        ${field(d.dateNeedsConfirmation? "날짜 (확인 필요)" : "날짜", `<input id="tlo-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="${d.dateNeedsConfirmation?"YYYY-MM-DD 직접 입력":""}" style="${d.dateNeedsConfirmation?"border-color:var(--amber);":""}" value="${escapeHtml(d.date||"")}">`)}
         ${field("운동 종류", `<select id="tlo-type">${typeOptions.map(t=>`<option value="${t}" ${d.type===t?"selected":""}>${typeLabel(t)}</option>`).join("")}</select>`)}
         ${field("거리 (km)", `<input id="tlo-distance" type="number" step="0.1" value="${d.distanceKm??""}">`)}
         ${field("시간 (분)", `<input id="tlo-duration" type="number" step="0.1" value="${d.durationMin??""}">`)}
@@ -8199,6 +8645,7 @@ function bindTlOcrDraftForm(wrap){
   if(!TL_OCR_DRAFT) return;
   const bind=(id,field,parse)=>wrap.querySelector(id)?.addEventListener("change",(e)=>{ TL_OCR_DRAFT[field]=parse?parse(e.target.value):e.target.value; });
   bind("#tlo-date","date");
+  wrap.querySelector("#tlo-date")?.addEventListener("change",(e)=>{ if(TL_OCR_DRAFT && e.target.value) TL_OCR_DRAFT.dateNeedsConfirmation=false; });
   bind("#tlo-type","type");
   bind("#tlo-distance","distanceKm",v=>v===""?null:Number(v));
   bind("#tlo-duration","durationMin",v=>v===""?null:Number(v));
@@ -8290,6 +8737,18 @@ function renderTrainingImportTab(wrap){
     reader.readAsText(file);
   });
 }
+// spec (훈련기록 중복값 등록 방지): bulk-import version — drops entries that duplicate either something
+// already in STATE.trainingLog, or an earlier entry in this same batch (re-importing the same CSV/
+// export twice, or a source file that itself has repeated rows, both land here). Reuses
+// isDuplicateTrainingLogEntry() — no separate matching logic.
+function dedupeTrainingLogBatch(batch, existingList){
+  const kept=[]; let skipped=0;
+  batch.forEach(candidate=>{
+    if(isDuplicateTrainingLogEntry(candidate, existingList) || isDuplicateTrainingLogEntry(candidate, kept)) skipped++;
+    else kept.push(candidate);
+  });
+  return { kept, skipped };
+}
 function renderCsvPreview(wrap){
   if(!CSV_PREVIEW || !CSV_PREVIEW.length){ wrap.querySelector("#csv-preview-wrap").innerHTML=""; return; }
   const el=wrap.querySelector("#csv-preview-wrap");
@@ -8309,8 +8768,11 @@ function renderCsvPreview(wrap){
   el.querySelectorAll("[data-csv-type]").forEach(s=>s.addEventListener("change",()=>{ CSV_PREVIEW[Number(s.dataset.csvType)].type=s.value; }));
   el.querySelectorAll("[data-csv-del]").forEach(b=>b.addEventListener("click",()=>{ CSV_PREVIEW.splice(Number(b.dataset.csvDel),1); renderCsvPreview(wrap); }));
   el.querySelector("#csv-commit").addEventListener("click",()=>{
-    STATE.trainingLog.push(...CSV_PREVIEW);
-    CSV_PREVIEW=null; recordHpiSnapshot(); persist(); showToast("가져오기가 완료되었습니다"); renderAll();
+    const { kept, skipped } = dedupeTrainingLogBatch(CSV_PREVIEW, STATE.trainingLog);
+    STATE.trainingLog.push(...kept);
+    CSV_PREVIEW=null; recordHpiSnapshot(); persist();
+    showToast(skipped>0 ? `${kept.length}건 가져왔습니다 (중복 ${skipped}건 제외)` : "가져오기가 완료되었습니다");
+    renderAll();
   });
   el.querySelector("#csv-cancel").addEventListener("click",()=>{ CSV_PREVIEW=null; renderAll(); });
 }
@@ -8334,9 +8796,13 @@ function renderApplePreview(wrap){
   el.querySelectorAll("[data-apple-type]").forEach(s=>s.addEventListener("change",()=>{ APPLE_PREVIEW.workouts[Number(s.dataset.appleType)].type=s.value; }));
   el.querySelectorAll("[data-apple-del]").forEach(b=>b.addEventListener("click",()=>{ APPLE_PREVIEW.workouts.splice(Number(b.dataset.appleDel),1); renderApplePreview(wrap); }));
   el.querySelector("#apple-commit").addEventListener("click",()=>{
-    STATE.trainingLog.push(...APPLE_PREVIEW.workouts);
+    const { kept, skipped } = dedupeTrainingLogBatch(APPLE_PREVIEW.workouts, STATE.trainingLog);
+    const restingHrCount = APPLE_PREVIEW.restingHr.length;
+    STATE.trainingLog.push(...kept);
     STATE.restingHrLog.push(...APPLE_PREVIEW.restingHr);
-    APPLE_PREVIEW=null; recordHpiSnapshot(); persist(); showToast("Apple Health 가져오기가 완료되었습니다"); renderAll();
+    APPLE_PREVIEW=null; recordHpiSnapshot(); persist();
+    showToast(skipped>0 ? `운동 ${kept.length}건 + 심박 ${restingHrCount}건 가져왔습니다 (중복 ${skipped}건 제외)` : "Apple Health 가져오기가 완료되었습니다");
+    renderAll();
   });
   el.querySelector("#apple-cancel").addEventListener("click",()=>{ APPLE_PREVIEW=null; renderAll(); });
 }
@@ -8418,7 +8884,7 @@ function renderGoal(wrap){
     <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">목표 설정</h1></div>
     <div class="card">
       <div class="grid grid-3">
-        ${field("기준 Division (실제 수행 중인 Division)", `<div class="reason-line" style="padding-top:9px;font-family:var(--font-mono);">${p.division} <span style="color:var(--gray-dim);font-family:var(--font-body);">(고정 — 이 페이지에서 변경되지 않습니다)</span></div>`)}
+        ${field("기준 Division (실제 수행 중인 Division)", `<div class="reason-line" style="padding-top:9px;font-family:var(--font-mono);">${p.division} <span style="color:var(--gray-dim);font-family:var(--font-body);">(저장 시 자동으로 바뀌지 않습니다 — 아래 버튼으로만 명시적으로 전환)</span></div>`)}
         ${field("목표 Division (기준과 다르게 설정 가능)", `<select id="goal-target-division">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select>`)}
         ${field("목표 기록 (h:mm:ss)", `<input id="goal-time" placeholder="1:24:00" value="${escapeHtml(p.targetTime)}">`)}
       </div>
@@ -8426,7 +8892,10 @@ function renderGoal(wrap){
         ${field("목표 대회 날짜 (YYYY-MM-DD)", `<input id="goal-date" type="text" inputmode="numeric" placeholder="2026-10-04" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(p.targetDate)}">`)}
         <div id="goal-partner-wrap" style="${p.division.includes("Doubles")?"":"display:none;"}">${field("파트너 이름 (선택)", `<input id="goal-partner" value="${escapeHtml(p.partnerName)}" placeholder="Doubles 팀 파트너">`)}</div>
       </div>
-      ${divisionBase(effectiveGoalDiv)!==divisionBase(p.division) ? `<div class="reason-line" style="margin-top:10px;color:var(--orange);">🟠 목표 Division이 현재 수행 Division과 다릅니다.<br>현재 기록은 목표 Division(${effectiveGoalDiv})의 workload 기준으로 환산한 뒤 목표 기록과 비교합니다 — Division 전환 예측(${p.division} → ${effectiveGoalDiv}) 결과를 사용하며, ${p.division} 기록을 그대로 목표 계산에 쓰지 않습니다.<br><span style="color:var(--gray-dim);">현재 예상 기록 = Division 전환 후 현재 능력 추정 (오류가 아니라 Cross-Division 예측입니다)</span></div>` : ""}
+      ${divisionBase(effectiveGoalDiv)!==divisionBase(p.division) ? `<div class="reason-line" style="margin-top:10px;color:var(--orange);">🟠 목표 Division이 현재 수행 Division과 다릅니다.<br>현재 기록은 목표 Division(${effectiveGoalDiv})의 workload 기준으로 환산한 뒤 목표 기록과 비교합니다 — Division 전환 예측(${p.division} → ${effectiveGoalDiv}) 결과를 사용하며, ${p.division} 기록을 그대로 목표 계산에 쓰지 않습니다.<br><span style="color:var(--gray-dim);">현재 예상 기록 = Division 전환 후 현재 능력 추정 (오류가 아니라 Cross-Division 예측입니다)</span></div>
+      <div class="reason-line" style="margin-top:10px;">실제로 ${p.division}에서 ${effectiveGoalDiv}(으)로 종목을 완전히 옮기셨다면, DNA·Prediction·Station 기록 등 <b>모든 데이터의 기준 자체</b>를 ${effectiveGoalDiv}(으)로 바꿀 수 있습니다.
+        <button class="btn ghost sm" id="goal-promote-division" style="margin-left:8px;">이 Division을 새 기준으로 전환</button>
+      </div>` : ""}
       <div style="margin-top:12px;"><button class="btn sm" id="goal-save">저장</button></div>
     </div>
     ${DEBUG_MODE && plan ? `<div class="card" style="border:1px dashed var(--gray-dim);opacity:0.85;">
@@ -8555,6 +9024,20 @@ function renderGoal(wrap){
     const partnerInput=wrap.querySelector("#goal-partner");
     if(partnerInput) STATE.profile.partnerName=partnerInput.value.trim();
     persist(); showToast("목표가 저장되었습니다"); renderAll();
+  });
+  // explicit, opt-in-only division promotion (spec: 사용자가 명시적으로 요청할 때만 — 과거에 매 저장마다
+  // 자동으로 profile.division을 덮어써서 데이터가 섞이던 버그가 있었기 때문에, 이 버튼을 누르지 않는 한
+  // #goal-save는 profile.division을 절대 건드리지 않습니다). goalDivision -> division으로 승격 후
+  // goalDivision은 비웁니다(새 기준과 같아졌으므로). 다른 Division에 이미 기록된 races/stationTests/
+  // simulationTests는 그대로 보존되며, exact-division 매칭 로직에 의해 새 기준에서는 계속 별도로 취급됩니다
+  // — 과거 데이터가 새 Division으로 소급 이동/합쳐지지 않습니다.
+  wrap.querySelector("#goal-promote-division")?.addEventListener("click",()=>{
+    const from=STATE.profile.division, to=STATE.profile.goalDivision || wrap.querySelector("#goal-target-division").value;
+    if(!to || to===from) return;
+    if(!confirm(`기준 Division을 "${from}" → "${to}"(으)로 바꿀까요?\n\n앞으로 DNA·Prediction·Station 기록 등 모든 계산이 "${to}" 기준으로 이루어집니다. "${from}"에 이미 기록된 경기/테스트는 삭제되지 않고 그대로 남지만, 새 기준에서는 별도 Division으로 취급되어 섞이지 않습니다.`)) return;
+    STATE.profile.division = to;
+    STATE.profile.goalDivision = "";
+    persist(); showToast(`기준 Division이 "${to}"(으)로 바뀌었습니다`); renderAll();
   });
   wrap.querySelectorAll("[data-goal-gap-toggle]").forEach(el=>el.addEventListener("click",()=>{
     const k=el.dataset.goalGapToggle;
@@ -9082,13 +9565,16 @@ function renderPeer(wrap){
           const band = peerScoreBand(score);
           const srcLabel = { ASIA:"ASIA", ASIA_AGE_RELAXED:"ASIA (Age Relaxed)", GLOBAL_HISTORICAL:"Global Historical",
             GLOBAL_HISTORICAL_AGE_RELAXED:"Global Historical (Age Relaxed)", GLOBAL_MATRIX:"Global Matrix",
-            EXTERNAL_RACE_DB:"실제 참가자 DB", STATIC_FALLBACK:"Static Fallback" }[s.benchmarkSource] || s.benchmarkSource || "";
+            EXTERNAL_RACE_DB:"실제 참가자 DB", STATIC_FALLBACK:"Static Fallback", UNAVAILABLE:"데이터 부족" }[s.benchmarkSource] || s.benchmarkSource || "";
           const basisLabel = { "actual":"최근 실측", "actual-adjusted":"실측(보정)", "actual-stale":"실측(경과됨)",
             "actual-recency-weighted":`실측 ${s.personalHistory?.n||""}회 recency-weighted`, "estimated-training-pace":"훈련 로그 추정" }[s.basis] || s.basis;
           return `<div style="margin-bottom:16px;">
             <div class="row-between"><span style="font-size:13px;font-weight:700;">${s.label}</span><span class="mono" style="font-size:12px;color:${band.color};">${score!=null?`${score}점 · ${band.label}`:"데이터 부족"}</span></div>
             <div class="bar-track" style="margin-top:6px;"><div class="bar-fill" style="width:${score!=null?clamp(score,2,100):0}%;background:${band.color};"></div></div>
-            ${s.actual!=null? `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${basisLabel?` (${basisLabel})`:""} · 동일 그룹 기준 ${fmtTime(s.peerMean)} · <span style="color:${s.timeLoss>=0?'var(--red)':'var(--green)'};">${s.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(s.timeLoss))}</span></div>` : ""}
+            ${s.actual!=null? (s.peerMean!=null
+              ? `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${basisLabel?` (${basisLabel})`:""} · 동일 그룹 기준 ${fmtTime(s.peerMean)} · <span style="color:${s.timeLoss>=0?'var(--red)':'var(--green)'};">${s.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(s.timeLoss))}</span></div>`
+              : `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${basisLabel?` (${basisLabel})`:""} · <span style="color:var(--amber);">동일 그룹 기준 데이터 부족</span></div>`
+            ) : ""}
             <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">비교 그룹: ${escapeHtml(deriveBenchmarkGender())} · ${escapeHtml(deriveAgeBand(STATE.profile.age)||"전연령")} · ${escapeHtml(STATE.profile.division)} · Source=${escapeHtml(srcLabel)}${s.sampleN?` · n=${s.sampleN}`:""}</div>
             ${s.personalHistory? `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">개인 경기 ${s.personalHistory.n}회 · 최근 ${fmtTime(s.personalHistory.latest)} · 최고 ${fmtTime(s.personalHistory.best)} · 중앙값 ${fmtTime(s.personalHistory.median)}</div>` : ""}
           </div>`;
@@ -9132,10 +9618,10 @@ function renderPeer(wrap){
         ${segments.filter(s=>s.actual!=null).map(s=>`<tr>
           <td>${s.label}</td>
           <td class="num mono">${fmtTime(s.actual)}</td>
-          <td class="num mono" style="color:var(--gray-dim);">${fmtTime(s.peerMean)}</td>
-          <td class="num mono">${s.z>=0?"+":""}${round1(s.z)}</td>
-          <td class="num mono">${s.peerIsReal?`상위 ${round1(100-s.percentile)}%`:`<span class="badge ${starBadgeClass(s.star.stars)}">${"★".repeat(s.star.stars)}${"☆".repeat(5-s.star.stars)} ${s.star.label}</span>`}</td>
-          <td>${peerSourceBadgeCompact(s.peerIsReal, s.peerN)}</td>
+          <td class="num mono" style="color:var(--gray-dim);">${s.peerMean!=null?fmtTime(s.peerMean):"—"}</td>
+          <td class="num mono">${s.z!=null?`${s.z>=0?"+":""}${round1(s.z)}`:"—"}</td>
+          <td class="num mono">${s.peerMean==null?`<span class="badge crit">데이터 부족</span>`:s.peerIsReal?`상위 ${round1(100-s.percentile)}%`:`<span class="badge ${starBadgeClass(s.star.stars)}">${"★".repeat(s.star.stars)}${"☆".repeat(5-s.star.stars)} ${s.star.label}</span>`}</td>
+          <td>${s.peerMean==null?"실제 벤치마크 없음 (비현실적 illustrative 값 차단됨)":peerSourceBadgeCompact(s.peerIsReal, s.peerN)}</td>
         </tr>`).join("")}
       </tbody></table></div>
       ` : ""}
@@ -9501,18 +9987,28 @@ function renderModelDnaImportTab(wrap){
   // ---- Phase 2-2: Derived Benchmark (Asia/Global percentile table) ----
   const dvCount = DERIVED_BENCHMARK.length;
   const dvMeta = DERIVED_BENCHMARK_META;
+  const dvLoadState = DERIVED_BENCHMARK_LOAD_STATE;
+  // spec item 7: status line reflects what actually happened (auto-fetch loading/succeeded/failed),
+  // not just "row count > 0" — a manual-import fallback after a failed auto-fetch is shown distinctly
+  // from a clean auto-load, and a genuine failure with zero rows is shown as a real failure, not "미로드".
+  const dvStatusText = dvLoadState.status==="loading" ? "Derived Benchmark 로딩 중..."
+    : dvLoadState.status==="loaded" ? (dvLoadState.source==="static-asset" ? "Loaded · Asia/Global derived benchmark" : `Loaded (${dvLoadState.source}) · ${dvCount.toLocaleString()}행`)
+    : dvCount>0 ? `${dvCount.toLocaleString()}행 로드됨` : "Derived Benchmark 로드 실패 · fallback 사용";
+  const dvStatusColor = dvLoadState.status==="loaded" ? "var(--green)" : dvLoadState.status==="loading" ? "var(--gray-dim)" : "var(--amber)";
   const dvCard = document.createElement("div");
   dvCard.className = "card";
   dvCard.innerHTML = `
-    <div class="row-between"><h2 class="section-title">📊 Derived Benchmark (Asia/Global 실측 percentile)</h2><span class="mono" style="font-size:11px;color:var(--gray-dim);">${dvCount>0?`${dvCount}행 로드됨`:"미로드"}</span></div>
-    <p class="lead" style="margin:6px 0 12px;">Phase 2 파이프라인(<code>build_derived_benchmark.py</code>)이 51만+ 행의 실제 HYROX 결과를 Division×Gender×AgeBand×Station별 P10~P90 percentile로 압축한 결과물(<code>derived_benchmark.json</code>)을 가져옵니다. Station Priority 계산에서 실제 데이터가 우선 사용되고, 없으면 기존 고정 벤치마크로 자동 대체됩니다(Asia→Global Historical→Global Matrix→기존 고정값 순).</p>
+    <div class="row-between"><h2 class="section-title">📊 Derived Benchmark (Asia/Global 실측 percentile)</h2><span class="mono" style="font-size:11px;color:${dvStatusColor};">${escapeHtml(dvStatusText)}</span></div>
+    <p class="lead" style="margin:6px 0 12px;">Phase 2 파이프라인(<code>build_derived_benchmark.py</code>)이 51만+ 행의 실제 HYROX 결과를 Division×Gender×AgeBand×Station별 P10~P90 percentile로 압축한 결과물(<code>derived_benchmark.json</code>)을 앱 로딩 시 <code>./derived_benchmark.json</code>에서 자동으로 가져옵니다(정적 asset — index.html과 함께 배포됨, localStorage에 별도 저장하지 않습니다). Station Priority/Prediction/DNA 모두 이 데이터를 우선 사용하고, 없으면 기존 고정 벤치마크로 자동 대체됩니다(Asia→Global Historical→Global Matrix→기존 고정값 순).</p>
+    ${dvLoadState.status==="failed" ? `<p class="reason-line" style="margin:0 0 10px;color:var(--amber);">자동 fetch 실패${dvLoadState.error?` (${escapeHtml(dvLoadState.error)})`:""} — index.html과 같은 경로에 derived_benchmark.json이 없거나 접근할 수 없습니다. 아래에서 수동으로 가져올 수 있습니다.</p>` : ""}
     ${dvMeta ? `<div class="reason-line" style="margin-bottom:10px;">
       ${dvMeta["ASIA-2026-H1-v1.0"] ? `Asia: ${dvMeta["ASIA-2026-H1-v1.0"].included_countries?.join(", ")||""} (${dvMeta["ASIA-2026-H1-v1.0"].record_count_valid?.toLocaleString()||"—"}건)<br>` : ""}
       ${dvMeta["GLOBAL-HISTORICAL-v1.0"] ? `Global Historical: ${dvMeta["GLOBAL-HISTORICAL-v1.0"].years?.join("/")||""} (${dvMeta["GLOBAL-HISTORICAL-v1.0"].record_count_valid?.toLocaleString()||"—"}건)<br>` : ""}
       ${dvMeta["GLOBAL-MATRIX-v1.0"] ? `Global Matrix: ${dvMeta["GLOBAL-MATRIX-v1.0"].record_count_valid||""}행` : ""}
     </div>` : ""}
     <div class="hstack" style="gap:10px;flex-wrap:wrap;">
-      <label class="btn sm" style="cursor:pointer;">derived_benchmark.json 파일 가져오기<input type="file" accept=".json,application/json" id="derivedbench-file-input" style="display:none;"></label>
+      <label class="btn sm" style="cursor:pointer;">derived_benchmark.json 파일 수동으로 가져오기<input type="file" accept=".json,application/json" id="derivedbench-file-input" style="display:none;"></label>
+      <button class="btn ghost sm" id="derivedbench-refetch">자동 로드 다시 시도</button>
       ${dvCount>0 ? `<button class="btn ghost sm" id="derivedbench-clear">전체 삭제</button>` : ""}
     </div>
     <div id="derivedbench-import-status" style="margin-top:10px;font-size:12px;"></div>
@@ -9527,6 +10023,13 @@ function renderModelDnaImportTab(wrap){
     if(res.ok){ dvStatusEl.style.color="var(--green)"; dvStatusEl.textContent=`${res.count.toLocaleString()}행 가져왔습니다.`; showToast("Derived Benchmark를 가져왔습니다"); renderAll(); }
     else { dvStatusEl.style.color="var(--red)"; dvStatusEl.textContent=res.error; }
     e.target.value="";
+  });
+  dvCard.querySelector("#derivedbench-refetch")?.addEventListener("click", async ()=>{
+    dvStatusEl.style.color="var(--gray-dim)"; dvStatusEl.textContent="Derived Benchmark 로딩 중...";
+    const res = await autoLoadDerivedBenchmark();
+    if(res.ok){ dvStatusEl.style.color="var(--green)"; dvStatusEl.textContent=`${res.count.toLocaleString()}행 로드됨 (${DERIVED_BENCHMARK_LOAD_STATE.source}).`; showToast("Derived Benchmark를 다시 불러왔습니다"); }
+    else { dvStatusEl.style.color="var(--amber)"; dvStatusEl.textContent=`자동 로드 실패: ${res.error}`; }
+    renderAll();
   });
   dvCard.querySelector("#derivedbench-clear")?.addEventListener("click", async ()=>{
     await clearDerivedBenchmark(); showToast("Derived Benchmark를 삭제했습니다"); renderAll();
@@ -9776,7 +10279,7 @@ function renderAccount(wrap){
   document.getElementById("modal-overlay")?.addEventListener("click",(e)=>{ if(e.target.id==="modal-overlay") closeModal(); });
   await loadState();
   await loadExternalRaceDb();
-  await loadDerivedBenchmark();
+  await autoLoadDerivedBenchmark();
   renderAll();
   if(sbEnabled()){ await initSupabaseAuth(); renderAll(); }
 })();
