@@ -5944,6 +5944,37 @@ function svgBottleneckBars(items, w=560){
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${rows}</svg>`;
 }
 
+/* ---------------------------------------------------------------------- */
+/* DASHBOARD "개선 필요 구간 Top" — peer-benchmark based (this pass)         */
+/*     Reuses computePeerAnalysis().impactList AS-IS (same function DNA     */
+/*     page uses — same Division/Gender/AgeBand/ASIA·Global benchmark       */
+/*     resolution chain, so Dashboard and DNA can never disagree about      */
+/*     which comparison group or benchmark source was used). Bars are       */
+/*     sized/colored by impactPct (each station's weighted share of total   */
+/*     time lost vs the peer group), never by a raw static-BENCH gap% —     */
+/*     that raw comparison (which can read like "+573.9%" for a segment     */
+/*     with almost no benchmark time, e.g. Transition) still exists, but    */
+/*     only in its own separate "기준 대비 현황" section (기록 예측 페이지's   */
+/*     "개선 필요 구간 상세", unchanged) — never as the Dashboard headline.  */
+/* ---------------------------------------------------------------------- */
+function svgPeerImpactBars(impactList, w=560){
+  const list = (impactList||[]).filter(it=>it.timeLoss>0).slice(0,6);
+  if(!list.length) return `<div class="empty-note">동일 그룹(성별·연령대·Division) 대비 개선이 필요한 구간이 없거나, 비교할 대회 기록이 부족합니다</div>`;
+  const rowH=30; const h=list.length*rowH+10;
+  const maxPct=Math.max(5,...list.map(it=>it.impactPct));
+  let rows="";
+  list.forEach((it,i)=>{
+    const y=i*rowH+8;
+    const barW=Math.min(220,(it.impactPct/maxPct)*220);
+    const color = it.impactPct>20? "#FF4D4D" : it.impactPct>10? "#FFB020" : "#33D17A";
+    rows+=`<text x="0" y="${y+13}" font-family="Inter" font-size="11.5" fill="#F5F4F1">${escapeHtml(it.label)}</text>
+      <rect x="230" y="${y+3}" width="220" height="14" rx="4" fill="#1C1C1F"/>
+      <rect x="230" y="${y+3}" width="${barW}" height="14" rx="4" fill="${color}"/>
+      <text x="460" y="${y+13}" font-family="JetBrains Mono" font-size="11" fill="${color}">+${fmtTime(it.timeLoss)} · ${round1(it.impactPct)}%</text>`;
+  });
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${rows}</svg>`;
+}
+
 function raceStrip(race){
   if(!race) return `<div class="empty-note">등록된 대회 기록이 없습니다</div>`;
   const b=bench();
@@ -6646,7 +6677,13 @@ function renderFitnessSurveyModal(){
 /* ---------------------------------------------------------------------- */
 function renderDashboard(wrap){
   const hpiResult=calcHPI();
-  const bottleneck=analyzeBottleneck(hpiResult);
+  // analyzeBottleneck() is kept only for the Rule Engine (buildRuleContext) and the
+  // Prediction page's separate "기준 대비 현황" (raw static-BENCH gap%) section — the
+  // Dashboard's own "개선 필요 구간 Top" now reads from computePeerAnalysis().impactList
+  // instead, so it never shows a raw BENCH-relative number (e.g. "+573.9%") as if it
+  // were the headline metric. Both this page and the DNA page call the exact same
+  // computePeerAnalysis(), so they always agree on Division/Gender/AgeBand/benchmark source.
+  const peerAnalysis = computePeerAnalysis();
   const ruleResult=evaluateRules();
   const race=latestRace();
   const dLeft=daysToRace();
@@ -6720,8 +6757,8 @@ function renderDashboard(wrap){
       </div>
       <div class="card">
         <div class="row-between"><h2 class="section-title">개선 필요 구간 Top</h2></div>
-        <p class="lead" style="margin-bottom:10px;">벤치마크 대비 시간 초과율(%) 기준, 큰 순서대로</p>
-        ${svgBottleneckBars(bottleneck.items.slice(0,6))}
+        <p class="lead" style="margin-bottom:10px;">동일 그룹(성별·연령대·Division) 대비 시간 손실 영향도 기준, 큰 순서대로</p>
+        ${peerAnalysis ? svgPeerImpactBars(peerAnalysis.impactList) : `<div class="empty-note">HYROX 대회 기록(러닝 8구간 + 스테이션)을 등록하면 동일 그룹 대비 개선 필요 구간이 표시됩니다</div>`}
       </div>
     </div>
 
@@ -7658,10 +7695,18 @@ async function runTrainingLogOcrPipeline(){
   for(let i=0;i<TL_OCR_STATE.images.length;i++){
     try{
       const canvas=await preprocessForOcr(TL_OCR_STATE.images[i].dataUrl);
-      const { data }=await Tesseract.recognize(canvas, "eng", {
+      // most Garmin/Apple Health/Strava screenshots here are Korean-labeled
+      // ("평균 페이스", "고도 상승", "총 시간"...) — English-only OCR can't
+      // read those at all, which was silently degrading every field below.
+      // Falls back to English-only if the Korean traineddata fails to fetch
+      // (e.g. offline), rather than failing the whole image.
+      const recognizeOpts = {
         logger:(m)=>{ if(m.status==="recognizing text"){ TL_OCR_STATE.progress=Math.round(((i+m.progress)/TL_OCR_STATE.images.length)*100);
           const el=document.getElementById("tl-ocr-progress-text"); if(el) el.textContent=`기록을 읽고 있어요… (${TL_OCR_STATE.progress}%)`; } }
-      });
+      };
+      let data;
+      try{ ({ data } = await Tesseract.recognize(canvas, "eng+kor", recognizeOpts)); }
+      catch(langErr){ console.warn("eng+kor OCR failed, falling back to eng-only", langErr); ({ data } = await Tesseract.recognize(canvas, "eng", recognizeOpts)); }
       const text = data.text || "";
       combinedRawText += `\n----- 이미지 ${i+1} -----\n${text}`;
       perImageFields.push(parseTrainingLogOcrText(text, todayISOStr));
@@ -8587,21 +8632,21 @@ function renderTrainingLogTab(wrap){
 
     <div class="card">
       <h2 class="section-title">최근 기록 (${STATE.trainingLog.length})</h2>
-      ${STATE.trainingLog.length? `<table style="margin-top:10px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
+      ${STATE.trainingLog.length? `<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;"><table style="margin-top:10px;min-width:820px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
         <tbody>${[...STATE.trainingLog].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,60).map(t=>`<tr>
-          <td>${t.date}</td><td>${typeLabel(t.type)}</td>
-          <td class="num mono">${t.distanceKm?t.distanceKm+"km":"—"}</td>
-          <td class="num mono">${t.durationMin??"—"}</td>
-          <td class="num mono">${t.avgPaceSecKm?fmtPace(t.avgPaceSecKm):"—"}</td>
-          <td class="num mono">${t.avgHr||"—"}</td>
-          <td class="num mono">${t.maxHr||"—"}</td>
-          <td class="num mono">${t.restingHr||"—"}</td>
-          <td class="num mono" style="${t.hrDrift!=null&&t.hrDrift!==""?(Number(t.hrDrift)>5?`color:var(--red);`:``):`color:var(--gray-dim);font-size:10px;`}">${t.hrDrift!=null&&t.hrDrift!==""?`${Number(t.hrDrift)>=0?"+":""}${t.hrDrift}%`:"데이터 부족"}</td>
-          <td class="num mono">${t.intensityRpe??"—"}</td>
-          <td>${t.painFlag?`<span class="badge crit">${escapeHtml(t.painArea||"통증")}</span>`:""}</td>
-          <td><span class="chip" style="font-size:9px;padding:2px 7px;">${t.source==="csv"?"CSV":t.source==="apple"?"Apple":t.source==="quick"?"빠른기록":"수기"}</span></td>
-          <td><span class="list-remove" data-del-tl="${t.id}">✕</span></td>
-        </tr>`).join("")}</tbody></table>`
+          <td style="white-space:nowrap;">${t.date}</td><td style="white-space:nowrap;">${typeLabel(t.type)}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.distanceKm?t.distanceKm+"km":"—"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.durationMin??"—"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.avgPaceSecKm?fmtPace(t.avgPaceSecKm):"—"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.avgHr||"—"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.maxHr||"—"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.restingHr||"—"}</td>
+          <td class="num mono" style="white-space:nowrap;${t.hrDrift!=null&&t.hrDrift!==""?(Number(t.hrDrift)>5?`color:var(--red);`:``):`color:var(--gray-dim);font-size:10px;`}">${t.hrDrift!=null&&t.hrDrift!==""?`${Number(t.hrDrift)>=0?"+":""}${t.hrDrift}%`:"데이터 부족"}</td>
+          <td class="num mono" style="white-space:nowrap;">${t.intensityRpe??"—"}</td>
+          <td style="white-space:nowrap;">${t.painFlag?`<span class="badge crit">${escapeHtml(t.painArea||"통증")}</span>`:""}</td>
+          <td style="white-space:nowrap;"><span class="chip" style="font-size:9px;padding:2px 7px;">${t.source==="csv"?"CSV":t.source==="apple"?"Apple":t.source==="quick"?"빠른기록":t.source==="ocr"?"OCR":"수기"}</span></td>
+          <td style="white-space:nowrap;"><span class="list-remove" data-del-tl="${t.id}">✕</span></td>
+        </tr>`).join("")}</tbody></table></div>`
         : `<div class="empty-note">훈련 기록이 없습니다</div>`}
     </div>
   `;
