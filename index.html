@@ -247,6 +247,15 @@ input,select,textarea{min-width:0;}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" crossorigin="anonymous"></script>
+
+<!-- HPS PWA metadata -->
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#0A0A0B">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HPS HYROX">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
 </head>
 <body style="background:#0A0A0B; margin:0;">
 <div id="app">
@@ -10089,6 +10098,15 @@ function renderAccount(wrap){
   renderAll();
   if(sbEnabled()){ await initSupabaseAuth(); renderAll(); }
 })();
+</script>
+
+<script>
+  // HPS PWA: register service worker only when served over HTTP(S).
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.protocol === 'http:')) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(err => console.warn('HPS service worker registration failed:', err));
+    });
+  }
 </script>
 </body>
 </html>
