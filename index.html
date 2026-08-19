@@ -8384,7 +8384,7 @@ function renderHyroxNameSearchCard(){
         <button class="btn sm" id="hyrox-name-search-btn" ${ready?"":"disabled"}>검색</button>
       </div>
       <div id="hyrox-db-status" style="margin-top:8px;font-size:12px;color:var(--gray);">
-        ${ready?"Supabase 백데이터 연결됨 — 이름 일부만 입력해도 검색됩니다.": "백데이터에 연결하는 중…"}
+        ${ready?"백데이터 연결됨 — 이름 일부만 입력해도 검색됩니다.": "백데이터에 연결하는 중…"}
       </div>
       <div id="hyrox-name-results" style="margin-top:10px;">
         ${ready && HYROX_DB_QUERY ? renderHyroxSearchResults() : ""}
