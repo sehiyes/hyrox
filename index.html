@@ -7710,6 +7710,18 @@ function hyroxTimeValue(v){
   }
   return s;
 }
+// spec: Run 컬럼명이 실제 업로드 파일마다 조금씩 다를 수 있음(Station은 이미 정상 매칭되던 것과
+// 대비해 Run만 표본이 비는 문제가 실제로 관측됨) — 단일 하드코딩 헤더 대신 여러 후보 이름을 순서대로
+// 시도한다. 첫 번째로 값이 있는 후보를 사용, 전부 비어있으면 빈 문자열(기존과 동일하게 null 처리됨).
+function pickCsvValue(row, candidates){
+  for(const c of candidates){
+    if(row[c]!==undefined){
+      const cleaned=hyroxCsvClean(row[c]);
+      if(cleaned!=="") return row[c];
+    }
+  }
+  return "";
+}
 function hyroxCsvRowToDbOfficial(row){
   const name=hyroxCsvClean(row["Name"]);
   const year=hyroxCsvClean(row["Year"]);
@@ -7722,7 +7734,11 @@ function hyroxCsvRowToDbOfficial(row){
   const overallRank=Number.parseInt(hyroxCsvClean(row["Rank (M/W)"]),10);
   const ageGroupRank=Number.parseInt(hyroxCsvClean(row["Rank (AG)"]),10);
   const totalTime=hyroxTimeValue(row["Overall Time"]);
-  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(row[`Split_Running ${i}`]));
+  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(pickCsvValue(row,[
+    `Split_Running ${i}`, `Running ${i}`, `Run ${i}`, `Split_Run ${i}`,
+    `Split_Running${i}`, `Running${i}`, `Run${i}`, `Split_Run${i}`,
+    `Run Split ${i}`, `Running Split ${i}`
+  ])));
   const stations=["Split_1000m SkiErg","Split_50m Sled Push","Split_50m Sled Pull","Split_80m Burpee Broad Jump","Split_1000m Row","Split_200m Farmers Carry","Split_100m Sandbag Lunges","Split_Wall Balls"].map(k=>hyroxTimeValue(row[k]));
   return {name,event,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
 }
@@ -7738,7 +7754,10 @@ function hyroxCsvRowToDbDatabase(row){
   const overallRank=Number.parseInt(hyroxCsvClean(row["rank_overall"]),10);
   const ageGroupRank=Number.parseInt(hyroxCsvClean(row["rank_age_group"]),10);
   const totalTime=hyroxTimeValue(row["overall_time"]);
-  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(row[`run_${i}_time`]));
+  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(pickCsvValue(row,[
+    `run_${i}_time`, `run${i}_time`, `run_${i}`, `run${i}`, `Run ${i}`,
+    `running_${i}_time`, `running${i}`
+  ])));
   const stations=["ski_erg_time","sled_push_time","sled_pull_time","burpee_broad_jump_time","row_time","farmers_carry_time","sandbag_lunges_time","wall_balls_time"].map(k=>hyroxTimeValue(row[k]));
   return {name,event,division,gender,age_group:hyroxCsvClean(row["age_group"])||null,bib:hyroxCsvClean(row["idp"])||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["roxzone_time"])||null,search_name:normalizeHyroxSearchText(name)};
 }
@@ -7837,8 +7856,12 @@ async function uploadHyroxRawCsv(file,onProgress){
     EXTERNAL_RACE_DB=[...extMap.values()];
     await persistExternalRaceDb();
   }
+  // diagnostic (spec §27-9/27-10): how many of the just-imported rows actually got a Run split —
+  // lets the person confirm the CSV header-alias fix worked without needing console access.
+  const runCoverage = converted.filter(r=>[r.run_1,r.run_2,r.run_3,r.run_4,r.run_5,r.run_6,r.run_7,r.run_8].some(v=>v!=null)).length;
+  const stationCoverage = converted.filter(r=>[r.ski,r.sled_push,r.sled_pull,r.burpee,r.row,r.carry,r.lunge,r.wallball].some(v=>v!=null)).length;
 
-  return {imported:unique.length,totalParsed:data.length,format,duplicates:rows.length-unique.length,peerDbAdded:converted.length};
+  return {imported:unique.length,totalParsed:data.length,format,duplicates:rows.length-unique.length,peerDbAdded:converted.length,runCoverage,stationCoverage};
 }
 /* ----------------------------------------------------------------------
  * HYROX RESULT SEARCH DB — Supabase-backed
@@ -10177,7 +10200,7 @@ function renderModelDnaImportTab(wrap){
         statusEl.textContent=`선수 검색 DB 반영 중... ${done.toLocaleString()} / ${total.toLocaleString()}건`;
       });
       statusEl.style.color="var(--green)";
-      statusEl.textContent=`완료! ${res.imported.toLocaleString()}건 선수 검색 DB 반영 · Race DNA/Peer 비교 데이터에도 ${res.peerDbAdded.toLocaleString()}건 반영되었습니다.`;
+      statusEl.textContent=`완료! ${res.imported.toLocaleString()}건 선수 검색 DB 반영 · Race DNA/Peer 비교 데이터에도 ${res.peerDbAdded.toLocaleString()}건 반영 (Run 스플릿 인식 ${res.runCoverage.toLocaleString()}건 · Station 스플릿 인식 ${res.stationCoverage.toLocaleString()}건)`;
       showToast("HYROX 선수 검색 DB + DNA 비교 데이터 업데이트 완료");
       renderAll();
     }catch(err){
