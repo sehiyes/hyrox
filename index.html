@@ -8375,7 +8375,7 @@ function renderHyroxNameSearchCard(){
         <span class="chip">${count!=null ? `${Number(count).toLocaleString()}건` : "Supabase"}</span>
       </div>
       <p class="lead" style="margin:6px 0 10px;">
-        Supabase에 등록된 대회 백데이터에서 선수 이름을 검색해
+        Season 24/25 이후 Asia 대회 백데이터에서 선수 이름을 검색해
         <b style="color:var(--orange);">기록 전체를 입력폼으로 불러올 수 있습니다.</b>
       </p>
       <div class="hstack" style="gap:8px;align-items:stretch;">
@@ -8384,7 +8384,7 @@ function renderHyroxNameSearchCard(){
         <button class="btn sm" id="hyrox-name-search-btn" ${ready?"":"disabled"}>검색</button>
       </div>
       <div id="hyrox-db-status" style="margin-top:8px;font-size:12px;color:var(--gray);">
-        ${ready?"Supabase 백데이터 연결됨 — 이름 일부만 입력해도 검색됩니다.": "Supabase 백데이터에 연결하는 중…"}
+        ${ready?"Supabase 백데이터 연결됨 — 이름 일부만 입력해도 검색됩니다.": "백데이터에 연결하는 중…"}
       </div>
       <div id="hyrox-name-results" style="margin-top:10px;">
         ${ready && HYROX_DB_QUERY ? renderHyroxSearchResults() : ""}
