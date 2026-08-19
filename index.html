@@ -3539,6 +3539,62 @@ function runHpsAudit(){
       log("Test A — DNA 나의 강점", true, "peer 분석 데이터 없음 — 스킵");
     }
 
+    // TEST RUN-DNA-01~10 — real Supabase/peer Run pipeline.
+    // This diagnostic is intentionally synchronous: if the Supabase cohort has not been loaded yet,
+    // renderPeer() performs the async load first. Once loaded, all checks below validate the existing
+    // queryPeerSegmentStats()/computePeerAnalysis() pipeline without a second stats engine.
+    if(peer){
+      const runSegs=peer.segments.filter(s=>s.kind==="run");
+      const runKeysOk=runSegs.length===8 && runSegs.every(s=>segmentDbField(s)==="run_"+s.key.replace("run",""));
+      log("TEST RUN-DNA-01 — Run1~8 DB key mapping", runKeysOk,
+        runSegs.map(s=>`${s.key}→${segmentDbField(s)}`).join(", "));
+
+      const peerMeanOk=runSegs.every(s=>s.actual==null || s.peerMean!=null);
+      log("TEST RUN-DNA-02 — Run1~8 peerMean 존재", peerMeanOk,
+        runSegs.map(s=>`${s.label}: mean=${s.peerMean==null?"null":fmtTime(s.peerMean)}`).join(" | "));
+
+      const zOk=runSegs.every(s=>s.actual==null || s.z!=null);
+      log("TEST RUN-DNA-03 — Run1~8 Z-score 존재", zOk,
+        runSegs.map(s=>`${s.label}: z=${s.z==null?"null":round1(s.z)}`).join(" | "));
+
+      const pctOk=runSegs.every(s=>s.actual==null || s.percentile!=null);
+      log("TEST RUN-DNA-04 — Run1~8 percentile 존재", pctOk,
+        runSegs.map(s=>`${s.label}: pct=${s.percentile==null?"null":round1(s.percentile)+"%"}`).join(" | "));
+
+      const fastDirectionOk=runSegs.every(s=>{
+        if(s.actual==null || s.peerMean==null || s.peerSd==null || s.peerSd<=0) return true;
+        const z=(s.peerMean-s.actual)/s.peerSd;
+        return Math.abs((s.z??z)-z)<0.001;
+      });
+      log("TEST RUN-DNA-05 — 빠를수록 높은 percentile 방향", fastDirectionOk,
+        "z=(peerMean-actual)/peerSd");
+
+      const runningExpected=runSegs.filter(s=>s.percentile!=null);
+      const runningExpectedPct=runningExpected.length?mean(runningExpected.map(s=>s.percentile)):null;
+      log("TEST RUN-DNA-06 — Running Index가 Run1~8 percentile 평균을 반영",
+        peer.strengthIdx.running==null || (runningExpectedPct!=null && Math.abs(peer.strengthIdx.running-runningExpectedPct)<0.001),
+        `runningIdx=${peer.strengthIdx.running==null?"null":round1(peer.strengthIdx.running)}, expected=${runningExpectedPct==null?"null":round1(runningExpectedPct)}`);
+
+      const runFallbacks=runSegs.filter(s=>s.actual!=null && s.peerN>=MIN_REAL_SAMPLE && s.benchmarkSource==="STATIC_FALLBACK");
+      log("TEST RUN-DNA-07 — 충분한 Run raw sample이 STATIC_FALLBACK으로 떨어지지 않음",
+        runFallbacks.length===0,
+        runFallbacks.length?runFallbacks.map(s=>s.label).join(", "):"이상 없음");
+
+      const top3=buildStrengthsTop3(peer.segments);
+      log("TEST RUN-DNA-08 — Strength TOP3에 Run 개별 항목 미노출",
+        !top3.some(s=>/^Run\\s*\\d/.test(s.label)),
+        top3.map(s=>s.label).join(", "));
+
+      const improvement=buildImprovementTop3(peer.impactList, peer.race);
+      log("TEST RUN-DNA-09 — 개선 TOP3에서 Running은 하나의 그룹으로만 노출",
+        !improvement.some(s=>/^Run\\s*\\d/.test(s.label)) && improvement.filter(s=>s.label==="Running").length<=1,
+        improvement.map(s=>s.label).join(", "));
+
+      log("TEST RUN-DNA-10 — Run 표본 수 표시 가능",
+        runSegs.every(s=>s.peerN==null || Number.isFinite(Number(s.peerN))),
+        runSegs.map(s=>`${s.label}: n=${s.peerN??"?"}`).join(" | "));
+    }
+
     // Test ASIA — per-segment derived-benchmark key-mapping verification (strengthened per follow-up
     // request): "적어도 하나는 매칭됨" 수준이 아니라, 17개 segment 각각에 대해 getSegmentBenchmarkSec()가
     // "매칭 가능하다"고 답하는데도 실제 resolveSegment() 결과가 STATIC_FALLBACK이면 그건 key 매핑 버그이므로
@@ -5071,8 +5127,8 @@ async function fetchSiteJson(candidates){
 }
 
 async function loadExternalRaceDb(){
-  // DNA source is intentionally independent from Supabase hyrox_results.
   // Keep manually imported/legacy local DNA records available.
+  // The current DNA page additionally hydrates the exact Supabase hyrox_results cohort on demand.
   const local = await StorageService.get("hps:peerdb:v1", []);
   EXTERNAL_RACE_DB = Array.isArray(local) ? local : [];
 
@@ -5239,14 +5295,86 @@ function segmentDbField(seg){
   if(seg.key.startsWith("run")) return "run_"+seg.key.replace("run","");
   return { sledPush:"sled_push", sledPull:"sled_pull" }[seg.key] || seg.key;
 }
+/* ---------------------------------------------------------------------- */
+/* SUPABASE PEER DATA — use the same hyrox_results DB for DNA peer stats   */
+/*   The search DB and DNA peer DB must not be two unrelated datasets.     */
+/*   hyrox_results stores splits in runs_json/stations_json, so rows are   */
+/*   normalized once through hyroxDbRowToExternal() into run_1..run_8.    */
+/* ---------------------------------------------------------------------- */
+const SUPABASE_PEER_CACHE = new Map();
+const SUPABASE_PEER_PROMISES = new Map();
+
+function supabasePeerGroupKey(group){
+  return [
+    group.gender||"",
+    group.ageGroup||"",
+    group.division||""
+  ].join("|");
+}
+
+function mergePeerRowsIntoExternal(rows){
+  if(!Array.isArray(rows) || !rows.length) return 0;
+  const keyOf=r=>`${r.event||""}|${r.athlete_id||""}|${r.race_id||""}|${r.division||""}|${r.overall_time||""}`;
+  const map=new Map(EXTERNAL_RACE_DB.map(r=>[keyOf(r),r]));
+  rows.forEach(r=>{
+    const normalized=hyroxDbRowToExternal(r);
+    if(normalized) map.set(keyOf(normalized),normalized);
+  });
+  EXTERNAL_RACE_DB=[...map.values()];
+  return rows.length;
+}
+
+async function ensureSupabasePeerDb(group){
+  const key=supabasePeerGroupKey(group);
+  if(SUPABASE_PEER_CACHE.has(key)) return SUPABASE_PEER_CACHE.get(key);
+  if(SUPABASE_PEER_PROMISES.has(key)) return SUPABASE_PEER_PROMISES.get(key);
+
+  const promise=(async()=>{
+    await ensureHyroxSearchDb();
+
+    const PAGE=1000;
+    let offset=0;
+    const rows=[];
+
+    while(true){
+      const {data,error}=await sb
+        .from("hyrox_results")
+        .select("event,name,bib,division,gender,age_group,total_time,runs_json,stations_json,transition")
+        .eq("gender",group.gender)
+        .eq("age_group",group.ageGroup)
+        .eq("division",group.division)
+        .range(offset,offset+PAGE-1);
+
+      if(error) throw error;
+      const batch=Array.isArray(data)?data:[];
+      rows.push(...batch);
+      if(batch.length<PAGE) break;
+      offset+=PAGE;
+      if(offset>200000) break; // defensive ceiling
+    }
+
+    mergePeerRowsIntoExternal(rows);
+    const result={key,count:rows.length,loadedAt:Date.now()};
+    SUPABASE_PEER_CACHE.set(key,result);
+    console.info("HYROX DNA Supabase peer data loaded:",{
+      group:key,
+      rows:rows.length
+    });
+    return result;
+  })();
+
+  SUPABASE_PEER_PROMISES.set(key,promise);
+  try{
+    return await promise;
+  }finally{
+    SUPABASE_PEER_PROMISES.delete(key);
+  }
+}
+
 // Single seam function: given a segment definition + the athlete's comparison group, return
-// { mean, sd, n, isReal, source }. Checks the REAL ASIA/Global DERIVED_BENCHMARK resolver FIRST (this
-// pass, spec ①/⑪/⑫/⑮/⑯) — the EXACT SAME queryDerivedBenchmark()/ASIA->...->GLOBAL_MATRIX chain
-// Prediction and Station Priority already use, keyed on the athlete's own Division+Gender+AgeBand, so
-// DNA never silently disagrees with Prediction about which benchmark source applies. Only when NO row
-// exists anywhere in that chain does this fall through to EXTERNAL_RACE_DB (spec §2, unchanged) and
-// finally the illustrative PEER_SEGMENTS model — no more "30 real participants or illustrative", since
-// a pre-aggregated ASIA/Global row with its own sample_n now outranks that check entirely.
+// { mean, sd, n, isReal, source }.
+// IMPORTANT: REAL SUPABASE/EXTERNAL participant rows are checked FIRST.
+// Derived Benchmark is a fallback only when the exact real participant sample is thin.
 function queryPeerSegmentStats(seg, group){
   const { gender, ageGroup, division } = group;
 
@@ -7863,12 +7991,57 @@ async function searchHyroxByName(query, limit=20){
   if(!sb) throw new Error("Supabase 연결이 초기화되지 않았습니다.");
 
   const safeLimit=Math.max(1,Math.min(Number(limit)||20,50));
-  const { data, error } = await sb.rpc("search_hyrox_results", {
-    search_text:q,
-    result_limit:safeLimit
-  });
-  if(error) throw error;
-  return (data||[]).map((row,i)=>({r:mapHyroxDbRow(row),i,score:i}));
+  let rpcRows=[];
+  let rpcError=null;
+
+  // 1) 기존 RPC/token-aware search를 먼저 사용한다.
+  //    영문 "Joshua White" ↔ "White, Joshua" 같은 검색은 이 경로가 가장 좋다.
+  try{
+    const { data, error } = await sb.rpc("search_hyrox_results", {
+      search_text:q,
+      result_limit:safeLimit
+    });
+    if(error) rpcError=error;
+    else rpcRows=Array.isArray(data)?data:[];
+  }catch(e){ rpcError=e; }
+
+  // 2) RPC가 한글 부분검색을 놓치는 경우를 대비한 직접 ILIKE fallback.
+  //    특히 "임세희"가 DB에 있을 때 "세희"/"세"/"임세"가 반드시 매칭되도록 한다.
+  //    공백으로 분리된 토큰은 모두 같은 name 컬럼에 AND 조건으로 적용한다.
+  let directRows=[];
+  if(!rpcRows.length){
+    try{
+      const tokens=q.split(/\s+/).filter(Boolean).slice(0,6);
+      let req=sb
+        .from("hyrox_results")
+        .select("id,name,event,division,gender,age_group,bib,overall_rank,age_group_rank,total_time,runs_json,stations_json,transition")
+        .limit(safeLimit);
+
+      tokens.forEach(token=>{
+        req=req.ilike("name", `%${token}%`);
+      });
+
+      const { data, error } = await req;
+      if(error) throw error;
+      directRows=Array.isArray(data)?data:[];
+    }catch(e){
+      // RPC가 실제 오류를 반환했고 직접 검색도 실패했다면 원래 오류를 우선 표시한다.
+      if(rpcError) throw new Error(`HYROX 이름 검색 실패: ${rpcError.message||rpcError}`);
+      throw e;
+    }
+  }
+
+  // 3) 두 검색 경로를 합쳐 중복 제거.
+  const merged=[...rpcRows,...directRows];
+  const seen=new Set();
+  const rows=merged.filter(row=>{
+    const key=String(row.id??`${row.name||""}|${row.event||""}|${row.bib||""}|${row.division||""}|${row.total_time||""}`);
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0,safeLimit);
+
+  return rows.map((row,i)=>({r:mapHyroxDbRow(row),i,score:i}));
 }
 
 function hyroxSourceBadge(r){
@@ -9565,6 +9738,38 @@ function peerSourceBadgeCompact(isReal, n){
     : `<span class="badge med" style="font-size:10px;">🟡 ESTIMATE</span>`;
 }
 function renderPeer(wrap){
+  // DNA peer statistics use the same Supabase hyrox_results dataset that powers
+  // the athlete-name search. Load the exact Gender/Age Group/Division cohort once,
+  // then reuse the existing synchronous computePeerAnalysis() pipeline.
+  const raceForPeer=racesByDivision(STATE.profile.division)[0] || null;
+  if(raceForPeer){
+    const peerGroupKey=supabasePeerGroupKey({
+      gender:STATE.profile.gender==="female"?"female":"male",
+      ageGroup:getAgeGroup(Number(STATE.profile.age)),
+      division:DIVISIONS.includes(STATE.profile.division)?STATE.profile.division:"Open"
+    });
+    if(!SUPABASE_PEER_CACHE.has(peerGroupKey)){
+      wrap.innerHTML=`
+        <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">동일 그룹 비교 · Race DNA</h1></div>
+        <div class="card"><div class="empty-note">🧬 동일 성별 · 연령대 · Division의 실제 HYROX 참가자 데이터를 불러오는 중입니다…</div></div>
+      `;
+      ensureSupabasePeerDb({
+        gender:STATE.profile.gender==="female"?"female":"male",
+        ageGroup:getAgeGroup(Number(STATE.profile.age)),
+        division:DIVISIONS.includes(STATE.profile.division)?STATE.profile.division:"Open"
+      }).then(()=>{
+        if(CURRENT_PAGE==="peer") renderAll();
+      }).catch(e=>{
+        if(CURRENT_PAGE!=="peer") return;
+        wrap.innerHTML=`
+          <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">동일 그룹 비교 · Race DNA</h1></div>
+          <div class="card"><div class="empty-note" style="color:var(--red);">실제 HYROX 비교 데이터를 불러오지 못했습니다: ${escapeHtml(e.message||String(e))}</div></div>
+        `;
+      });
+      return;
+    }
+  }
+
   const analysis=computePeerAnalysis();
   if(!analysis){
     wrap.innerHTML = `
@@ -9713,18 +9918,71 @@ function renderPeer(wrap){
       </tbody></table></div>
 
       <div class="divider" style="margin:16px 0;"></div>
-      <div class="eyebrow gray">구간별 퍼센타일/등급 · Z-score</div>
-      <p class="lead" style="margin:2px 0 8px;">🟢 REAL PEER DATA(${MIN_REAL_SAMPLE}건↑ 실측) · 🟡 REFERENCE ESTIMATE(예시 기준값)</p>
-      <div style="overflow-x:auto;"><table style="margin-top:8px;min-width:640px;"><thead><tr><th>구간</th><th class="num">내 기록</th><th class="num">그룹 평균</th><th class="num">Z-score</th><th class="num">퍼센타일/등급</th><th>데이터 근거</th></tr></thead><tbody>
-        ${segments.filter(s=>s.actual!=null).map(s=>`<tr>
-          <td>${s.label}</td>
-          <td class="num mono">${fmtTime(s.actual)}</td>
-          <td class="num mono" style="color:var(--gray-dim);">${fmtTime(s.peerMean)}</td>
-          <td class="num mono">${s.z>=0?"+":""}${round1(s.z)}</td>
-          <td class="num mono">${s.peerIsReal?`상위 ${round1(100-s.percentile)}%`:`<span class="badge ${starBadgeClass(s.star.stars)}">${"★".repeat(s.star.stars)}${"☆".repeat(5-s.star.stars)} ${s.star.label}</span>`}</td>
-          <td>${peerSourceBadgeCompact(s.peerIsReal, s.peerN)}</td>
-        </tr>`).join("")}
-      </tbody></table></div>
+      <div class="eyebrow gray">구간별 퍼센타일 / 등급 · Z-score</div>
+      <p class="lead" style="margin:2px 0 10px;">🟢 REAL PEER DATA · 실제 비교 선수 분포 기반 · Run 1~8도 Station과 동일한 방식으로 계산</p>
+
+      ${(() => {
+        const runDetails=segments.filter(s=>s.kind==="run" && s.actual!=null);
+        const stationDetails=segments.filter(s=>s.kind==="station" && s.actual!=null);
+        const renderRunCard=s=>{
+          const pct=s.percentile!=null?Math.round(s.percentile):null;
+          const grade=percentileGrade(s.percentile);
+          const band=peerScoreBand(pct);
+          return `<div style="border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:var(--panel);">
+            <div class="row-between">
+              <b style="font-size:12px;">${s.label}</b>
+              <span class="mono" style="font-weight:800;color:${band.color};">${pct!=null?`${pct}% · ${grade.short}`:"데이터 부족"}</span>
+            </div>
+            <div class="mono" style="font-size:10.5px;color:var(--gray-dim);margin-top:5px;">
+              ${s.actual!=null?`내 ${fmtTime(s.actual)}`:"내 —"} · 평균 ${s.peerMean!=null?fmtTime(s.peerMean):"—"} · Z ${s.z!=null?(s.z>=0?"+":"")+round1(s.z):"—"}
+            </div>
+            <div style="font-size:10px;color:var(--gray-dim);margin-top:4px;">
+              ${peerSourceBadgeCompact(s.peerIsReal,s.peerN)}${s.peerN?` · 비교 선수 ${Number(s.peerN).toLocaleString()}명`:""}
+            </div>
+          </div>`;
+        };
+        const runningPct=runDetails.length?mean(runDetails.map(s=>s.percentile).filter(v=>v!=null)):null;
+        const runningGrade=percentileGrade(runningPct);
+        const runningBand=peerScoreBand(runningPct!=null?Math.round(runningPct):null);
+        return `
+          <div style="border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:8px;">
+            <div class="row-between">
+              <div>
+                <div style="font-weight:800;font-size:14px;">🏃 Running</div>
+                <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">Run 1~8 종합 · 실제 percentile 평균</div>
+              </div>
+              <div class="mono" style="font-size:15px;font-weight:900;color:${runningBand.color};">
+                ${runningPct!=null?`${Math.round(runningPct)}% · ${runningGrade.short}`:"데이터 부족"}
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px;">
+              ${runDetails.map(renderRunCard).join("")}
+            </div>
+            ${runDetails.length?`<div style="font-size:10.5px;color:var(--gray-dim);margin-top:8px;">${runDetails.every(s=>s.peerIsReal)?"🟢 Run 1~8 실제 Peer Data":"🟡 일부 Run은 fallback"} · 평균 비교 선수 수 ${Math.round(mean(runDetails.map(s=>s.peerN||0))||0).toLocaleString()}명</div>`:""}
+          </div>
+
+          <div style="margin-top:12px;">
+            <div style="font-weight:800;font-size:13px;margin-bottom:7px;">Station</div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+              ${stationDetails.map(s=>{
+                const pct=s.percentile!=null?Math.round(s.percentile):null;
+                const grade=percentileGrade(s.percentile);
+                const band=peerScoreBand(pct);
+                return `<div style="border:1px solid var(--line);border-radius:10px;padding:10px;">
+                  <div class="row-between">
+                    <b style="font-size:12.5px;">${s.label}</b>
+                    <span class="mono" style="font-weight:800;color:${band.color};">${pct!=null?`${pct}% · ${grade.short}`:"데이터 부족"}</span>
+                  </div>
+                  <div class="mono" style="font-size:10.5px;color:var(--gray-dim);margin-top:4px;">
+                    내 ${s.actual!=null?fmtTime(s.actual):"—"} · 평균 ${s.peerMean!=null?fmtTime(s.peerMean):"—"} · Z ${s.z!=null?(s.z>=0?"+":"")+round1(s.z):"—"} · 비교 선수 ${s.peerN?Number(s.peerN).toLocaleString():"—"}명
+                  </div>
+                  <div style="font-size:10px;color:var(--gray-dim);margin-top:4px;">${peerSourceBadgeCompact(s.peerIsReal,s.peerN)}</div>
+                </div>`;
+              }).join("")}
+            </div>
+          </div>
+        `;
+      })()}
       ` : ""}
     </div>
 
@@ -9766,6 +10024,21 @@ function starBadgeClass(stars){ return stars>=5?"elite":stars===4?"low":stars===
 /*     main Race DNA screen. The old radar + full Z-score table move into   */
 /*     a collapsed "상세 분석" section, still reachable, not deleted.        */
 /* ---------------------------------------------------------------------- */
+function percentileGrade(percentile){
+  if(percentile==null || !Number.isFinite(Number(percentile))) return {label:"—", short:"—"};
+  const p=Number(percentile);
+  if(p>=90) return {label:"A+", short:"A+"};
+  if(p>=80) return {label:"A", short:"A"};
+  if(p>=75) return {label:"A-", short:"A-"};
+  if(p>=70) return {label:"B+", short:"B+"};
+  if(p>=65) return {label:"B", short:"B"};
+  if(p>=60) return {label:"B-", short:"B-"};
+  if(p>=50) return {label:"C+", short:"C+"};
+  if(p>=40) return {label:"C", short:"C"};
+  if(p>=30) return {label:"C-", short:"C-"};
+  if(p>=20) return {label:"D", short:"D"};
+  return {label:"F", short:"F"};
+}
 function peerScoreBand(score){
   if(score==null) return { label:"데이터 부족", color:"var(--gray-dim)" };
   if(score>=80) return { label:"강점", color:"var(--green)" };
@@ -9814,19 +10087,46 @@ function buildStrengthsTop3(segments){
 // in the separate 기록 손실 분석 section) + a specific "후반 Running" item when measured post-station
 // degradation (computeStationInducedDegradation, already real data) is large enough to call out.
 function buildImprovementTop3(impactList, race){
-  const stationItems = impactList.filter(c=>c.key!=="run" && c.timeLoss>0).slice(0,3)
-    .map(c=>({ label:c.label, key:c.key, reason:`기준 기록보다 ${fmtTime(Math.abs(c.timeLoss))} 느림` }));
-  const items=[...stationItems];
+  // Running은 Run 1~8 개별 항목이 아니라 aggregate candidate 하나로만 노출한다.
+  // computePeerAnalysis()의 impactList에 이미 8개 Run의 timeLoss 합계가 들어 있으므로
+  // 별도 계산 엔진을 만들지 않고 기존 값을 그대로 재사용한다.
+  const items=impactList
+    .filter(c=>c.timeLoss>0)
+    .map(c=>({
+      label:c.key==="run" ? "Running" : c.label,
+      key:c.key,
+      reason:c.key==="run"
+        ? `Run 1~8 전체 기준보다 ${fmtTime(Math.abs(c.timeLoss))} 느림`
+        : `기준 기록보다 ${fmtTime(Math.abs(c.timeLoss))} 느림`
+    }));
+
+  // 후반 Running 저하는 Running 자체를 또 하나의 중복 항목으로 만들지 않고,
+  // 기존 Running aggregate가 이미 TOP3에 있다면 설명만 유지한다.
   const degradation=computeStationInducedDegradation(race);
   const topDeg=degradation.find(d=>d.degradationSec>0);
   if(topDeg){
     const pct=(topDeg.degradationSec/topDeg.baselineSec)*100;
     if(pct>=8){
-      const degItem={ label:"후반 Running", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
-      if(items.length<3) items.push(degItem); else items[2]=degItem;
+      const runningExisting=items.findIndex(i=>i.key==="run");
+      if(runningExisting>=0){
+        items[runningExisting].reason += ` · ${topDeg.label} 이후 후반 페이스 저하 ${round1(pct)}%`;
+      }else{
+        items.push({
+          label:"Running",
+          key:"run",
+          reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하`
+        });
+      }
     }
   }
-  return items.slice(0,3);
+
+  return items
+    .sort((a,b)=>{
+      const ai=impactList.find(x=>x.key===a.key)?.impactPct||0;
+      const bi=impactList.find(x=>x.key===b.key)?.impactPct||0;
+      return bi-ai;
+    })
+    .slice(0,3);
 }
 const STATION_TRAINING_HINT = {
   ski:"SkiErg 인터벌", row:"Row 인터벌", burpee:"Burpee Broad Jump 반복",
