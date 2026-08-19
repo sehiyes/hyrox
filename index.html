@@ -7636,14 +7636,8 @@ let EXPANDED_RACE_ID = null;
 /* ----------------------------------------------------------------------
  * HYROX RESULT ADMIN IMPORT — raw official CSV -> Supabase
  * ---------------------------------------------------------------------- */
-const HYROX_CSV_REQUIRED_COLUMNS = [
-  "year","city","division","sex","idp","name","age_group",
-  "rank_overall","rank_age_group","overall_time",
-  "run_1_time","run_2_time","run_3_time","run_4_time",
-  "run_5_time","run_6_time","run_7_time","run_8_time",
-  "ski_erg_time","sled_push_time","sled_pull_time","burpee_broad_jump_time",
-  "row_time","farmers_carry_time","sandbag_lunges_time","wall_balls_time","roxzone_time"
-];
+const HYROX_OFFICIAL_HEADERS = ["Year","Target Race","Selected Division","Selected Gender","Name","Bib Number","Age Group","Rank (M/W)","Rank (AG)","Overall Time","Split_Running 1","Split_1000m SkiErg","Split_Running 2","Split_50m Sled Push","Split_Running 3","Split_50m Sled Pull","Split_Running 4","Split_80m Burpee Broad Jump","Split_Running 5","Split_1000m Row","Split_Running 6","Split_200m Farmers Carry","Split_Running 7","Split_100m Sandbag Lunges","Split_Running 8","Split_Wall Balls","Split_Roxzone Time"];
+const HYROX_DB_HEADERS = ["season","year","city","division","event_id","sex","idp","name","age_group","rank_overall","rank_age_group","overall_time","run_1_time","run_2_time","run_3_time","run_4_time","run_5_time","run_6_time","run_7_time","run_8_time","ski_erg_time","sled_push_time","sled_pull_time","burpee_broad_jump_time","row_time","farmers_carry_time","sandbag_lunges_time","wall_balls_time","roxzone_time"];
 function hyroxCsvClean(v){
   if(v===undefined || v===null) return "";
   const s=String(v).replace(/^\uFEFF/,"").trim();
@@ -7657,27 +7651,77 @@ function hyroxCsvDivision(v){
   if(s.includes("PRO")) return "Pro";
   return "Open";
 }
-function hyroxCsvGender(v){
-  const s=hyroxCsvClean(v).toLowerCase();
-  if(["f","female","women","woman","w"].includes(s)) return "female";
-  if(["m","male","men","man"].includes(s)) return "male";
+function hyroxTimeValue(v){
+  const s=hyroxCsvClean(v);
+  if(!s) return "";
+  if(/^\d+(?:\.\d+)?$/.test(s)){
+    const n=Number(s);
+    if(Number.isFinite(n) && n>=0 && n<100000){
+      const sec=Math.round(n);
+      const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), ss=sec%60;
+      return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+    }
+  }
   return s;
 }
-function hyroxCsvRowToDb(row){
+function hyroxCsvRowToDbOfficial(row){
+  const name=hyroxCsvClean(row["Name"]);
+  const year=hyroxCsvClean(row["Year"]);
+  const race=hyroxCsvClean(row["Target Race"]) || hyroxCsvClean(row["Race"]);
+  const event=[year,race].filter(Boolean).join(" ");
+  const division=hyroxCsvDivision(row["Selected Division"] || row["Division"]);
+  const gender=hyroxCsvClean(row["Selected Gender"]);
+  const ageGroup=hyroxCsvClean(row["Age Group"]);
+  const bib=hyroxCsvClean(row["Bib Number"]);
+  const overallRank=Number.parseInt(hyroxCsvClean(row["Rank (M/W)"]),10);
+  const ageGroupRank=Number.parseInt(hyroxCsvClean(row["Rank (AG)"]),10);
+  const totalTime=hyroxTimeValue(row["Overall Time"]);
+  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(row[`Split_Running ${i}`]));
+  const stations=["Split_1000m SkiErg","Split_50m Sled Push","Split_50m Sled Pull","Split_80m Burpee Broad Jump","Split_1000m Row","Split_200m Farmers Carry","Split_100m Sandbag Lunges","Split_Wall Balls"].map(k=>hyroxTimeValue(row[k]));
+  return {name,event,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
+}
+function hyroxCsvRowToDbDatabase(row){
   const name=hyroxCsvClean(row["name"]);
   const year=hyroxCsvClean(row["year"]);
   const city=hyroxCsvClean(row["city"]);
-  const event=[year,city].filter(Boolean).join(" ");
+  const eventId=hyroxCsvClean(row["event_id"]);
+  const event=[year,city].filter(Boolean).join(" ") || eventId;
   const division=hyroxCsvDivision(row["division"]);
-  const gender=hyroxCsvGender(row["sex"]);
-  const ageGroup=hyroxCsvClean(row["age_group"]);
-  const bib=hyroxCsvClean(row["idp"]);
+  const sex=hyroxCsvClean(row["sex"]).toLowerCase();
+  const gender=sex.startsWith("f") || sex.includes("female") || sex.includes("woman") ? "female" : (sex ? "male" : null);
   const overallRank=Number.parseInt(hyroxCsvClean(row["rank_overall"]),10);
   const ageGroupRank=Number.parseInt(hyroxCsvClean(row["rank_age_group"]),10);
-  const totalTime=hyroxCsvClean(row["overall_time"]) || hyroxCsvClean(row["finish_time"]);
-  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxCsvClean(row[`run_${i}_time`]));
-  const stations=[hyroxCsvClean(row["ski_erg_time"]),hyroxCsvClean(row["sled_push_time"]),hyroxCsvClean(row["sled_pull_time"]),hyroxCsvClean(row["burpee_broad_jump_time"]),hyroxCsvClean(row["row_time"]),hyroxCsvClean(row["farmers_carry_time"]),hyroxCsvClean(row["sandbag_lunges_time"]),hyroxCsvClean(row["wall_balls_time"])];
-  return {name,event,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxCsvClean(row["roxzone_time"])||null,search_name:normalizeHyroxSearchText(name)};
+  const totalTime=hyroxTimeValue(row["overall_time"]);
+  const runs=[1,2,3,4,5,6,7,8].map(i=>hyroxTimeValue(row[`run_${i}_time`]));
+  const stations=["ski_erg_time","sled_push_time","sled_pull_time","burpee_broad_jump_time","row_time","farmers_carry_time","sandbag_lunges_time","wall_balls_time"].map(k=>hyroxTimeValue(row[k]));
+  return {name,event,division,gender,age_group:hyroxCsvClean(row["age_group"])||null,bib:hyroxCsvClean(row["idp"])||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["roxzone_time"])||null,search_name:normalizeHyroxSearchText(name)};
+}
+function hyroxDetectFormat(headers){
+  const h=new Set(headers.map(x=>String(x||"").replace(/^\uFEFF/,"").trim()));
+  if(h.has("Target Race") && h.has("Selected Division") && h.has("Selected Gender") && h.has("Name")) return "official";
+  if(h.has("year") && h.has("city") && h.has("division") && h.has("sex") && h.has("idp") && h.has("name")) return "database";
+  return null;
+}
+async function ensureSheetJS(){
+  if(window.XLSX) return window.XLSX;
+  if(window.__HPS_XLSX_PROMISE) return window.__HPS_XLSX_PROMISE;
+  window.__HPS_XLSX_PROMISE=new Promise((resolve,reject)=>{
+    const existing=document.querySelector('script[data-hps-xlsx]');
+    if(existing){ existing.addEventListener("load",()=>resolve(window.XLSX)); existing.addEventListener("error",()=>reject(new Error("Excel parser를 불러오지 못했습니다."))); return; }
+    const sc=document.createElement("script"); sc.dataset.hpsXlsx="1"; sc.src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"; sc.onload=()=>window.XLSX?resolve(window.XLSX):reject(new Error("Excel parser를 불러오지 못했습니다.")); sc.onerror=()=>reject(new Error("Excel parser를 불러오지 못했습니다. 인터넷 연결을 확인해주세요.")); document.head.appendChild(sc);
+  });
+  return window.__HPS_XLSX_PROMISE;
+}
+async function readHyroxUploadFile(file){
+  const ext=(file.name.split(".").pop()||"").toLowerCase();
+  if(ext==="xlsx" || ext==="xls"){
+    const XLSX=await ensureSheetJS();
+    const buf=await file.arrayBuffer();
+    const wb=XLSX.read(buf,{type:"array",cellDates:false});
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(ws,{header:1,defval:"",raw:false});
+  }
+  return parseCSV(await file.text());
 }
 function hyroxDbRowToExternal(row){
   if(!row) return null;
@@ -7711,36 +7755,29 @@ async function uploadHyroxRawCsv(file,onProgress){
     if(!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase URL / anon key가 설정되지 않았습니다.");
     sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
   }
-  if(!file) throw new Error("CSV 파일이 선택되지 않았습니다.");
-  const text=await file.text();
-  const matrix=parseCSV(text);
-  if(!matrix.length) throw new Error("CSV 내용을 읽지 못했습니다.");
-  const headers=matrix[0].map(h=>String(h||"").replace(/^\uFEFF/,"").trim());
-  const headerSet=new Set(headers);
-  const missing=HYROX_CSV_REQUIRED_COLUMNS.filter(c=>!headerSet.has(c));
-  if(missing.length) throw new Error(`이 CSV 형식은 지원되지 않습니다. 누락 컬럼: ${missing.slice(0,5).join(", ")}${missing.length>5?" 외":""}`);
-
-  const data=matrix.slice(1).map(cols=>{
-    const o={}; headers.forEach((h,i)=>o[h]=cols[i]??""); return o;
-  });
-  const rows=data.map(hyroxCsvRowToDb).filter(r=>r.name&&r.event&&r.division&&r.total_time);
-  if(!rows.length) throw new Error("유효한 HYROX 결과 행이 없습니다.");
-
-  // This upload is for the athlete SEARCH DB only. It must NOT modify Race DNA.
+  if(!file) throw new Error("CSV/XLSX 파일이 선택되지 않았습니다.");
+  const matrix=await readHyroxUploadFile(file);
+  if(!matrix.length) throw new Error("파일 내용을 읽지 못했습니다.");
+  const headers=matrix[0].map(h=>String(h??"").replace(/^\uFEFF/,"").trim());
+  const format=hyroxDetectFormat(headers);
+  if(!format) throw new Error("지원하지 않는 HYROX 양식입니다. 공식 Full Results 양식 또는 db_results 양식을 사용해주세요.");
+  const data=matrix.slice(1).map(cols=>{const o={};headers.forEach((h,i)=>o[h]=cols[i]??"");return o;});
+  const mapper=format==="official"?hyroxCsvRowToDbOfficial:hyroxCsvRowToDbDatabase;
+  const rows=data.map(mapper).filter(r=>r.name&&r.event&&r.division&&r.total_time);
+  if(!rows.length) throw new Error("유효한 HYROX 결과 행이 없습니다. Name / Event / Division / Overall Time을 확인해주세요.");
+  const unique=[]; const seen=new Set();
+  for(const r of rows){const key=[r.event,r.name,r.bib,r.division,r.total_time].join("\u0001"); if(seen.has(key)) continue; seen.add(key); unique.push(r);}
   const BATCH=300; let processed=0;
-  for(let i=0;i<rows.length;i+=BATCH){
-    const batch=rows.slice(i,i+BATCH);
-    const {error}=await sb.from("hyrox_results").upsert(batch,{
-      onConflict:"event,name,bib,division,total_time",
-      ignoreDuplicates:true
-    });
+  for(let i=0;i<unique.length;i+=BATCH){
+    const batch=unique.slice(i,i+BATCH);
+    const {error}=await sb.from("hyrox_results").upsert(batch,{onConflict:"event,name,bib,division,total_time",ignoreDuplicates:true});
     if(error) throw error;
     processed+=batch.length;
-    if(onProgress) onProgress(processed,rows.length);
+    if(onProgress) onProgress(processed,unique.length);
   }
   HYROX_SEARCH_DB=null; HYROX_SEARCH_DB_PROMISE=null; HYROX_SEARCH_DB_COUNT=null;
   await ensureHyroxSearchDb();
-  return {imported:rows.length,totalParsed:data.length};
+  return {imported:unique.length,totalParsed:data.length,format,duplicates:rows.length-unique.length};
 }
 /* ----------------------------------------------------------------------
  * HYROX RESULT SEARCH DB — Supabase-backed
@@ -10026,7 +10063,7 @@ function renderModelDnaImportTab(wrap){
       </div>
       <div class="hstack" style="gap:10px;flex-wrap:wrap;margin-top:8px;">
         <button class="btn sm" id="peerdb-import-json">JSON 가져오기</button>
-        <label class="btn secondary sm" style="cursor:pointer;">원본 HYROX CSV 업로드 → 선수 검색 DB<input type="file" accept=".csv,text/csv" id="peerdb-csv-input" style="display:none;"></label>
+        <label class="btn secondary sm" style="cursor:pointer;">HYROX CSV / Excel 업로드 → 선수 검색 DB<input type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" id="peerdb-csv-input" style="display:none;"></label>
         ${dbSize>0? `<button class="btn ghost sm" id="peerdb-clear">로컬 DNA 캐시 삭제</button>` : ""}
       </div>
       <div id="peerdb-import-status" style="margin-top:10px;font-size:12px;"></div>
