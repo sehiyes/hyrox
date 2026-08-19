@@ -159,9 +159,9 @@ td.num, th.num{font-family:var(--font-mono); text-align:right;}
 .qbtn:hover{border-color:var(--gray-dim);}
 .qbtn.on{background:var(--orange-glow); color:var(--orange); border-color:transparent; font-weight:700;}
 .qbtn-grid{display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;}
-.modal-overlay{position:fixed; inset:0; background:rgba(0,0,0,.6); backdrop-filter:blur(2px); z-index:1000; display:flex; align-items:flex-end; justify-content:center; opacity:0; pointer-events:none; transition:opacity .18s;}
+.modal-overlay{position:fixed; inset:0; background:rgba(0,0,0,.6); backdrop-filter:blur(2px); z-index:1010; display:flex; align-items:flex-end; justify-content:center; opacity:0; pointer-events:none; transition:opacity .18s;}
 .modal-overlay.show{opacity:1; pointer-events:auto;}
-.modal-panel{width:100%; max-width:520px; max-height:88vh; overflow-y:auto; background:var(--surface); border:1px solid var(--line); border-radius:16px 16px 0 0; padding:20px 20px 26px; transform:translateY(16px); transition:transform .18s;}
+.modal-panel{width:100%; max-width:520px; max-height:88vh; overflow-y:auto; background:var(--surface); border:1px solid var(--line); border-radius:16px 16px 0 0; padding:20px 20px calc(26px + env(safe-area-inset-bottom)); transform:translateY(16px); transition:transform .18s;}
 .modal-overlay.show .modal-panel{transform:translateY(0);}
 @media (min-width:640px){
   .modal-overlay{align-items:center;}
@@ -6640,20 +6640,29 @@ function myRecordRowHtml(bigText, dateText, subText){
     <div style="font-size:11.5px;color:var(--gray-dim);font-family:var(--font-mono);">${escapeHtml(dateText)}</div>
   </div>`;
 }
-let SIM_QUICK_DRAFT=null, TENK_QUICK_DRAFT=null;
-function openSimQuickAddModal(){
-  SIM_QUICK_DRAFT = { date:todayISO(), totalTime:"", division:STATE.profile.division, note:"" };
+let SIM_QUICK_DRAFT=null, TENK_QUICK_DRAFT=null, SIM_EDIT_ID=null, TENK_EDIT_ID=null;
+function openSimQuickAddModal(existing=null){
+  SIM_EDIT_ID = existing?.id || null;
+  SIM_QUICK_DRAFT = existing
+    ? { date:existing.date, totalTime:existing.totalTime||"", division:existing.division||STATE.profile.division, note:existing.note||"" }
+    : { date:todayISO(), totalTime:"", division:STATE.profile.division, note:"" };
   renderSimQuickAddModal(); openModal();
 }
+function deleteSimRecord(id){
+  if(!confirm("이 Simulation 기록을 삭제할까요? 삭제 후에는 되돌릴 수 없습니다.")) return;
+  STATE.simulationTests = STATE.simulationTests.filter(s=>s.id!==id);
+  persist(); showToast("Simulation 기록을 삭제했습니다"); renderSimFullListModal();
+}
 function renderSimQuickAddModal(){
-  const panel=document.getElementById("modal-panel"); const d=SIM_QUICK_DRAFT;
+  const panel=document.getElementById("modal-panel"); const d=SIM_QUICK_DRAFT; const editing=!!SIM_EDIT_ID;
   panel.innerHTML = `
-    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 기록 추가</div><span class="modal-close" id="simq-close">✕</span></div>
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="simq-close">✕</span></div>
     <div class="field"><label>날짜</label><input id="simq-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}"></div>
     <div class="field" style="margin-top:10px;"><label>총 기록 (h:mm:ss 또는 mm:ss)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
     <div class="field" style="margin-top:10px;"><label>Division</label><select id="simq-div">${DIVISIONS.map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select></div>
     <div class="field" style="margin-top:10px;"><label>메모 (선택)</label><input id="simq-note" placeholder="선택사항" value="${escapeHtml(d.note)}"></div>
-    <button class="btn" id="simq-save" style="width:100%;justify-content:center;margin-top:16px;">저장</button>
+    <button class="btn" id="simq-save" style="width:100%;justify-content:center;margin-top:16px;">${editing?"수정 저장":"저장"}</button>
+    ${editing? `<p class="reason-line" style="margin-top:8px;text-align:center;">Run 1~8·Station별 상세 기록 수정은 준비 중입니다 — 날짜/총기록/Division/메모만 수정할 수 있습니다.</p>` : ""}
   `;
   panel.querySelector("#simq-close").addEventListener("click", closeModal);
   panel.querySelector("#simq-date").addEventListener("change",e=>{ d.date=e.target.value; });
@@ -6663,21 +6672,35 @@ function renderSimQuickAddModal(){
   panel.querySelector("#simq-save").addEventListener("click",()=>{
     if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
     if(!parseTimeToSec(d.totalTime)){ showToast("총 기록을 mm:ss 또는 h:mm:ss 형식으로 입력해주세요"); return; }
-    STATE.simulationTests.push({ id:uid(), date:d.date, type:"full", division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime, note:d.note||"", source:"manual" });
-    persist(); closeModal(); showToast("Simulation 기록이 저장되었습니다"); renderAll();
+    if(editing){
+      const rec = STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
+      if(rec){ rec.date=d.date; rec.totalTime=d.totalTime; rec.division=d.division; rec.note=d.note||""; }
+      persist(); closeModal(); showToast("Simulation 기록을 수정했습니다"); renderAll();
+    } else {
+      STATE.simulationTests.push({ id:uid(), date:d.date, type:"full", division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime, note:d.note||"", source:"manual" });
+      persist(); closeModal(); showToast("Simulation 기록이 저장되었습니다"); renderAll();
+    }
   });
 }
-function open10kQuickAddModal(){
-  TENK_QUICK_DRAFT = { date:todayISO(), time:"" };
+function open10kQuickAddModal(existing=null){
+  TENK_EDIT_ID = existing?.id || null;
+  TENK_QUICK_DRAFT = existing
+    ? { date:existing.date, time:fmtTime(existing.avgPaceSecKm*10) }
+    : { date:todayISO(), time:"" };
   render10kQuickAddModal(); openModal();
 }
+function delete10kRecord(id){
+  if(!confirm("이 10K TT 기록을 삭제할까요? 삭제 후에는 되돌릴 수 없습니다.")) return;
+  STATE.trainingLog = STATE.trainingLog.filter(l=>l.id!==id);
+  persist(); showToast("10K TT 기록을 삭제했습니다"); render10kFullListModal();
+}
 function render10kQuickAddModal(){
-  const panel=document.getElementById("modal-panel"); const d=TENK_QUICK_DRAFT;
+  const panel=document.getElementById("modal-panel"); const d=TENK_QUICK_DRAFT; const editing=!!TENK_EDIT_ID;
   panel.innerHTML = `
-    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏃 10K TT 기록 추가</div><span class="modal-close" id="tenkq-close">✕</span></div>
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏃 10K TT 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="tenkq-close">✕</span></div>
     <div class="field"><label>날짜</label><input id="tenkq-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}"></div>
     <div class="field" style="margin-top:10px;"><label>10K 기록 (mm:ss)</label><input id="tenkq-time" placeholder="예: 48:32" value="${escapeHtml(d.time)}"></div>
-    <button class="btn" id="tenkq-save" style="width:100%;justify-content:center;margin-top:16px;">저장</button>
+    <button class="btn" id="tenkq-save" style="width:100%;justify-content:center;margin-top:16px;">${editing?"수정 저장":"저장"}</button>
   `;
   panel.querySelector("#tenkq-close").addEventListener("click", closeModal);
   panel.querySelector("#tenkq-date").addEventListener("change",e=>{ d.date=e.target.value; });
@@ -6686,12 +6709,76 @@ function render10kQuickAddModal(){
     if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
     const sec=parseTimeToSec(d.time);
     if(!sec){ showToast("기록을 mm:ss 형식으로 입력해주세요"); return; }
-    STATE.trainingLog.push({ id:uid(), date:d.date, type:"tt", distanceKm:10, durationMin:round1(sec/60),
-      avgPaceSecKm:Math.round(sec/10), intensityRpe:null, painFlag:false, note:"10K TT", source:"manual" });
-    const curPb=parseTimeToSec(STATE.running.pb10k);
-    if(!curPb || sec<curPb) STATE.running.pb10k=d.time;
-    recordHpiSnapshot(); persist(); closeModal(); showToast("10K TT 기록이 저장되었습니다"); renderAll();
+    if(editing){
+      const rec = STATE.trainingLog.find(l=>l.id===TENK_EDIT_ID);
+      if(rec){ rec.date=d.date; rec.durationMin=round1(sec/60); rec.avgPaceSecKm=Math.round(sec/10); }
+      const curPb=parseTimeToSec(STATE.running.pb10k);
+      if(!curPb || sec<curPb) STATE.running.pb10k=d.time;
+      recordHpiSnapshot(); persist(); closeModal(); showToast("10K TT 기록을 수정했습니다"); renderAll();
+    } else {
+      STATE.trainingLog.push({ id:uid(), date:d.date, type:"tt", distanceKm:10, durationMin:round1(sec/60),
+        avgPaceSecKm:Math.round(sec/10), intensityRpe:null, painFlag:false, note:"10K TT", source:"manual" });
+      const curPb=parseTimeToSec(STATE.running.pb10k);
+      if(!curPb || sec<curPb) STATE.running.pb10k=d.time;
+      recordHpiSnapshot(); persist(); closeModal(); showToast("10K TT 기록이 저장되었습니다"); renderAll();
+    }
   });
+}
+// spec (doc7 §4/§5): "전체보기" — full list with 수정/삭제 per record, reusing the SAME modal
+// infrastructure and edit/delete functions above (no separate page/route needed).
+function openSimFullListModal(){ renderSimFullListModal(); openModal(); }
+function renderSimFullListModal(){
+  const panel=document.getElementById("modal-panel");
+  const list=[...STATE.simulationTests].sort((a,b)=>b.date.localeCompare(a.date));
+  panel.innerHTML = `
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 전체 기록</div><span class="modal-close" id="simlist-close">✕</span></div>
+    <div style="display:flex;flex-direction:column;gap:2px;max-height:60vh;overflow-y:auto;">
+      ${list.length? list.map(s=>`<div class="row-between" style="padding:10px 0;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-family:var(--font-mono);font-size:15px;font-weight:700;">${escapeHtml(s.totalTime||"—")}</div>
+          <div style="font-size:10.5px;color:var(--gray-dim);margin-top:1px;">${fmtDateDots(s.date)} · ${escapeHtml(s.division||"")}${s.note?` · ${escapeHtml(s.note)}`:""}</div>
+        </div>
+        <div class="hstack" style="gap:6px;">
+          <span class="chip sim-edit" data-id="${s.id}" style="cursor:pointer;font-size:11px;">수정</span>
+          <span class="chip sim-del" data-id="${s.id}" style="cursor:pointer;font-size:11px;color:var(--red);">삭제</span>
+        </div>
+      </div>`).join("") : `<div class="empty-note">Simulation 기록이 없습니다</div>`}
+    </div>
+    <button class="btn" id="simlist-add" style="width:100%;justify-content:center;margin-top:16px;">+ 새 Simulation 기록 추가</button>
+  `;
+  panel.querySelector("#simlist-close").addEventListener("click", closeModal);
+  panel.querySelector("#simlist-add").addEventListener("click", ()=>openSimQuickAddModal());
+  panel.querySelectorAll(".sim-edit").forEach(el=>el.addEventListener("click",()=>{
+    const rec=STATE.simulationTests.find(s=>s.id===el.dataset.id); if(rec) openSimQuickAddModal(rec);
+  }));
+  panel.querySelectorAll(".sim-del").forEach(el=>el.addEventListener("click",()=>deleteSimRecord(el.dataset.id)));
+}
+function open10kFullListModal(){ render10kFullListModal(); openModal(); }
+function render10kFullListModal(){
+  const panel=document.getElementById("modal-panel");
+  const list=STATE.trainingLog.filter(l=>l.type==="tt" && l.distanceKm!=null && l.distanceKm>=9 && l.distanceKm<=11).sort((a,b)=>b.date.localeCompare(a.date));
+  panel.innerHTML = `
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏃 10K TT 전체 기록</div><span class="modal-close" id="tenklist-close">✕</span></div>
+    <div style="display:flex;flex-direction:column;gap:2px;max-height:60vh;overflow-y:auto;">
+      ${list.length? list.map(l=>`<div class="row-between" style="padding:10px 0;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-family:var(--font-mono);font-size:15px;font-weight:700;">${fmtTime(l.avgPaceSecKm*10)}</div>
+          <div style="font-size:10.5px;color:var(--gray-dim);margin-top:1px;">${fmtDateDots(l.date)} · 페이스 ${fmtTime(l.avgPaceSecKm)}/km</div>
+        </div>
+        <div class="hstack" style="gap:6px;">
+          <span class="chip tenk-edit" data-id="${l.id}" style="cursor:pointer;font-size:11px;">수정</span>
+          <span class="chip tenk-del" data-id="${l.id}" style="cursor:pointer;font-size:11px;color:var(--red);">삭제</span>
+        </div>
+      </div>`).join("") : `<div class="empty-note">10K TT 기록이 없습니다</div>`}
+    </div>
+    <button class="btn" id="tenklist-add" style="width:100%;justify-content:center;margin-top:16px;">+ 새 10K TT 기록 추가</button>
+  `;
+  panel.querySelector("#tenklist-close").addEventListener("click", closeModal);
+  panel.querySelector("#tenklist-add").addEventListener("click", ()=>open10kQuickAddModal());
+  panel.querySelectorAll(".tenk-edit").forEach(el=>el.addEventListener("click",()=>{
+    const rec=STATE.trainingLog.find(l=>l.id===el.dataset.id); if(rec) open10kQuickAddModal(rec);
+  }));
+  panel.querySelectorAll(".tenk-del").forEach(el=>el.addEventListener("click",()=>delete10kRecord(el.dataset.id)));
 }
 function renderMyRecordPage(wrap){
   const hyrox=myRecordHyroxSummary(), sims=myRecordSimSummary(), tenk=myRecord10kSummary();
@@ -6710,13 +6797,13 @@ function renderMyRecordPage(wrap){
       </div>
     </div>
     <div class="card">
-      <div class="row-between"><div class="eyebrow gray">최근 Simulation</div><button class="btn sm" id="myrecord-add-sim">+ 추가</button></div>
+      <div class="row-between"><div class="eyebrow gray">최근 Simulation</div><div class="hstack" style="gap:6px;"><button class="btn sm" id="myrecord-add-sim">+ 추가</button><span class="chip" id="myrecord-list-sim" style="cursor:pointer;">전체보기</span></div></div>
       <div style="margin-top:6px;">
         ${sims.length? sims.map(s=>myRecordRowHtml(s.totalTime||"—", fmtDateDots(s.date), s.note||s.division||"")).join("") : `<div class="empty-note">Simulation 기록이 없습니다</div>`}
       </div>
     </div>
     <div class="card">
-      <div class="row-between"><div class="eyebrow gray">10K TT</div><button class="btn sm" id="myrecord-add-10k">+ 추가</button></div>
+      <div class="row-between"><div class="eyebrow gray">10K TT</div><div class="hstack" style="gap:6px;"><button class="btn sm" id="myrecord-add-10k">+ 추가</button><span class="chip" id="myrecord-list-10k" style="cursor:pointer;">전체보기</span></div></div>
       <div style="margin-top:8px;font-size:12px;color:var(--gray-dim);">PB <span style="color:var(--white);font-weight:700;font-family:var(--font-mono);">${tenk.pb||"—"}</span></div>
       <div style="margin-top:6px;">
         ${tenk.recent.length? tenk.recent.map(l=>myRecordRowHtml(fmtTime(l.avgPaceSecKm*10), fmtDateDots(l.date), "")).join("") : `<div class="empty-note">10K TT 기록이 없습니다</div>`}
@@ -6725,8 +6812,10 @@ function renderMyRecordPage(wrap){
   `;
   bindHyroxNameSearch(wrap);
   wrap.querySelector("#myrecord-goto-races")?.addEventListener("click",()=>{ CURRENT_PAGE="races"; RACES_TAB="log"; renderAll(); });
-  wrap.querySelector("#myrecord-add-sim")?.addEventListener("click", openSimQuickAddModal);
-  wrap.querySelector("#myrecord-add-10k")?.addEventListener("click", open10kQuickAddModal);
+  wrap.querySelector("#myrecord-add-sim")?.addEventListener("click", ()=>openSimQuickAddModal());
+  wrap.querySelector("#myrecord-add-10k")?.addEventListener("click", ()=>open10kQuickAddModal());
+  wrap.querySelector("#myrecord-list-sim")?.addEventListener("click", openSimFullListModal);
+  wrap.querySelector("#myrecord-list-10k")?.addEventListener("click", open10kFullListModal);
 }
 
 /* ---- DNA (simplified) ---- */
@@ -6734,18 +6823,9 @@ const MY_DNA_AXES = ["running","engine","strengthEnd","skill","raceExec"];
 function renderMyDnaPage(wrap){
   const hpiResult=calcHPI();
   const peer=computePeerAnalysis();
-  let strengths, improvements;
-  if(peer){
-    strengths = buildStrengthsTop3(peer.segments);
-    improvements = buildImprovementTop3(peer.impactList, peer.race);
-  } else {
-    // 실제 대회 데이터가 없을 때는 억지로 percentile을 만들지 않고, 이미 있는 Training Priority
-    // 엔진(Impact×Gap×Trainability×...)의 결과를 그대로 재사용해 자연스럽게 대체한다.
-    const priority=computeTrainingPriority();
-    strengths = [...priority].filter(p=>p.score!=null).sort((a,b)=>b.score-a.score).slice(0,3)
-      .map(p=>({ label:INDEX_META[p.key].friendly, score:Math.round(p.score) }));
-    improvements = priority.slice(0,3).map(p=>({ label:INDEX_META[p.key].friendly }));
-  }
+  const strengthRank = getDnaStrengthRanking(3);
+  const improvementRank = getDnaWeaknessRanking(3);
+  const strengths = strengthRank.items, improvements = improvementRank.items;
   wrap.innerHTML = `
     <div><div class="eyebrow">MY HYROX DNA</div><h1 class="page-title">내 DNA</h1></div>
     <div class="card">
@@ -6774,7 +6854,7 @@ function renderMyDnaPage(wrap){
       </div>
     </div>
     <div class="card tight" style="text-align:center;">
-      <span class="chip" id="mydna-goto-detail" style="cursor:pointer;font-size:11px;padding:8px 14px;">상세 분석 보기 (Percentile · Z-score · Impact Score) →</span>
+      <span class="chip" id="mydna-goto-detail" style="cursor:pointer;font-size:11px;padding:8px 14px;">상세 분석 보기 →</span>
     </div>
   `;
   wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{ CURRENT_PAGE="peer"; renderAll(); });
@@ -6836,26 +6916,64 @@ function renderMyGoalPodiumResult(wrap){
     return;
   }
   const podium=r.benchmark.podium;
-  el.innerHTML = `<div class="card" style="border-left:3px solid var(--orange);margin-top:14px;">
-    <div class="eyebrow gray">🏆 포디움 가능성</div>
-    <div style="font-size:12px;color:var(--gray-dim);margin-top:2px;">${escapeHtml(r.goalDiv)}${r.eventName?` · ${escapeHtml(r.eventName)}`:""}</div>
-    <div style="font-family:var(--font-display);font-size:48px;font-weight:800;margin-top:8px;color:var(--orange);">${round1(r.probability)}%</div>
-    <div style="font-size:13px;font-weight:700;margin-top:2px;">${r.qual.emoji} ${r.qual.label}</div>
-    <p class="reason-line" style="font-family:var(--font-body);color:var(--white);margin-top:6px;">${podiumQualSentence(r.probability)}</p>
-    <div class="divider" style="margin:12px 0;"></div>
-    <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;color:var(--gray);">현재 예상 기록</span><span class="mono" style="font-size:15px;font-weight:700;">${fmtTime(r.predicted)}</span></div>
-    <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;color:var(--gray);">포디움 기준 (3위)</span><span class="mono" style="font-size:15px;font-weight:700;color:var(--amber);">${fmtTime(r.cutoff)}</span></div>
-    <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;color:var(--gray);">안정적인 목표</span><span class="mono" style="font-size:15px;font-weight:700;color:var(--green);">${fmtTime(r.safeTarget)}</span></div>
-    <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;color:var(--gray);">포디움까지</span><span class="mono" style="font-size:13px;color:${r.gapSec>0?'var(--red)':'var(--green)'};">${r.gapSec>0?`약 ${fmtTime(r.gapSec)}`:"이미 도달권"}</span></div>
-    <div class="divider" style="margin:12px 0;"></div>
-    <div class="eyebrow gray" style="margin-bottom:8px;">포디움 기준 기록</div>
-    ${podium.map((t,i)=>`<div class="row-between" style="padding:5px 0;"><span style="font-size:13px;">${["🥇 1위","🥈 2위","🥉 3위"][i]}</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
-    <div class="divider" style="margin:12px 0;"></div>
-    <div class="row-between"><span style="font-size:12px;color:var(--gray);">신뢰도</span><span class="badge ${r.overallConfidence==='HIGH'?'elite':r.overallConfidence==='MEDIUM'?'med':'crit'}">${r.overallConfidence}</span></div>
-    <p class="reason-line" style="margin-top:6px;">동일 조건(Division·성별·연령대${r.benchmark.scope==='event'?'·대회':''}) 실제 선수 데이터 ${r.benchmark.n}건 기준</p>
-    <div class="divider" style="margin:12px 0;"></div>
-    <div class="eyebrow gray" style="margin-bottom:8px;">가장 필요한 개선</div>
-    ${computeTrainingPriority().slice(0,3).map((tp,i)=>`<div class="hstack" style="padding:3px 0;"><span class="badge high" style="flex-shrink:0;">${i+1}</span><span style="font-size:13px;">${INDEX_META[tp.key].friendly}</span></div>`).join("")}
+  const gapPositive = r.gapSec>0; // still need to get faster
+  const rank = getDnaWeaknessRanking(3);
+  const medalEmoji=["🥇","🥈","🥉"];
+  el.innerHTML = `<div class="card" style="margin-top:14px;padding:0;overflow:hidden;border:1px solid var(--line);">
+    <div style="padding:22px 20px 20px;text-align:center;background:radial-gradient(120% 140% at 50% -10%, var(--orange-glow), transparent 60%);border-bottom:1px solid var(--line);">
+      <div style="font-family:var(--font-display);font-weight:800;letter-spacing:1.5px;font-size:13px;color:var(--orange);">🏆 MY PODIUM POTENTIAL</div>
+      <div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">${escapeHtml(r.goalDiv)}${r.eventName?` · ${escapeHtml(r.eventName)}`:""}</div>
+      <div style="font-family:var(--font-display);font-size:64px;font-weight:800;line-height:1;margin-top:10px;background:linear-gradient(180deg,var(--white),var(--orange));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">${round1(r.probability)}%</div>
+      <div style="font-size:11px;letter-spacing:1px;color:var(--gray-dim);margin-top:2px;">PODIUM CHANCE</div>
+      <div style="display:inline-block;margin-top:10px;padding:5px 14px;border-radius:20px;background:var(--surface2);font-size:13px;font-weight:700;">${r.qual.emoji} ${r.qual.label}</div>
+      <p class="reason-line" style="font-family:var(--font-body);color:var(--white);margin-top:10px;">${podiumQualSentence(r.probability)}</p>
+    </div>
+
+    <div style="padding:18px 20px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;text-align:center;">
+        <div>
+          <div style="font-size:10.5px;color:var(--gray-dim);">현재 예상 기록</div>
+          <div style="font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:3px;">${fmtTime(r.predicted)}</div>
+        </div>
+        <div>
+          <div style="font-size:10.5px;color:var(--gray-dim);">포디움 기준 (3위)</div>
+          <div style="font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:3px;color:var(--amber);">${fmtTime(r.cutoff)}</div>
+        </div>
+        <div>
+          <div style="font-size:10.5px;color:var(--gray-dim);">GAP</div>
+          <div style="font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:3px;color:${gapPositive?'var(--red)':'var(--green)'};">${gapPositive?"+":"-"}${fmtTime(Math.abs(r.gapSec))}</div>
+        </div>
+      </div>
+      <div class="row-between" style="padding:8px 0 0;margin-top:10px;border-top:1px solid var(--line);">
+        <span style="font-size:11.5px;color:var(--gray);">안정적인 목표</span><span class="mono" style="font-size:13px;font-weight:700;color:var(--green);">${fmtTime(r.safeTarget)}</span>
+      </div>
+    </div>
+
+    <div class="divider" style="margin:0;"></div>
+    <div style="padding:18px 20px;">
+      <div class="eyebrow gray" style="margin-bottom:10px;">🔥 PODIUM GAP을 줄이려면</div>
+      ${rank.items.length ? rank.items.map((it,i)=>`
+        <div class="hstack" style="padding:8px 0;align-items:flex-start;gap:10px;${i<rank.items.length-1?'border-bottom:1px solid var(--line);':''}">
+          <div style="width:24px;height:24px;border-radius:50%;background:var(--orange);color:#fff;font-family:var(--font-display);font-weight:800;font-size:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${i+1}</div>
+          <div>
+            <div style="font-size:14px;font-weight:700;">${escapeHtml(it.label)}</div>
+            ${it.reason? `<div class="reason-line" style="margin-top:1px;">${escapeHtml(it.reason)}</div>` : ""}
+          </div>
+        </div>`).join("") : `<div class="empty-note">데이터가 더 쌓이면 표시됩니다</div>`}
+      ${rank.source!=="dna" ? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ 동일 그룹 비교 데이터가 부족해 훈련 우선순위 지표로 대체 표시 중입니다.</p>` : `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ DNA 페이지의 동일 그룹 비교 기준과 동일합니다.</p>`}
+    </div>
+
+    <div class="divider" style="margin:0;"></div>
+    <div style="padding:18px 20px;">
+      <div class="eyebrow gray" style="margin-bottom:10px;">포디움 기준 기록</div>
+      ${podium.map((t,i)=>`<div class="row-between" style="padding:6px 0;"><span style="font-size:13.5px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
+    </div>
+
+    <div class="divider" style="margin:0;"></div>
+    <div style="padding:14px 20px 18px;">
+      <div class="row-between"><span style="font-size:12px;color:var(--gray);">신뢰도</span><span class="badge ${r.overallConfidence==='HIGH'?'elite':r.overallConfidence==='MEDIUM'?'med':'crit'}">${r.overallConfidence}</span></div>
+      <p class="reason-line" style="margin-top:6px;">동일 조건(Division·성별·연령대${r.benchmark.scope==='event'?'·대회':''}) 실제 선수 데이터 ${r.benchmark.n}건 기준</p>
+    </div>
   </div>`;
 }
 
@@ -6864,7 +6982,6 @@ function renderMyGoalPodiumResult(wrap){
 /* ---------------------------------------------------------------------- */
 function renderDashboard(wrap){
   const hpiResult=calcHPI();
-  const bottleneck=analyzeBottleneck(hpiResult);
   const ruleResult=evaluateRules();
   const race=latestRace();
   const dLeft=daysToRace();
@@ -6938,8 +7055,14 @@ function renderDashboard(wrap){
       </div>
       <div class="card">
         <div class="row-between"><h2 class="section-title">개선 필요 구간 Top</h2></div>
-        <p class="lead" style="margin-bottom:10px;">벤치마크 대비 시간 초과율(%) 기준, 큰 순서대로</p>
-        ${svgBottleneckBars(bottleneck.items.slice(0,6))}
+        ${(() => { const rank=getDnaWeaknessRanking(3);
+          return `<p class="lead" style="margin-bottom:10px;">${rank.source==="dna"?"DNA · 동일 그룹 비교 기준":"HYROX 대회 기록이 아직 없어 훈련 우선순위 엔진 기준"}</p>
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            ${rank.items.length? rank.items.map((it,i)=>`<div class="hstack" style="align-items:flex-start;">
+              <span class="badge crit" style="flex-shrink:0;">${i+1}</span>
+              <div><div style="font-weight:700;font-size:13.5px;">${escapeHtml(it.label)}</div>${it.reason?`<div class="reason-line">${escapeHtml(it.reason)}</div>`:""}</div>
+            </div>`).join("") : `<div class="empty-note">데이터가 더 쌓이면 개선 우선순위가 표시됩니다</div>`}
+          </div>`; })()}
       </div>
     </div>
 
@@ -8413,6 +8536,13 @@ function hyroxSourceBadge(r){
   return parts.join(" · ");
 }
 
+// doc7 §3 fix: "불러옴" previously just wrote silently into a draft (RC_PREFILL) with a toast,
+// with no visible confirmation step — on the mobile 기록 page in particular, there was no
+// "기록 추가" button anywhere nearby to actually finish the save, so the record was never
+// written to STATE.races even though the toast implied success. Now this only stages a
+// confirmation-modal draft (HYROX_IMPORT_DRAFT); STATE.races is untouched until the user
+// explicitly presses "기록 추가" inside that modal (see renderHyroxImportConfirmModal below).
+let HYROX_IMPORT_DRAFT = null;
 function importHyroxDbRecord(index){
   const item=HYROX_DB_RESULTS?.[index];
   const r=item?.r;
@@ -8421,7 +8551,7 @@ function importHyroxDbRecord(index){
   RUN_KEYS.forEach((k,i)=>{ runs[k]=r.u?.[i]||""; });
   const stations={};
   STATIONS.forEach((s,i)=>{ stations[s.key]=r.s?.[i]||""; });
-  RC_PREFILL={
+  HYROX_IMPORT_DRAFT = {
     name:r.n||"",
     date:"",
     division:r.d||DIVISIONS[0],
@@ -8435,12 +8565,57 @@ function importHyroxDbRecord(index){
     _hyroxRank:r.rk||"",
     _hyroxBib:r.b||""
   };
-  RC_OCR_CONF=null;
-  RC_SOURCE_TYPE="HYROX_DATABASE";
   HYROX_DB_SELECTED=index;
-  saveLocalDraft("raceEntry", RC_PREFILL);
-  showToast(`${r.n}님의 ${r.e||"HYROX"} 기록을 불러왔습니다`);
-  renderAll();
+  renderHyroxImportConfirmModal();
+  openModal();
+}
+function hyroxImportConfirmRow(label, value){
+  return `<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:12.5px;"><span style="color:var(--gray-dim);">${escapeHtml(label)}</span><span class="mono" style="font-weight:600;">${escapeHtml(value||"—")}</span></div>`;
+}
+function renderHyroxImportConfirmModal(){
+  const panel=document.getElementById("modal-panel");
+  const d=HYROX_IMPORT_DRAFT;
+  if(!d){ closeModal(); return; }
+  panel.innerHTML = `
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🔎 기록 등록 확인</div><span class="modal-close" id="hic-close">✕</span></div>
+    <p class="lead" style="margin:6px 0 14px;">아래 내용을 확인하고 <b style="color:var(--orange);">[기록 추가]</b>를 눌러야 실제로 등록됩니다. 취소하면 아무것도 저장되지 않습니다.</p>
+    <div class="card" style="padding:12px 14px;">
+      <div style="font-weight:800;font-size:16px;">${escapeHtml(d.name)}</div>
+      <div class="reason-line" style="margin-top:2px;">${escapeHtml([d._hyroxSource,d.division,d._hyroxGender,d._hyroxAge].filter(Boolean).join(" · "))}</div>
+      <div style="font-family:var(--font-mono);font-size:28px;font-weight:800;margin-top:8px;">${escapeHtml(d.officialTime||"—")}</div>
+    </div>
+    <div class="field" style="margin-top:12px;"><label>대회 날짜 (YYYY-MM-DD) <span style="color:var(--amber);">— 원본 데이터에 날짜가 없어 직접 입력해주세요</span></label>
+      <input id="hic-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="2026-06-01" value="${escapeHtml(d.date||"")}">
+    </div>
+    <div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray">Running Splits</div>
+    <div style="margin-top:4px;">${RUN_KEYS.map(k=>hyroxImportConfirmRow("Run "+k, d.runs[k])).join("")}</div>
+    <div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray">Station Splits</div>
+    <div style="margin-top:4px;">${STATIONS.map(s=>hyroxImportConfirmRow(s.label, d.stations[s.key])).join("")}
+      ${hyroxImportConfirmRow("Transition", d.transition)}</div>
+    <div class="hstack" style="gap:10px;margin-top:18px;">
+      <button class="btn ghost sm" id="hic-cancel" style="flex:1;justify-content:center;">취소</button>
+      <button class="btn sm" id="hic-confirm" style="flex:1;justify-content:center;">기록 추가</button>
+    </div>
+  `;
+  const discard=()=>{ HYROX_IMPORT_DRAFT=null; HYROX_DB_SELECTED=null; closeModal(); };
+  panel.querySelector("#hic-close").addEventListener("click", discard);
+  panel.querySelector("#hic-cancel").addEventListener("click", discard);
+  panel.querySelector("#hic-date").addEventListener("change", e=>{ d.date=e.target.value; });
+  panel.querySelector("#hic-confirm").addEventListener("click", ()=>{
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("대회 날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
+    RC_SOURCE_TYPE="HYROX_DATABASE";
+    RC_OCR_CONF=null;
+    const data={...d};
+    HYROX_IMPORT_DRAFT=null; HYROX_DB_SELECTED=null;
+    // reuses the exact same duplicate-check + save pipeline as the manual "기록 추가" form
+    // (raceDuplicateExists / showRaceDuplicateConfirm / finalizeAddRace) so both entry paths
+    // end up writing to STATE.races identically.
+    if(raceDuplicateExists(data)){ showRaceDuplicateConfirm(data); return; }
+    closeModal();
+    finalizeAddRace(data);
+  });
 }
 
 function renderHyroxNameSearchCard(){
@@ -8454,7 +8629,7 @@ function renderHyroxNameSearchCard(){
       </div>
       <p class="lead" style="margin:6px 0 10px;">
         Supabase에 등록된 대회 백데이터에서 선수 이름을 검색해
-        <b style="color:var(--orange);">기록 전체를 입력폼으로 불러올 수 있습니다.</b>
+        <b style="color:var(--orange);">기록을 불러온 뒤, 확인 후 직접 등록할 수 있습니다.</b>
       </p>
       <div class="hstack" style="gap:8px;align-items:stretch;">
         <input id="hyrox-name-search" style="flex:1;min-width:0;" placeholder="예: Joshua White / White, Joshua"
@@ -8477,7 +8652,6 @@ function renderHyroxSearchResults(){
   }
   return HYROX_DB_RESULTS.map((x,i)=>{
     const r=x.r;
-    const selected=HYROX_DB_SELECTED===i;
     return `
       <div style="padding:11px 0;border-top:1px solid var(--line);">
         <div class="row-between" style="gap:10px;">
@@ -8488,9 +8662,7 @@ function renderHyroxSearchResults(){
               ${r.b?`Bib ${escapeHtml(r.b)} · `:""}${r.rk?`Overall ${escapeHtml(String(r.rk))}`:""}${r.ag?` · AG ${escapeHtml(String(r.ag))}`:""}
             </div>
           </div>
-          <button class="btn sm ${selected?"secondary":""}" data-hyrox-import="${i}">
-            ${selected?"불러옴":"이 기록 사용"}
-          </button>
+          <button class="btn sm" data-hyrox-import="${i}">기록 불러오기</button>
         </div>
       </div>
     `;
@@ -9913,8 +10085,22 @@ function renderPrediction(wrap){
 
     <div class="card">
       <h2 class="section-title">개선 필요 구간 상세</h2>
-      ${svgBottleneckBars(bottleneck.items)}
-      ${bottleneck.worstIndex? `<p class="lead" style="margin-top:10px;">가장 낮은 능력 점수: <b style="color:var(--orange)" title="${INDEX_META[bottleneck.worstIndex.key].label}">${INDEX_META[bottleneck.worstIndex.key].emoji} ${INDEX_META[bottleneck.worstIndex.key].friendly}</b> (${round1(bottleneck.worstIndex.score)}점) — 개선 시 HPI 기여도가 가장 큽니다.</p>`:""}
+      ${(() => { const peer=computePeerAnalysis();
+        if(peer){
+          const items=peer.impactList.filter(c=>c.timeLoss>0).map(c=>({label:c.label, gapPct:c.impactPct}));
+          return `<p class="lead" style="margin-bottom:6px;">DNA · 동일 그룹 비교 영향도(%) 기준</p>${svgBottleneckBars(items)}`;
+        }
+        return `${svgBottleneckBars(bottleneck.items)}
+        ${bottleneck.worstIndex? `<p class="lead" style="margin-top:10px;">가장 낮은 능력 점수: <b style="color:var(--orange)" title="${INDEX_META[bottleneck.worstIndex.key].label}">${INDEX_META[bottleneck.worstIndex.key].emoji} ${INDEX_META[bottleneck.worstIndex.key].friendly}</b> (${round1(bottleneck.worstIndex.score)}점) — 개선 시 HPI 기여도가 가장 큽니다.</p>`:""}`; })()}
+    </div>
+
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">개선 가능성이 큰 구간</h2></div>
+      ${(() => { const rank=getDnaWeaknessRanking(3);
+        return `<p class="lead" style="margin-bottom:10px;">예상 기록 ${fmtTime(p0.predicted)}에 가장 큰 영향을 주는 구간 (${rank.source==="dna"?"DNA 기준":"훈련 우선순위 기준"})</p>
+        <div class="hstack" style="gap:8px;flex-wrap:wrap;">
+          ${rank.items.length? rank.items.map(it=>`<span class="badge crit">${escapeHtml(it.label)}</span>`).join("") : `<span class="empty-note">데이터가 더 쌓이면 표시됩니다</span>`}
+        </div>`; })()}
     </div>
 
     <div class="card">
@@ -10233,7 +10419,7 @@ function renderPeer(wrap){
     </div>
 
     <div class="card">
-      <div class="qbtn" id="peer-detail-toggle">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기 (Strength Index 레이더 · 구간별 Z-score · Impact Score)"}</div>
+      <div class="qbtn" id="peer-detail-toggle">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기"}</div>
       ${PEER_DETAIL_OPEN ? `
       <div style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
@@ -10393,6 +10579,40 @@ function buildImprovementTop3(impactList, race){
     }
   }
   return items.slice(0,3);
+}
+/* ---------------------------------------------------------------------- */
+/* 9f. UNIFIED DNA-BASED WEAKNESS/STRENGTH RANKING (doc7 §8-15)            */
+/*     Single source of truth for "개선 필요/우선순위" and "강점" everywhere  */
+/*     (Dashboard / 기록예측 / DNA / Podium). Wraps the SAME real peer        */
+/*     Z-score/percentile-weighted DNA engine the DNA page already shows     */
+/*     (computePeerAnalysis -> buildImprovementTop3/buildStrengthsTop3) —    */
+/*     no new statistics, no separate benchmark-gap or Impact×Gap×          */
+/*     Trainability ranking competing with it. Every screen that wants      */
+/*     "which area needs work" must call THIS, not compute its own.         */
+/*     Falls back to the existing Training Priority index-ranking (already  */
+/*     a real, separately-used engine for weekly planning) ONLY when there  */
+/*     is no race in the current division to run DNA/peer analysis on at    */
+/*     all — never invents a third ranking, and the fallback is labeled so  */
+/*     the UI can be honest about which source produced the list.          */
+/* ---------------------------------------------------------------------- */
+function getDnaWeaknessRanking(n=3){
+  const peer = computePeerAnalysis();
+  if(peer){
+    const top3 = buildImprovementTop3(peer.impactList, peer.race).slice(0,n);
+    if(top3.length) return { source:"dna", items: top3 };
+  }
+  const priority = computeTrainingPriority();
+  return { source:"trainingPriority", items: priority.slice(0,n).map(p=>({ label:INDEX_META[p.key].friendly, key:p.key, reason:null })) };
+}
+function getDnaStrengthRanking(n=3){
+  const peer = computePeerAnalysis();
+  if(peer){
+    const top3 = buildStrengthsTop3(peer.segments).slice(0,n);
+    if(top3.length) return { source:"dna", items: top3.map(s=>({ label:s.label, key:null, reason:s.desc })) };
+  }
+  const hpiResult = calcHPI();
+  const ranked = Object.entries(hpiResult.indices).filter(([k,v])=>v.score!=null).sort((a,b)=>b[1].score-a[1].score).slice(0,n);
+  return { source:"hpi", items: ranked.map(([k,v])=>({ label:INDEX_META[k].friendly, key:k, reason:null })) };
 }
 const STATION_TRAINING_HINT = {
   ski:"SkiErg 인터벌", row:"Row 인터벌", burpee:"Burpee Broad Jump 반복",
