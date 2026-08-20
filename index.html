@@ -10168,6 +10168,136 @@ function mapHyroxDbRow(row){
 
 // Supabase RPC performs token-aware search, so "Joshua White" also finds
 // "White, Joshua" without downloading the whole athlete database.
+/* ---------------------------------------------------------------------- */
+/* 한글 <-> 로마자 교차 검색                                                 */
+/*                                                                        */
+/* search_hyrox_results RPC는 search_name에 대한 ilike 부분검색이라, DB에    */
+/* 저장된 표기와 입력 표기가 다르면(김세희 vs Kim Sehee) 매칭되지 않는다.     */
+/* RPC/스키마를 건드리지 않고, 클라이언트에서 표기 후보를 만들어 여러 번      */
+/* 검색한 뒤 합치는 방식으로 해결한다.                                       */
+/*                                                                        */
+/* 한글 -> 로마자: 자모 분해 후 국어의 로마자 표기법으로 변환. 성씨는 실제    */
+/* 여권 표기가 표기법과 다른 경우가 많아(이=Lee, 박=Park) 별도 표를 둔다.     */
+/* 로마자 -> 한글: 역변환은 원리상 1:다 대응이라 완전하지 않다. 이름에 자주   */
+/* 쓰이는 음절만 표로 두고 greedy 분절한다. 후보는 항상 상한을 둬서, 검색이   */
+/* 느려지거나 엉뚱한 결과가 쏟아지지 않게 한다.                              */
+/* ---------------------------------------------------------------------- */
+const RR_INITIAL = ["g","kk","n","d","tt","r","m","b","pp","s","ss","","j","jj","ch","k","t","p","h"];
+const RR_VOWEL   = ["a","ae","ya","yae","eo","e","yeo","ye","o","wa","wae","oe","yo","u","wo","we","wi","yu","eu","ui","i"];
+const RR_FINAL   = ["","k","k","k","n","n","n","t","l","l","l","l","l","l","l","l","m","p","p","t","t","ng","t","t","k","t","p","t"];
+// 여권에서 실제로 쓰이는 성씨 표기 (표기법 결과와 다른 것 위주)
+const SURNAME_ROMAN = {
+  "김":["kim"], "이":["lee","yi","rhee"], "박":["park","bak"], "최":["choi","choe"],
+  "정":["jung","jeong","chung"], "강":["kang"], "조":["cho","jo"], "윤":["yoon","yun"],
+  "장":["jang","chang"], "임":["lim","im"], "한":["han"], "오":["oh","o"], "서":["seo","suh"],
+  "신":["shin","sin"], "권":["kwon","gwon"], "황":["hwang"], "안":["ahn","an"], "송":["song"],
+  "전":["jeon","jun"], "홍":["hong"], "유":["yoo","yu"], "고":["ko","go"], "문":["moon","mun"],
+  "손":["son","sohn"], "양":["yang"], "배":["bae"], "백":["baek","paik"], "허":["heo","hur"],
+  "남":["nam"], "심":["shim","sim"], "노":["noh","no"], "구":["koo","gu"], "주":["joo","ju"],
+};
+// 이름에 흔한 로마자 음절 -> 한글 (역변환용). 완전한 표가 아니라 "자주 쓰는 것"만.
+const ROMAN_TO_HANGUL_SYL = {
+  se:["세"], sae:["새"], hee:["희","혜"], hui:["희"], hye:["혜"], ji:["지"], jin:["진"],
+  min:["민"], jun:["준"], joon:["준"], jung:["정","중"], jeong:["정"], young:["영"], yeong:["영"],
+  hyun:["현"], hyeon:["현"], soo:["수"], su:["수"], sung:["성"], seong:["성"], chul:["철"],
+  cheol:["철"], ho:["호"], hoon:["훈"], hun:["훈"], woo:["우"], woon:["운"], eun:["은"],
+  yoon:["윤"], yun:["윤"], na:["나"], ra:["라"], ha:["하"], da:["다"], bin:["빈"], sol:["솔"],
+  a:["아"], ah:["아"], yeon:["연"], yun2:["연"], mi:["미"], ju:["주"], joo:["주"], kyung:["경"],
+  gyeong:["경"], kyu:["규"], gyu:["규"], tae:["태"], dong:["동"], sang:["상"], won:["원"],
+  hwan:["환"], jae:["재"], chan:["찬"], hyuk:["혁"], seok:["석"], suk:["석"], gun:["건"], geon:["건"],
+  bo:["보"], yu:["유"], you:["유"], nam:["남"], rim:["림"], lim:["림"], kim:["김"], lee:["이"],
+  park:["박"], choi:["최"], kang:["강"], cho:["조"], jang:["장"], han:["한"], oh:["오"], seo:["서"],
+  shin:["신"], kwon:["권"], hwang:["황"], ahn:["안"], song:["송"], jeon:["전"], hong:["홍"],
+  ko:["고"], moon:["문"], son:["손"], yang:["양"], bae:["배"], baek:["백"], heo:["허"],
+};
+function romanizeHangulSyllable(ch){
+  const code=ch.charCodeAt(0)-0xAC00;
+  if(code<0 || code>11171) return null;
+  return RR_INITIAL[Math.floor(code/588)] + RR_VOWEL[Math.floor((code%588)/28)] + RR_FINAL[code%28];
+}
+function hasHangul(str){ return /[\uAC00-\uD7A3]/.test(str); }
+// 로마자 표기법(RR) 결과와 실제로 여권/대회 등록에 쓰는 철자는 자주 다르다.
+// 희=hui(표기법) 이지만 대부분 hee 로 쓰고, 철=cheol 이지만 chul, 수=su 지만 soo 로 쓴다.
+// RR 결과에 아래 치환을 적용해 "실제로 쓰일 법한" 철자 후보를 추가로 만든다.
+const RR_SPELLING_ALT = [
+  [/hui/g,"hee"], [/cheol/g,"chul"], [/jeong/g,"jung"], [/yeong/g,"young"],
+  [/hyeon/g,"hyun"], [/seong/g,"sung"], [/gyeong/g,"kyung"], [/seok/g,"suk"],
+  [/gyu/g,"kyu"], [/geon/g,"gun"], [/su\b/g,"soo"], [/u\b/g,"oo"], [/eo/g,"u"], [/eu/g,"u"],
+];
+function romanSpellingAlternates(roman, max=2){
+  const out=[];
+  // 1차: 대표 치환을 전부 적용한 형태
+  let a=roman; RR_SPELLING_ALT.forEach(([re,to])=>{ a=a.replace(re,to); });
+  if(a!==roman) out.push(a);
+  // 2차: 모음 축약(eo/eu)은 빼고 자주 쓰는 철자만 바꾼 보수적인 형태
+  let b=roman; RR_SPELLING_ALT.slice(0,10).forEach(([re,to])=>{ b=b.replace(re,to); });
+  if(b!==roman && b!==a) out.push(b);
+  return out.slice(0,max);
+}
+// 한글 이름 -> 로마자 후보 (최대 MAX). "김 세희" 같은 띄어쓰기도 그대로 살린다.
+function hangulToRomanCandidates(str, max=4){
+  if(!hasHangul(str)) return [];
+  const words=str.trim().split(/\s+/).filter(Boolean);
+  // 각 글자별 후보 목록을 만들고, 조합 폭발을 막기 위해 성씨만 다중 후보를 허용한다.
+  const perWord=words.map((w,wi)=>{
+    const chars=[...w];
+    const out=[];
+    // 성씨 후보: 첫 단어의 첫 글자 (또는 붙여쓴 이름의 첫 글자)
+    const surnameAlts = (wi===0 && SURNAME_ROMAN[chars[0]]) ? SURNAME_ROMAN[chars[0]] : null;
+    const restRoman = chars.slice(surnameAlts?1:0).map(c=>romanizeHangulSyllable(c)||c).join("");
+    if(surnameAlts){ surnameAlts.forEach(sa=>out.push(sa+restRoman)); }
+    else out.push(chars.map(c=>romanizeHangulSyllable(c)||c).join(""));
+    return [...new Set(out)];
+  });
+  // 단어별 후보를 조합 (상한 적용)
+  let combos=[""];
+  perWord.forEach((alts,i)=>{
+    const next=[];
+    combos.forEach(base=>alts.forEach(a=>{ if(next.length<max*3) next.push(i===0? a : base+" "+a); }));
+    combos=next;
+  });
+  return [...new Set(combos.map(c=>c.trim()).filter(c=>c.length>=2))].slice(0,max);
+}
+// 로마자 -> 한글 후보 (최대 MAX). greedy 최장일치 분절.
+function romanToHangulCandidates(str, max=3){
+  if(hasHangul(str)) return [];
+  const words=str.toLowerCase().replace(/[^a-z\s]/g," ").trim().split(/\s+/).filter(Boolean);
+  if(!words.length) return [];
+  const keys=Object.keys(ROMAN_TO_HANGUL_SYL).filter(k=>!/\d/.test(k)).sort((a,b)=>b.length-a.length);
+  const segWord=(w)=>{
+    let i=0, parts=[];
+    while(i<w.length){
+      const hit=keys.find(k=>w.startsWith(k,i));
+      if(!hit) return null;                // 하나라도 모르는 음절이 있으면 포기 (오탐 방지)
+      parts.push(ROMAN_TO_HANGUL_SYL[hit]);
+      i+=hit.length;
+    }
+    return parts;
+  };
+  const perWord=words.map(segWord);
+  if(perWord.some(p=>p===null)) return [];
+  let combos=[""];
+  perWord.forEach((parts,wi)=>{
+    let next=combos;
+    parts.forEach(alts=>{
+      const grown=[];
+      next.forEach(base=>alts.forEach(a=>{ if(grown.length<max*4) grown.push(base+a); }));
+      next=grown;
+    });
+    combos = wi===0 ? next : next;
+  });
+  return [...new Set(combos.filter(c=>c.length>=2))].slice(0,max);
+}
+// 입력 하나로 만들 수 있는 모든 검색 표기 후보. 원본이 항상 첫 번째(= 최우선).
+function buildHyroxSearchVariants(q){
+  const out=[q];
+  hangulToRomanCandidates(q).forEach(v=>{ out.push(v); romanSpellingAlternates(v).forEach(a=>out.push(a)); });
+  romanToHangulCandidates(q).forEach(v=>out.push(v));
+  // 띄어쓰기 없이 붙여 쓴 표기도 흔하다 (kim sehee -> kimsehee)
+  if(/\s/.test(q)) out.push(q.replace(/\s+/g,""));
+  return [...new Set(out.map(v=>normalizeHyroxSearchText(v)).filter(v=>v && v.length>=2))].slice(0,8);
+}
+
 async function searchHyroxByName(query, limit=20){
   if(!HYROX_SEARCH_DB) await ensureHyroxSearchDb();
   const q=normalizeHyroxSearchText(query);
@@ -10175,12 +10305,31 @@ async function searchHyroxByName(query, limit=20){
   if(!sb) throw new Error("Supabase 연결이 초기화되지 않았습니다.");
 
   const safeLimit=Math.max(1,Math.min(Number(limit)||20,50));
-  const { data, error } = await sb.rpc("search_hyrox_results", {
-    search_text:q,
-    result_limit:safeLimit
+  const variants=buildHyroxSearchVariants(q);
+  const settled=await Promise.allSettled(variants.map(v=>
+    sb.rpc("search_hyrox_results", { search_text:v, result_limit:safeLimit })));
+
+  // 첫 번째(원본 표기) 호출이 에러면 그대로 던진다 — 연결 문제를 조용히 삼키지 않기 위해.
+  const first=settled[0];
+  if(first.status==="rejected") throw first.reason;
+  if(first.value && first.value.error) throw first.value.error;
+
+  const seen=new Set(), out=[];
+  settled.forEach((res,vi)=>{
+    if(res.status!=="fulfilled" || !res.value || res.value.error) return;
+    (res.value.data||[]).forEach((row,ri)=>{
+      const r=mapHyroxDbRow(row);
+      // 같은 선수의 같은 대회 기록이 여러 표기 후보에서 중복으로 잡힐 수 있다.
+      const key=[r.n,r.e,r.d,r.t,r.b].join("|");
+      if(seen.has(key)) return;
+      seen.add(key);
+      // 원본 표기로 잡힌 결과를 항상 위로 (vi=0), 그 다음이 변환 표기.
+      out.push({ r, i:out.length, score:vi*1000+ri,
+        matchedVariant: vi===0? null : variants[vi] });
+    });
   });
-  if(error) throw error;
-  return (data||[]).map((row,i)=>({r:mapHyroxDbRow(row),i,score:i}));
+  out.sort((a,b)=>a.score-b.score);
+  return out.slice(0,safeLimit).map((x,i)=>({...x, i}));
 }
 
 function hyroxSourceBadge(r){
@@ -10320,7 +10469,7 @@ function renderHyroxSearchResults(){
       <div style="padding:11px 0;border-top:1px solid var(--line);">
         <div class="row-between" style="gap:10px;">
           <div style="min-width:0;">
-            <div style="font-weight:800;color:var(--white);">${escapeHtml(r.n)}</div>
+            <div style="font-weight:800;color:var(--white);">${escapeHtml(r.n)}${x.matchedVariant? ` <span class="chip" style="font-size:10px;vertical-align:middle;">"${escapeHtml(x.matchedVariant)}" 표기로 매칭</span>`:""}</div>
             <div class="reason-line" style="margin-top:3px;">${escapeHtml(hyroxSourceBadge(r))}${r.t?` · <b style="color:var(--white);">${escapeHtml(r.t)}</b>`:""}</div>
             <div class="reason-line" style="margin-top:3px;">
               ${r.b?`Bib ${escapeHtml(r.b)} · `:""}${r.rk?`Overall ${escapeHtml(String(r.rk))}`:""}${r.ag?` · AG ${escapeHtml(String(r.ag))}`:""}
