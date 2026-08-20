@@ -2457,12 +2457,13 @@ function computeGoalScenarios(){
   } else {
     wSafe=4; wReal=8; wChallenge=12; hasRaceDate=false;
   }
-  const pSafe=predictTime(hpiResult,wSafe), pReal=predictTime(hpiResult,wReal), pChallenge=predictTime(hpiResult,wChallenge);
-  // Goal-aware (see getGoalAwareBaseline() header): only this "현재" display number is division-aware.
-  // pSafe/pReal/pChallenge intentionally still come from predictTime() untouched (per explicit
-  // instruction not to modify predictTime()/the segment Anchor) — they remain base-division scenarios.
-  // Known, flagged limitation: when goalDivision differs from the base division, "현재" below is
-  // division-converted but the Safe/Realistic/Challenge scenario numbers are not yet — reported as-is.
+  // IMPORTANT: A/B/C milestone forecasts must use the SAME selected goal Division as the
+  // current baseline. The previous implementation only made currentSec goal-aware while
+  // pSafe/pReal/pChallenge silently stayed on STATE.profile.division, so Open Doubles and
+  // Pro Doubles could show the same 8-week milestone even when their current baselines differed.
+  const goalDivForScenario = STATE.profile.goalDivision || STATE.profile.division;
+  const predictGoalScenario = (weeks)=>withDivisionContext(goalDivForScenario, ()=>predictTime(calcHPI(), weeks));
+  const pSafe=predictGoalScenario(wSafe), pReal=predictGoalScenario(wReal), pChallenge=predictGoalScenario(wChallenge);
   const goalAwareNow=getGoalAwareBaseline(hpiResult);
   const currentSec=goalAwareNow.value;
 
@@ -5282,7 +5283,7 @@ function normalizeAgeGroupLabel(raw){
 function validateRaceRecordRow(r){
   if(!r || typeof r!=="object") return false;
   const gender=String(r.gender||"").toLowerCase();
-  if(gender!=="male" && gender!=="female") return false;
+  if(gender!=="male" && gender!=="female" && gender!=="mixed") return false;
   if(!r.division) return false;
   return true;
 }
@@ -5317,7 +5318,8 @@ function classifyAnalysisValidity(overallTimeSec, r){
   return { valid:true, reason:null };
 }
 function normalizeExternalRaceRow(r){
-  const gender = String(r.gender||"").toLowerCase()==="female" ? "female" : "male";
+  const genderRaw = String(r.gender||"").toLowerCase();
+  const gender = genderRaw.includes("mixed") ? "mixed" : (genderRaw==="female" ? "female" : "male");
   const age = r.age!=null && r.age!=="" ? Number(r.age) : null;
   const overall_time = numOrNull(r.overall_time);
   const partial = {
@@ -6011,25 +6013,46 @@ async function fetchPodiumDivisionRowsFromSupabase(division){
     }
     return out;
   };
-  const exact=await exactQuery();
-  rows.push(...exact);
-
-  // Mixed Doubles has historically appeared in imported datasets with small label
-  // variations. If the canonical exact query returns zero, broaden ONLY Mixed Doubles
-  // to a division-label search, then normalize back to the canonical Division.
-  // Never broaden Open/Pro/Doubles categories this way.
-  if(division==="Mixed Doubles" && rows.length===0){
+  if(division==="Mixed Doubles") {
+    // IMPORTANT: In the actual Supabase data Mixed Doubles is stored as
+    // division = "Open Doubles" + gender = "Mixed". Do NOT query
+    // division = "Mixed Doubles" because that canonical label does not exist
+    // in the current table. Query the real storage shape directly.
     let start=0;
     for(let page=0; page<pageCeiling; page++){
       const to=start+EXTERNAL_RACE_DB_PAGE_SIZE-1;
-      const { data, error } = await sb.from("hyrox_results").select("*").ilike("division","%mixed%double%").order("id",{ascending:true}).range(start,to);
+      const { data, error } = await sb.from("hyrox_results").select("*")
+        .eq("division","Open Doubles")
+        .eq("gender","Mixed")
+        .order("id",{ascending:true}).range(start,to);
       if(error) throw error;
       if(!data || !data.length) break;
       rows.push(...data);
       if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
       start+=EXTERNAL_RACE_DB_PAGE_SIZE;
     }
+    // Defensive fallback for historical label variations, but still require
+    // Mixed gender so Men/Women Open Doubles cannot leak into this group.
+    if(rows.length===0){
+      let start2=0;
+      for(let page=0; page<pageCeiling; page++){
+        const to=start2+EXTERNAL_RACE_DB_PAGE_SIZE-1;
+        const { data, error } = await sb.from("hyrox_results").select("*")
+          .ilike("gender","%mixed%")
+          .ilike("division","%double%")
+          .order("id",{ascending:true}).range(start2,to);
+        if(error) throw error;
+        if(!data || !data.length) break;
+        rows.push(...data);
+        if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
+        start2+=EXTERNAL_RACE_DB_PAGE_SIZE;
+      }
+    }
+    return rows;
   }
+
+  const exact=await exactQuery();
+  rows.push(...exact);
   return rows;
 }
 // [포디움 기준 재설계 — "전체 DB 상위 3명" 버그 수정]
@@ -6090,7 +6113,12 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
     }
   }
   if(!sourceRows){
-    sourceRows = EXTERNAL_RACE_DB.filter(r=>{ const d=String(r.division||""); return division==="Mixed Doubles" ? hyroxCsvDivision(d)==="Mixed Doubles" : d===division; }); // offline/폴백 경로
+    sourceRows = EXTERNAL_RACE_DB.filter(r=>{
+      const d=String(r.division||"");
+      const g=String(r.gender||"").toLowerCase();
+      if(division==="Mixed Doubles") return hyroxCsvDivision(d)==="Mixed Doubles" || (d.toLowerCase().includes("double") && g.includes("mixed"));
+      return d===division;
+    }); // offline/폴백 경로
     rawFetchedCount = convertedCount = sourceRows.length;
   }
   console.log(`[Podium Trace]\nrequested:\ngender = ${gender}\ndivision = ${division}\nageGroup = ${ageGroup}`
@@ -9090,12 +9118,14 @@ function hyroxDbRowToExternal(row){
   const runs = Array.isArray(row.runs_json) ? row.runs_json : [];
   const stations = Array.isArray(row.stations_json) ? row.stations_json : [];
   const genderRaw = String(row.gender||"").trim().toLowerCase();
+  const rawDivision = String(row.division||"").trim();
+  const isMixedTeam = genderRaw.includes("mixed") && rawDivision.toLowerCase().includes("double");
   // doc11 §2: the old check only matched "female"/"women" (plural) — "woman" (singular) has a
   // different spelling ("wom-a-n" vs "wom-e-n") and silently fell through to the male default, quietly
   // undercounting real female rows (including Doubles entries) before they ever reached the podium
   // comparison-group filter. Matching the shared "wom" prefix catches both spellings plus any casing.
-  const gender = genderRaw==="f" || genderRaw.includes("female") || genderRaw.includes("wom") ? "female" : "male";
-  const division = DIVISIONS.includes(row.division) ? row.division : hyroxCsvDivision(row.division);
+  const gender = isMixedTeam ? "mixed" : (genderRaw==="f" || genderRaw.includes("female") || genderRaw.includes("wom") ? "female" : "male");
+  const division = isMixedTeam ? "Mixed Doubles" : (DIVISIONS.includes(row.division) ? row.division : hyroxCsvDivision(row.division));
   const total = parseTimeToSec(row.total_time);
   const obj = {
     race_id: `${row.event||"HYROX"}|${row.name||""}|${row.bib||""}|${division}|${row.total_time||""}`,
