@@ -433,6 +433,18 @@ function weightedAvg(pairs){ // [[score,weight], ...] ignoring nulls, renormaliz
   return valid.reduce((s,p)=>s+p[0]*p[1],0)/wsum;
 }
 function mean(arr){ arr=arr.filter(v=>v!=null&&!isNaN(v)); return arr.length? arr.reduce((a,b)=>a+b,0)/arr.length : null; }
+// linear-interpolation percentile (0..1), used by the event-based Podium benchmark below — a single
+// very fast/slow event never dominates since it's one data point among many events, not a raw row.
+function percentileOf(arr, p){
+  const a=arr.filter(v=>v!=null&&!isNaN(v)).sort((x,y)=>x-y);
+  if(!a.length) return null;
+  if(a.length===1) return a[0];
+  const idx=(a.length-1)*p;
+  const lo=Math.floor(idx), hi=Math.ceil(idx);
+  if(lo===hi) return a[lo];
+  return a[lo] + (a[hi]-a[lo])*(idx-lo);
+}
+function medianOf(arr){ return percentileOf(arr, 0.5); }
 function stdev(arr){
   arr=arr.filter(v=>v!=null&&!isNaN(v));
   if(arr.length<2)return 0;
@@ -724,14 +736,11 @@ function latestRace(divisionOverride){
   return r[0]||null;
 }
 const STATION_STALE_DAYS = 14;
-// doc9 §30-4: a SEPARATE, more lenient threshold than STATION_STALE_DAYS (14d, used elsewhere for the
-// small ±adjustment-nudge decision) specifically for "should Simulation even be considered at all when
-// an Official record already exists for this segment". The doc's own worked examples put Official-20-
-// days on the "still just use Official, ignore a newer Simulation" side and Official-30-days on the
-// "let Simulation supplement it" side — 21 days (3 weeks) sits between those two examples. Below this
-// threshold, Official is used directly and Simulation is never even added to the candidate pool for
-// that segment, however much fresher the Simulation entry is; at or beyond it, Simulation candidates
-// are added and normal recency ordering decides (unchanged mechanism, just gated at a different point).
+// doc12 긴급 수정: 이전에는 이 값을 기준으로 "최근 Official 기록이 있으면 Simulation 후보를 아예 배제"
+// 하는 하드 게이트로 사용했다 (collectStationCandidates/runLegCandidates/transitionCandidates) — 21일
+// 이내 공식 기록이 있다는 이유만으로 그보다 더 최근/더 나은 Simulation 신호가 100% 차단되는 문제
+// (TEST-04)였다. 이 하드 게이트는 제거되었고 위 세 함수 모두 이제 Simulation을 항상 후보로 추가한 뒤
+// recency 정렬로 처리한다. 이 상수는 더 이상 게이트로 쓰이지 않으며 과거 동작 참고용으로만 남겨둔다.
 const OFFICIAL_VS_SIMULATION_GRACE_DAYS = 21;
 // cardio-driven stations: a measured running-pace trend is a fairly direct signal, so a larger cap applies.
 const ENGINE_STATIONS_ADJUSTABLE = ["ski","row","burpee"];
@@ -775,25 +784,25 @@ function collectStationCandidates(key){
   const out=[];
   STATE.stationTests.forEach(t=>{ const v=t.values&&t.values[key]; if(v) out.push({date:t.date, value:v, source:"test"}); });
   STATE.races.filter(r=>divisionBase(r.division)===myDiv).forEach(r=>{ const v=r.stations&&r.stations[key]; if(v) out.push({date:r.date, value:v, source:"race"}); });
-  out.sort((a,b)=>b.date.localeCompare(a.date));
-  const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
-  if(!officialFresh){
-    const stMeta=STATIONS.find(s=>s.key===key);
-    const officialUnit=stMeta?stMeta.unit:null;
-    if(officialUnit){
-      // spec: only counts when the performed amount EXACTLY matches the official station distance/reps
-      // (e.g. "50m" for Sled Push) — a half-distance rep is never blended into a full-distance benchmark.
-      // No unit conversion/estimation attempted; string match only (trim+case-insensitive).
-      STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
-        const s=t.stations && t.stations[key];
-        if(!s || !s.time || !s.amount) return;
-        if(String(s.amount).trim().toLowerCase()!==String(officialUnit).trim().toLowerCase()) return;
-        out.push({date:t.date, value:s.time, source:"simulation"});
-      });
-      out.sort((a,b)=>b.date.localeCompare(a.date));
-    }
+  // doc12 §3 재검토: 이전에는 최근 공식 기록(<=21일)이 있으면 Simulation 후보 자체를 후보 목록에서
+  // 아예 배제했다 — 21일 이내 공식 기록이 있다는 이유만으로 그보다 더 최근의 좋은 Simulation 신호가
+  // 100% 차단되는 문제(TEST-04)였다. 이제는 항상 후보로 추가하고, 아래 recency 정렬이 실제로 더 최근인
+  // 쪽을 자연스럽게 선택하도록 한다 — 공식 기록을 무시하는 것도 아니고(더 최근이면 그대로 이김),
+  // Simulation을 무조건 차단하는 것도 아니다.
+  const stMeta=STATIONS.find(s=>s.key===key);
+  const officialUnit=stMeta?stMeta.unit:null;
+  if(officialUnit){
+    // spec: only counts when the performed amount EXACTLY matches the official station distance/reps
+    // (e.g. "50m" for Sled Push) — a half-distance rep is never blended into a full-distance benchmark.
+    // No unit conversion/estimation attempted; string match only (trim+case-insensitive).
+    STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+      const s=t.stations && t.stations[key];
+      if(!s || !s.time || !s.amount) return;
+      if(String(s.amount).trim().toLowerCase()!==String(officialUnit).trim().toLowerCase()) return;
+      out.push({date:t.date, value:s.time, source:"simulation"});
+    });
   }
+  out.sort((a,b)=>b.date.localeCompare(a.date));
   return out;
 }
 // average running pace (sec/km) from the unified training log within ±windowDays of centerDate
@@ -1604,7 +1613,116 @@ function getRecentActualCandidates(){
     .filter(r=>r.officialTime && daysBetween(r.date, todayISO())<=RECENT_ACTUAL_WINDOW_DAYS)
     .map(r=>({ value:parseTimeToSec(r.officialTime), date:r.date, ageDays:daysBetween(r.date, todayISO()) }));
 }
+
+/* ---------------------------------------------------------------------- */
+/* SIMULATION -> RACE-LEVEL ANCHOR (doc12 긴급 수정 요청)                    */
+/*   Previously a Simulation's own `totalTime` was NEVER consulted as a     */
+/*   race-level performance signal — only its individual Run/Station/      */
+/*   Transition splits fed the 17-segment model (buildRaceSegmentModel()). */
+/*   A Full Simulation with a genuinely fast totalTime but no (or partial)  */
+/*   segment breakdown therefore had ZERO effect on getBaselineTime()'s     */
+/*   Anchor. Below adds `getBestSimulationCandidate()` as an explicit,      */
+/*   confidence-scored race-level signal, and computeCurrentAnchor() now    */
+/*   blends it into whatever Anchor Step A/B/C/D would otherwise produce — */
+/*   never a full override (Simulation != official result, principle §7),  */
+/*   never fully ignored (the actual bug being fixed).                     */
+/* ---------------------------------------------------------------------- */
+const SIM_MIN_CONFIDENCE_FOR_ANCHOR = 0.35; // below this, Simulation still feeds 17-segment candidates
+                                             // (unchanged, existing mechanism) but is not trusted enough
+                                             // to move the race-level Anchor directly.
+const SIM_MAX_ANCHOR_WEIGHT = 0.5;          // hard cap — even a perfect-confidence Simulation never
+                                             // exceeds 50% blend weight, so Anchor never just "becomes"
+                                             // the Simulation time outright (forbidden by principle §3).
+const SIM_SLOWER_DAMPEN = 0.15;             // when the Simulation is SLOWER than the current Anchor,
+                                             // its pull is dampened hard — a single off-day Simulation
+                                             // should not meaningfully worsen the prediction (TEST-03).
+// Confidence factors (spec §4): type (Full>Half>Custom) × freshness (decays to 0 over the same
+// RECENT_ACTUAL_WINDOW_DAYS used for official actuals) × completeness (Run1-8 + Station×8 + Transition
+// filled — a Full Simulation with every segment filled gets the highest possible confidence, per spec).
+function simulationConfidence(sim){
+  const typeWeight = { full:1.0, half:0.65, custom:0.4 }[sim.type] || 0.4;
+  const runsFilled = RUN_KEYS.filter(k=>sim.runs && sim.runs[k] && sim.runs[k].time).length;
+  const stationsFilled = STATIONS.filter(s=>sim.stations && sim.stations[s.key] && sim.stations[s.key].time).length;
+  const transFilled = sim.transition ? 1 : 0;
+  const completeness = (runsFilled+stationsFilled+transFilled)/17;
+  const completenessFactor = 0.5 + completeness*0.5; // 0.5 (totalTime only) .. 1.0 (fully detailed)
+  const ageDays = daysBetween(sim.date, todayISO());
+  const freshness = clamp(1 - ageDays/RECENT_ACTUAL_WINDOW_DAYS, 0, 1);
+  return clamp(typeWeight*freshness*completenessFactor, 0, 1);
+}
+// Picks the single best-qualifying Simulation as a race-level candidate — highest confidence first,
+// most recent as tiebreaker. Only considers entries with a parseable totalTime, matching the current
+// profile's Division base, within the same recency window official actuals use.
+function getBestSimulationCandidate(){
+  const myDiv = currentProfileDivisionBase();
+  const cands = STATE.simulationTests
+    .filter(t=>divisionBase(t.division)===myDiv && t.totalTime)
+    .map(t=>{
+      const value=parseTimeToSec(t.totalTime);
+      if(value==null) return null;
+      const ageDays=daysBetween(t.date, todayISO());
+      if(ageDays>RECENT_ACTUAL_WINDOW_DAYS) return null;
+      return { value, date:t.date, ageDays, type:t.type, confidence:simulationConfidence(t) };
+    })
+    .filter(Boolean);
+  if(!cands.length) return null;
+  cands.sort((a,b)=> b.confidence-a.confidence || a.ageDays-b.ageDays);
+  return cands[0];
+}
+// Wraps whatever computeBaseAnchorWithoutSimulation() (Steps A/B/C/D, entirely unchanged logic) would
+// have returned, then blends in a qualifying Simulation. Asymmetric on purpose: a FASTER Simulation is
+// trusted up to SIM_MAX_ANCHOR_WEIGHT (a real improvement signal worth reflecting); a SLOWER Simulation
+// is trusted at only SIM_MAX_ANCHOR_WEIGHT×SIM_SLOWER_DAMPEN (present, but not allowed to needlessly
+// drag the prediction backward off one off-day session — TEST-03).
 function computeCurrentAnchor(hpiResult){
+  const base = computeBaseAnchorWithoutSimulation(hpiResult);
+  const simCandidate = getBestSimulationCandidate();
+  const simQualifies = !!(simCandidate && simCandidate.confidence>=SIM_MIN_CONFIDENCE_FOR_ANCHOR);
+
+  if(!base){
+    // D 이전 단계: 공식 기록도 Segment 모델도 전혀 없는 경우 — TEST-02: totalTime만 있는 Simulation도
+    // 최소한의 race-level 신호로는 반영되어야 한다.
+    if(simQualifies){
+      const result = { value:simCandidate.value, source:`Simulation 기록 (${simCandidate.type}, ${simCandidate.ageDays}일 전) — 공식대회/구간 데이터 없음`,
+        baselineHpiDate:simCandidate.date, recentActual:null, bestRecentActual:null, segmentEstimate:null,
+        protectionWeight:1, anchorNote:null, simulationEstimate:simCandidate, simulationUsed:true, simulationWeight:1 };
+      logPredictionDebug({ officialBaseline:null, simulationBaseline:simCandidate.value, segmentBaseline:null,
+        simulationUsed:true, simulationWeight:1, finalPrediction:result.value });
+      return result;
+    }
+    logPredictionDebug({ officialBaseline:null, simulationBaseline:simCandidate?simCandidate.value:null, segmentBaseline:null,
+      simulationUsed:false, simulationWeight:0, finalPrediction:null });
+    return null;
+  }
+  if(!simQualifies){
+    logPredictionDebug({ officialBaseline:base.recentActual?base.recentActual.value:(base.bestRecentActual?base.bestRecentActual.value:null),
+      simulationBaseline:simCandidate?simCandidate.value:null, segmentBaseline:base.segmentEstimate?base.segmentEstimate.value:null,
+      simulationUsed:false, simulationWeight:0, finalPrediction:base.value });
+    return { ...base, simulationEstimate:simCandidate||null, simulationUsed:false, simulationWeight:0 };
+  }
+  const isFaster = simCandidate.value<=base.value;
+  const rawWeight = clamp(simCandidate.confidence, 0, SIM_MAX_ANCHOR_WEIGHT);
+  const weight = isFaster ? rawWeight : rawWeight*SIM_SLOWER_DAMPEN;
+  const blendedValue = base.value*(1-weight) + simCandidate.value*weight;
+  const result = { ...base, value:blendedValue,
+    source: `${base.source} + Simulation(${simCandidate.type}, ${simCandidate.ageDays}일 전) 반영 ${Math.round(weight*100)}%`,
+    simulationEstimate:simCandidate, simulationUsed:true, simulationWeight:weight };
+  logPredictionDebug({ officialBaseline:base.recentActual?base.recentActual.value:(base.bestRecentActual?base.bestRecentActual.value:null),
+    simulationBaseline:simCandidate.value, segmentBaseline:base.segmentEstimate?base.segmentEstimate.value:null,
+    simulationUsed:true, simulationWeight:weight, finalPrediction:result.value });
+  return result;
+}
+// 요청 §6: 콘솔에서 Simulation이 실제로 prediction에 반영되었는지 즉시 확인 가능하도록.
+function logPredictionDebug(d){
+  try{
+    console.log(`[Prediction Debug]\nofficialBaseline: ${d.officialBaseline!=null?fmtTime(d.officialBaseline):"—"}`
+      + `\nsimulationBaseline: ${d.simulationBaseline!=null?fmtTime(d.simulationBaseline):"—"}`
+      + `\nsegmentBaseline: ${d.segmentBaseline!=null?fmtTime(d.segmentBaseline):"—"}`
+      + `\nsimulationUsed: ${d.simulationUsed}\nsimulationWeight: ${round1((d.simulationWeight||0)*100)}%`
+      + `\nfinalPrediction: ${d.finalPrediction!=null?fmtTime(d.finalPrediction):"—"}`);
+  }catch(e){ /* diagnostic only */ }
+}
+function computeBaseAnchorWithoutSimulation(hpiResult){
   const race = racesByDivision(STATE.profile.division)[0] || null;
   const recentActual = race && race.officialTime
     ? { value:parseTimeToSec(race.officialTime), date:race.date, ageDays:daysBetween(race.date, todayISO()) }
@@ -2119,39 +2237,33 @@ function transitionBenchmarkSec(){
 // divisionBase()/collectStationCandidates() above for the full rationale).
 function runLegCandidates(runIdx){
   const myDiv=currentProfileDivisionBase();
-  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv).sort((a,b)=>b.date.localeCompare(a.date))
+  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv)
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.runs?.[runIdx]), source:"race" }))
     .filter(c=>c.sec!=null);
-  const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
-  if(!officialFresh){
-    STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
-      const r=t.runs && t.runs[runIdx];
-      if(!r || !r.time || r.distanceM==null || r.distanceM<=0) return; // never guess a missing distance
-      const timeSec=parseTimeToSec(r.time);
-      if(!timeSec) return;
-      out.push({ date:t.date, sec:(timeSec/r.distanceM)*1000, source:"simulation" });
-    });
-    out.sort((a,b)=>b.date.localeCompare(a.date));
-  }
+  // doc12 §3: 더 이상 "최근 공식 기록<=21일" 이유만으로 Simulation 후보를 배제하지 않음 — 항상 추가하고
+  // recency 정렬로 실제 더 최근인 쪽이 자연스럽게 선택되도록 함 (collectStationCandidates와 동일 원칙).
+  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+    const r=t.runs && t.runs[runIdx];
+    if(!r || !r.time || r.distanceM==null || r.distanceM<=0) return; // never guess a missing distance
+    const timeSec=parseTimeToSec(r.time);
+    if(!timeSec) return;
+    out.push({ date:t.date, sec:(timeSec/r.distanceM)*1000, source:"simulation" });
+  });
+  out.sort((a,b)=>b.date.localeCompare(a.date));
   return out;
 }
 function transitionCandidates(){
   const myDiv=currentProfileDivisionBase();
-  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv).sort((a,b)=>b.date.localeCompare(a.date))
+  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv)
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.transition), source:"race" }))
     .filter(c=>c.sec!=null);
-  const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
-  if(!officialFresh){
-    STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
-      if(!t.transition) return;
-      const sec=parseTimeToSec(t.transition);
-      if(!sec) return;
-      out.push({ date:t.date, sec, source:"simulation" });
-    });
-    out.sort((a,b)=>b.date.localeCompare(a.date));
-  }
+  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+    if(!t.transition) return;
+    const sec=parseTimeToSec(t.transition);
+    if(!sec) return;
+    out.push({ date:t.date, sec, source:"simulation" });
+  });
+  out.sort((a,b)=>b.date.localeCompare(a.date));
   return out;
 }
 
@@ -5893,6 +6005,48 @@ async function fetchPodiumDivisionRowsFromSupabase(division){
   }
   return rows;
 }
+// [포디움 기준 재설계 — "전체 DB 상위 3명" 버그 수정]
+// 이전 로직은 Gender+Division+AgeGroup으로 필터한 뒤, 그 전체 풀(pool)에서 가장 빠른 3명을 그대로
+// "포디움 기준"으로 사용했다 — 이는 사실상 해당 조건의 "세계 최상위 3명"이지, "실제 대회에서 포디움에
+//드는 데 필요한 기준"이 아니다. 아래는 이벤트(대회)별로 실제 3위 기록을 먼저 추출하고, 그 분포의
+// median(또는 지정 percentile)을 최종 기준으로 삼는다 — 특정 대회 하나의 극단적으로 빠른 기록 때문에
+// 기준이 지나치게 낮아지는 것도 방지된다.
+const PODIUM_MIN_EVENT_FINISHERS = 3; // an event needs >=3 valid finishers to have a real 3rd place
+const PODIUM_MIN_EVENTS_FOR_TIER = 1; // >=1 qualifying event required before a tier is usable at all
+function computeEventPodiums(rows){
+  const byEvent=new Map();
+  rows.forEach(r=>{
+    const key=(r.event||"").trim();
+    if(!key) return; // no event label — can't attribute to a specific race, excluded from event-level analysis
+    if(!byEvent.has(key)) byEvent.set(key, []);
+    byEvent.get(key).push(r);
+  });
+  const podiums=[];
+  byEvent.forEach((list,eventKey)=>{
+    if(list.length<PODIUM_MIN_EVENT_FINISHERS) return; // no real 3rd place to extract
+    const sorted=[...list].sort((a,b)=>a.overall_time-b.overall_time);
+    podiums.push({ event:eventKey, n:list.length,
+      first:sorted[0].overall_time, second:sorted[1].overall_time, third:sorted[2].overall_time,
+      thirdRow:sorted[2] });
+  });
+  return podiums;
+}
+// method: "median" (default, spec §8) or "p25" (stricter — closer to a harder podium bar)
+function buildPodiumBenchmarkFromEventPodiums(eventPodiums, method){
+  if(!eventPodiums.length) return null;
+  const firsts=eventPodiums.map(e=>e.first), seconds=eventPodiums.map(e=>e.second), thirds=eventPodiums.map(e=>e.third);
+  const stat = method==="p25" ? (arr=>percentileOf(arr,0.25)) : medianOf;
+  const cutoff = stat(thirds);
+  // gap-decomposition needs one REAL row's actual segment splits — pick whichever event's real 3rd-place
+  // row sits closest to the computed statistical cutoff, as the best available real representative.
+  const repEvent = eventPodiums.reduce((best,e)=> Math.abs(e.third-cutoff)<Math.abs(best.third-cutoff) ? e : best, eventPodiums[0]);
+  return {
+    podium:[stat(firsts), stat(seconds), cutoff], podiumRows:[null,null,repEvent.thirdRow],
+    method, distribution:{ min:Math.min(...thirds), p25:percentileOf(thirds,0.25), median:medianOf(thirds), p75:percentileOf(thirds,0.75), max:Math.max(...thirds) },
+    eventCount:eventPodiums.length, totalRiders:eventPodiums.reduce((s,e)=>s+e.n,0),
+    events:eventPodiums.map(e=>({event:e.event, n:e.n, third:e.third})).sort((a,b)=>a.third-b.third),
+  };
+}
 async function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
   let sourceRows = null; // will hold division-scoped, hyroxDbRowToExternal-converted rows
   let rawFetchedCount = null, convertedCount = null, usedLiveQuery = false;
@@ -5905,52 +6059,80 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
       convertedCount = sourceRows.length;
       usedLiveQuery = true;
     }catch(e){
-      console.warn("[Podium Pipeline Debug] Supabase 직접 query 실패 — 로컬 EXTERNAL_RACE_DB로 폴백:", e?.message||e);
+      console.warn("[Podium Trace] Supabase 직접 query 실패 — 로컬 EXTERNAL_RACE_DB로 폴백:", e?.message||e);
     }
   }
   if(!sourceRows){
     sourceRows = EXTERNAL_RACE_DB.filter(r=>r.division===division); // offline/폴백 경로
     rawFetchedCount = convertedCount = sourceRows.length;
   }
+  console.log(`[Podium Trace]\nrequested:\ngender = ${gender}\ndivision = ${division}\nageGroup = ${ageGroup}`
+    + `\n\ncandidate filter:\ngender = ${gender}\ndivision = ${division}\nageGroup = ${ageGroup}`
+    + `\n\nSupabase raw rows fetched: ${rawFetchedCount}${usedLiveQuery?` (division="${division}" 직접 query — cross-division 혼합 없음)`:` (로컬 캐시 폴백)`}`
+    + `\nhyroxDbRowToExternal() 변환 성공 rows: ${convertedCount}`);
 
   const genderRows = sourceRows.filter(r=>r.gender===gender);
-  const ageRows = genderRows.filter(r=>r.age_group===ageGroup);
-  const validTimeRows = ageRows.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
 
-  console.log(`[Podium Pipeline Debug]`
-    + `\n1. Supabase raw rows fetched: ${rawFetchedCount}${usedLiveQuery?` (division="${division}" 직접 query)`:` (로컬 캐시 폴백)`}`
-    + `\n2. hyroxDbRowToExternal() 변환 성공 rows: ${convertedCount}`
-    + `\n3. EXTERNAL_RACE_DB 저장 rows(참고, division 스코프): ${sourceRows.length}`
-    + `\n4. gender=${gender} rows: ${genderRows.length}`
-    + `\n5. division=${division} rows: ${sourceRows.length}`
-    + `\n6. age_group=${ageGroup} rows: ${ageRows.length}`
-    + `\n7. 유효 total_time rows (analysis_valid && overall_time!=null): ${validTimeRows.length}`);
-
-  const base = validTimeRows;
-  let result;
+  // Tier 0: 사용자가 목표로 지정한 특정 대회(eventName) 자체의 실제 3위 — 별도 통계 없이 그 대회 실제값 그대로.
   if(eventName){
-    const withEvent = base.filter(r=>r.event && r.event.trim().toLowerCase()===eventName.trim().toLowerCase());
-    if(withEvent.length>=PODIUM_MIN_SAMPLE) result = { rows:withEvent, scope:"event", n:withEvent.length };
+    const ageFiltered = genderRows.filter(r=>r.age_group===ageGroup);
+    const validRows = ageFiltered.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
+    const evRows = validRows.filter(r=>r.event && r.event.trim().toLowerCase()===eventName.trim().toLowerCase());
+    if(evRows.length>=PODIUM_MIN_EVENT_FINISHERS){
+      const sorted=[...evRows].sort((a,b)=>a.overall_time-b.overall_time);
+      const built = { podium:[sorted[0].overall_time, sorted[1].overall_time, sorted[2].overall_time],
+        podiumRows:[sorted[0], sorted[1], sorted[2]], method:"single-event-actual", eventCount:1, totalRiders:evRows.length,
+        events:[{event:eventName, n:evRows.length, third:sorted[2].overall_time}],
+        distribution:{ min:sorted[2].overall_time, p25:sorted[2].overall_time, median:sorted[2].overall_time, p75:sorted[2].overall_time, max:sorted[2].overall_time } };
+      const result = { ...built, scope:"event", n:validRows.length, division, gender, ageGroup,
+        sourceDivision:division, tier:"REQUESTED_EVENT_ACTUAL", ageGroupUsed:ageGroup };
+      logPodiumTrace(result, validRows.length);
+      return result;
+    }
   }
-  if(!result){
-    result = base.length>=PODIUM_MIN_SAMPLE ? { rows:base, scope:"division-gender-age", n:base.length }
-      : { rows:base, scope:"insufficient", n:base.length };
+
+  // Tier 1: Gender + Division + AgeGroup — 이벤트별 실제 3위 분포 (요청 §1~8의 핵심 로직).
+  const ageRows = genderRows.filter(r=>r.age_group===ageGroup);
+  const validRowsT1 = ageRows.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
+  const eventPodiumsT1 = computeEventPodiums(validRowsT1);
+  let chosen=null;
+  if(eventPodiumsT1.length>=PODIUM_MIN_EVENTS_FOR_TIER){
+    chosen = { tier:"ASIA_EVENT_PODIUM_GENDER_DIVISION_AGE", ageGroupUsed:ageGroup, validRows:validRowsT1, eventPodiums:eventPodiumsT1 };
   }
-  result.division=division; result.gender=gender; result.ageGroup=ageGroup;
-  console.log(`[Podium Pipeline Debug] 8. computePodiumComparisonGroup() 입력 rows: ${base.length}`
-    + `\n9. 최종 podium comparison rows: ${result.n} (scope=${result.scope})`);
-  if(result.rows && result.rows.length){
-    const top3 = [...result.rows].sort((a,b)=>a.overall_time-b.overall_time).slice(0,3);
-    console.log(`[Podium DB Top 3]\n${top3.map((r,i)=>`${i+1}. ${fmtTime(r.overall_time)}`).join("\n")}`);
+  // Tier 2: AgeGroup만 완화 (Gender+Division은 절대 유지 — division 간 혼합 금지, 요청 명시사항).
+  let validRowsT2=null, eventPodiumsT2=null;
+  if(!chosen){
+    validRowsT2 = genderRows.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
+    eventPodiumsT2 = computeEventPodiums(validRowsT2);
+    if(eventPodiumsT2.length>=PODIUM_MIN_EVENTS_FOR_TIER){
+      chosen = { tier:"ASIA_EVENT_PODIUM_GENDER_DIVISION_ONLY", ageGroupUsed:null, validRows:validRowsT2, eventPodiums:eventPodiumsT2 };
+    }
   }
+  if(!chosen){
+    const result = { scope:"insufficient", n:(validRowsT2||validRowsT1).length, division, gender, ageGroup,
+      podium:null, podiumRows:null, sourceDivision:division, tier:"INSUFFICIENT", ageGroupUsed:ageGroup,
+      eventCount:0, totalRiders:0, events:[], distribution:null, method:null };
+    logPodiumTrace(result, result.n);
+    return result;
+  }
+  const built = buildPodiumBenchmarkFromEventPodiums(chosen.eventPodiums, "median");
+  const result = { ...built, scope:"division-gender-age", n:chosen.validRows.length, division, gender, ageGroup,
+    sourceDivision:division, tier:chosen.tier, ageGroupUsed:chosen.ageGroupUsed };
+  logPodiumTrace(result, chosen.validRows.length);
   return result;
 }
+function logPodiumTrace(result, validRowCount){
+  console.log(`[Podium Trace]\nvalid rows = ${validRowCount}`
+    + `\n\nevents = ${result.eventCount||0}`
+    + `\n\nevent podium rows = ${result.totalRiders||0}`
+    + `\n\nfallback tier = ${result.tier}${result.ageGroupUsed===null && result.tier!=="INSUFFICIENT" ? " (Age Group 완화됨 — Gender+Division만 유지)" : ""}`
+    + (result.distribution ? `\n\npodium 3rd distribution:\nmin = ${fmtTime(result.distribution.min)}\nP25 = ${fmtTime(result.distribution.p25)}\nmedian = ${fmtTime(result.distribution.median)}\nP75 = ${fmtTime(result.distribution.p75)}\nmax = ${fmtTime(result.distribution.max)}` : "\n\npodium 3rd distribution: (없음 — insufficient)")
+    + `\n\nfinal podium benchmark = ${result.podium ? fmtTime(result.podium[2]) : "—"}`
+    + `\n\nsource division = ${result.sourceDivision}`
+    + (result.events && result.events.length ? `\n\nevents used:\n${result.events.map(e=>`- ${e.event} (n=${e.n}, 3rd=${fmtTime(e.third)})`).join("\n")}` : ""));
+}
 async function computePodiumBenchmark(eventName, division, gender, ageGroup){
-  const group = await computePodiumComparisonGroup(eventName, division, gender, ageGroup);
-  if(group.scope==="insufficient") return { ...group, podium:null, podiumRows:null };
-  const sorted=[...group.rows].sort((a,b)=>a.overall_time-b.overall_time);
-  const top3rows = sorted.slice(0,3);
-  return { ...group, podium: top3rows.map(r=>r.overall_time), podiumRows: top3rows }; // [1st,2nd,3rd]
+  return await computePodiumComparisonGroup(eventName, division, gender, ageGroup);
 }
 // doc9 §25: Podium Gap decomposition into per-segment seconds — ONLY when the specific comparison
 // record (the actual 3rd-place row from EXTERNAL_RACE_DB) has its own real segment splits, which not
@@ -6015,7 +6197,7 @@ async function computePodiumAnalysis(){
   const dnaConsistencyFlags = checkDnaMatrixConsistency(peer);
   const dnaWeaknessRank = getDnaWeaknessRanking(3);
   const goalDiv = p.goalDivision || p.division;
-  const genderStr = p.gender==="female" ? "female":"male";
+  const genderStr = (p.goalGender || p.gender)==="female" ? "female":"male";
   const ageGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
   const eventName = (p.targetEventName||"").trim();
   const benchmark = await computePodiumBenchmark(eventName, goalDiv, genderStr, ageGroup);
@@ -7306,7 +7488,7 @@ function renderMyGoalPage(wrap){
   const p=STATE.profile;
   const effectiveGoalDiv = p.goalDivision || p.division;
   const effectiveGoalAgeGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
-  const canCompute = !!p.targetDate;
+  const effectiveGoalGender = p.goalGender || p.gender || "male";
   const hasRace = !!(racesByDivision(STATE.profile.division)[0]);
   wrap.innerHTML = `
     <div><div class="eyebrow">MY NEXT RACE</div><h1 class="page-title">목표</h1></div>
@@ -7322,30 +7504,55 @@ function renderMyGoalPage(wrap){
     <div class="card">
       <div class="field"><label>목표 대회명 / 지역</label><input id="mg-event" placeholder="예: HYROX Seoul" value="${escapeHtml(p.targetEventName)}"></div>
       <div class="field" style="margin-top:10px;"><label>날짜 (YYYY-MM-DD)</label><input id="mg-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="2026-10-18" value="${escapeHtml(p.targetDate)}"></div>
+      <div class="field" style="margin-top:10px;"><label>성별</label><select id="mg-gender"><option value="male" ${effectiveGoalGender==="male"?"selected":""}>남성</option><option value="female" ${effectiveGoalGender==="female"?"selected":""}>여성</option></select></div>
       <div class="field" style="margin-top:10px;"><label>Division</label><select id="mg-div">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select></div>
       <div class="field" style="margin-top:10px;"><label>Age Group</label><select id="mg-agegroup">${AGE_GROUPS.map(a=>`<option value="${a}" ${effectiveGoalAgeGroup===a?"selected":""}>${a}</option>`).join("")}</select></div>
       <p class="reason-line" style="margin-top:4px;">${p.age? `선수 프로필의 나이(${p.age}세) 기준으로 자동 선택되어 있습니다 — 필요하면 직접 바꿀 수 있습니다.` : "선수 프로필에 나이를 입력하면 자동으로 선택됩니다 — 지금은 직접 선택해주세요."}</p>
       <div style="margin-top:12px;"><button class="btn sm secondary" id="mg-save">저장</button></div>
     </div>
 
-    <button class="btn" id="mg-podium-btn" style="width:100%;justify-content:center;font-size:15px;padding:16px;" ${canCompute?"":"disabled"}>🏆 나의 포디움 가능성은?</button>
-    ${!canCompute? `<p class="reason-line" style="text-align:center;margin-top:8px;">목표 날짜를 입력하고 저장하면 계산할 수 있습니다</p>` : ""}
+    <button class="btn" id="mg-podium-btn" style="width:100%;justify-content:center;font-size:15px;padding:16px;">🏆 나의 포디움 가능성은?</button>
+    <p class="reason-line" style="text-align:center;margin-top:8px;">목표 날짜만 입력하면 저장 없이 바로 조회됩니다</p>
 
     <div id="mg-podium-result"></div>
   `;
-  wrap.querySelector("#mygoal-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
-  wrap.querySelector("#mg-save").addEventListener("click",()=>{
+  // 입력 필드 -> STATE.profile 반영 (저장 버튼과 포디움 버튼이 공유하는 로직 — 요청에 따라 저장을
+  // 누르지 않아도 포디움 버튼 클릭만으로 최신 입력값이 즉시 반영/계산되도록 함)
+  function applyGoalFieldsToProfile(){
     STATE.profile.targetEventName=wrap.querySelector("#mg-event").value.trim();
     STATE.profile.targetDate=wrap.querySelector("#mg-date").value.trim();
+    const genderSel=wrap.querySelector("#mg-gender").value;
+    STATE.profile.goalGender = genderSel===STATE.profile.gender ? "" : genderSel;
     const divSel=wrap.querySelector("#mg-div").value;
     STATE.profile.goalDivision = divSel===STATE.profile.division ? "" : divSel;
     const ageSel=wrap.querySelector("#mg-agegroup").value;
     STATE.profile.goalAgeGroup = ageSel===getAgeGroup(Number(STATE.profile.age)) ? "" : ageSel;
+  }
+  wrap.querySelector("#mygoal-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
+  wrap.querySelector("#mg-save").addEventListener("click",()=>{
+    applyGoalFieldsToProfile();
     persist(); showToast("목표가 저장되었습니다"); PODIUM_SHOWN=false; renderAll();
   });
   wrap.querySelector("#mg-podium-btn")?.addEventListener("click",async()=>{
+    applyGoalFieldsToProfile();
+    persist();
+    if(!STATE.profile.targetDate){
+      showToast("목표 날짜를 먼저 입력해주세요");
+      return;
+    }
     const el=wrap.querySelector("#mg-podium-result");
-    if(el) el.innerHTML=`<div class="card" style="margin-top:14px;"><p class="reason-line">실제 참가자 데이터를 조회하는 중…</p></div>`;
+    if(el) el.innerHTML=`
+      <div class="card" style="margin-top:14px;text-align:center;padding:28px 20px;">
+        <div class="hps-podium-spinner"></div>
+        <p style="font-size:16px;font-weight:700;margin-top:16px;">실제 참가자 데이터를 조회하는 중…</p>
+        <p class="reason-line" style="margin-top:6px;">동일 Division · 성별 · 연령대 기록을 비교하고 있어요</p>
+      </div>
+      <style>
+        .hps-podium-spinner{width:40px;height:40px;margin:0 auto;border-radius:50%;
+          border:4px solid var(--surface2);border-top-color:var(--orange);
+          animation:hpsPodiumSpin 0.8s linear infinite;}
+        @keyframes hpsPodiumSpin{to{transform:rotate(360deg);}}
+      </style>`;
     PODIUM_SHOWN = true;
     try{
       PODIUM_RESULT = await computePodiumAnalysis();
@@ -7404,20 +7611,13 @@ function renderMyGoalPodiumResult(wrap){
           <div style="font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:3px;color:${gapPositive?'var(--red)':'var(--green)'};">${gapPositive?"+":"-"}${fmtTime(Math.abs(r.gapSec))}</div>
         </div>
       </div>
-      <div class="row-between" style="padding:8px 0 0;margin-top:10px;border-top:1px solid var(--line);">
-        <span style="font-size:11.5px;color:var(--gray);">안정적인 목표</span><span class="mono" style="font-size:13px;font-weight:700;color:var(--green);">${fmtTime(r.safeTarget)}</span>
-      </div>
       ${r.dnaScore ? `<p class="reason-line" style="margin-top:8px;">DNA Race Score는 Run 1~8·Station·Transition 각 구간의 동일 그룹 percentile을 <b>실제 소요 시간 비중으로 가중 평균</b>한 값입니다 (단순 평균 아님) — 위 예상 기록에는 이미 실제 기록·최근 Simulation·ASIA/Global 벤치마크가 반영되어 있고, 이 점수는 그 근거를 요약해서 보여드리는 것입니다.</p>` : ""}
-      ${r.dnaConsistencyFlags && r.dnaConsistencyFlags.length ? `<div style="margin-top:10px;padding:9px 11px;background:var(--surface2);border-radius:8px;">
-        <div style="font-size:11.5px;font-weight:700;color:var(--amber);">⚠ Benchmark 소스 확인 필요</div>
-        ${r.dnaConsistencyFlags.map(f=>`<div class="reason-line" style="margin-top:3px;">${escapeHtml(f.label)}: DNA ${f.dnaPercentile}% vs GLOBAL MATRIX ${f.matrixPercentile}% (차이 ${f.diff}%p, 현재 DNA 소스: ${escapeHtml(f.dnaSource||"—")})</div>`).join("")}
-      </div>` : ""}
     </div>
 
     <div class="divider" style="margin:0;"></div>
     ${r.gapDecomposition ? `<div style="padding:18px 20px;">
       <div class="eyebrow gray" style="margin-bottom:10px;">GAP 구간별 분해</div>
-      <p class="reason-line" style="margin-bottom:8px;">동일 조건 3위 기록의 실제 구간 splits와 비교 (일치 구간 ${round1(r.gapDecomposition.coverage*100)}%)</p>
+      <p class="reason-line" style="margin-bottom:8px;">동일 조건 3위 기록의 실제 구간 splits와 비교</p>
       ${r.gapDecomposition.rows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
         <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("")}
       ${Math.abs(r.gapDecomposition.unaccountedGap)>=1 ? `<div class="row-between" style="padding:4px 0;color:var(--gray-dim);"><span style="font-size:12.5px;">기타 (측정 방식 차이 등)</span><span class="mono" style="font-size:12.5px;">${r.gapDecomposition.unaccountedGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.unaccountedGap))}</span></div>` : ""}
@@ -7439,18 +7639,40 @@ function renderMyGoalPodiumResult(wrap){
 
     <div class="divider" style="margin:0;"></div>
     <div style="padding:18px 20px;">
-      <div class="eyebrow gray" style="margin-bottom:10px;">포디움 기준 기록</div>
+      <div class="eyebrow gray" style="margin-bottom:10px;">포디움에 가고 싶다면!</div>
       ${podium.map((t,i)=>`<div class="row-between" style="padding:6px 0;"><span style="font-size:13.5px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
       <div class="divider" style="margin:12px 0;"></div>
-      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='female'?'Female':'Male', r.benchmark.division, r.benchmark.ageGroup].filter(Boolean).join(' · '))}</span></div>
-      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">데이터</span><span style="font-size:12.5px;font-weight:600;">${r.benchmark.scope==='event' ? `${escapeHtml(r.eventName||'해당 대회')} · ${r.benchmark.n.toLocaleString()}명` : `전체 · ${r.benchmark.n.toLocaleString()}명`}</span></div>
+      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='female'?'Female':'Male', r.benchmark.division, r.benchmark.ageGroupUsed||r.benchmark.ageGroup].filter(Boolean).join(' · '))}${r.benchmark.ageGroupUsed==null?` <span style="color:var(--amber);">(연령대 완화됨)</span>`:""}</span></div>
+      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">데이터</span><span style="font-size:12.5px;font-weight:600;">${r.benchmark.scope==='event' ? `${escapeHtml(r.eventName||'해당 대회')} · ${r.benchmark.n.toLocaleString()}명` : `Asia 전체 · ${r.benchmark.n.toLocaleString()}명`}</span></div>
+      <details style="margin-top:10px;">
+        <summary style="cursor:pointer;font-size:11.5px;color:var(--gray-dim);">📊 산출 근거 자세히 보기 (관리자/디버그용)</summary>
+        <div style="margin-top:8px;padding:10px 12px;background:var(--surface2);border-radius:8px;font-size:12px;line-height:1.7;">
+          <div>적용 Gender: <b>${r.benchmark.gender==='female'?'Female':'Male'}</b></div>
+          <div>적용 Division: <b>${escapeHtml(r.benchmark.division)}</b></div>
+          <div>적용 Age Group: <b>${r.benchmark.ageGroupUsed || "(완화됨 — Gender+Division만 적용)"}</b></div>
+          <div>분석 대상 대회 수: <b>${r.benchmark.eventCount ?? 0}개</b></div>
+          <div>분석 대상 총 인원(유효): <b>${(r.benchmark.n||0).toLocaleString()}명</b></div>
+          <div>대회별 3위 기록 수: <b>${r.benchmark.eventCount ?? 0}건</b></div>
+          <div>기준 산출 방식: <b>${{"median":"대회별 3위 median","p25":"대회별 3위 P25","single-event-actual":"목표 대회 실제 3위"}[r.benchmark.method] || r.benchmark.method || "—"}</b></div>
+          <div>최종 포디움 기준(3위): <b>${fmtTime(r.benchmark.podium[2])}</b></div>
+          <div>Source Division: <b>${escapeHtml(r.benchmark.sourceDivision||r.benchmark.division)}</b></div>
+          <div>Tier: <b>${escapeHtml(r.benchmark.tier||"—")}</b></div>
+          ${r.benchmark.distribution ? `<div style="margin-top:4px;">3위 기록 분포: min ${fmtTime(r.benchmark.distribution.min)} · P25 ${fmtTime(r.benchmark.distribution.p25)} · median ${fmtTime(r.benchmark.distribution.median)} · P75 ${fmtTime(r.benchmark.distribution.p75)} · max ${fmtTime(r.benchmark.distribution.max)}</div>`:""}
+          ${r.benchmark.events && r.benchmark.events.length ? `<div style="margin-top:6px;">사용된 대회 목록:<br>${r.benchmark.events.map(e=>`· ${escapeHtml(e.event)} (n=${e.n}, 3위=${fmtTime(e.third)})`).join("<br>")}</div>` : ""}
+        </div>
+      </details>
     </div>
 
     <div class="divider" style="margin:0;"></div>
     <div style="padding:14px 20px 18px;">
       <div class="row-between"><span style="font-size:12px;color:var(--gray);">신뢰도</span><span class="badge ${r.overallConfidence==='HIGH'?'elite':r.overallConfidence==='MEDIUM'?'med':'crit'}">${r.overallConfidence}</span></div>
     </div>
+    <div class="divider" style="margin:0;"></div>
+    <div style="padding:14px 20px 18px;">
+      <button class="btn sm secondary" id="mg-goto-prediction" style="width:100%;justify-content:center;">기록 예측 보러가기</button>
+    </div>
   </div>`;
+  el.querySelector("#mg-goto-prediction")?.addEventListener("click",()=>{ CURRENT_PAGE="prediction"; renderAll(); });
 }
 
 /* ---------------------------------------------------------------------- */
@@ -10480,6 +10702,7 @@ function renderPrediction(wrap){
       ${p0.baseline.recentActual? `<div class="kv"><span class="k">Recent Actual</span><span class="v">${fmtTime(p0.baseline.recentActual.value)} (${p0.baseline.recentActual.ageDays}일 전)</span></div>` : ""}
       ${p0.baseline.bestRecentActual? `<div class="kv"><span class="k">Best Recent Actual</span><span class="v">${fmtTime(p0.baseline.bestRecentActual.value)} (${p0.baseline.bestRecentActual.ageDays}일 전, ${RECENT_ACTUAL_WINDOW_DAYS}일 이내 최고 기록)</span></div>` : ""}
       ${p0.baseline.segmentEstimate? `<div class="kv"><span class="k">Segment Estimate</span><span class="v">${fmtTime(p0.baseline.segmentEstimate.value)}</span></div>` : ""}
+      ${p0.baseline.simulationEstimate? `<div class="kv"><span class="k">Simulation</span><span class="v">${fmtTime(p0.baseline.simulationEstimate.value)} (${p0.baseline.simulationEstimate.type}, ${p0.baseline.simulationEstimate.ageDays}일 전${p0.baseline.simulationUsed?`, 반영 ${Math.round(p0.baseline.simulationWeight*100)}%`:", 신뢰도 낮아 미반영"})</span></div>` : ""}
       <div class="kv"><span class="k">Current Anchor</span><span class="v">${fmtTime(p0.baseline.value)}</span></div>
       ${p0.baseline.anchorNote? `<div class="reason-line" style="margin-top:2px;color:var(--amber);">${escapeHtml(p0.baseline.anchorNote)}</div>` : ""}
       <div class="kv"><span class="k">HPI</span><span class="v">${round1(hpiResult.hpi)}</span></div>
