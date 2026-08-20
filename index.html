@@ -10,7 +10,7 @@
   // HPS build cache-buster.
   // A new build version forces Safari/GitHub Pages to request this HTML again.
   (function(){
-    var HPS_BUILD_VERSION = "20260820-division-fix-01";
+    var HPS_BUILD_VERSION = "20260820-division-fix-02";
     try {
       var url = new URL(window.location.href);
       if (url.searchParams.get("hpsv") !== HPS_BUILD_VERSION) {
@@ -780,18 +780,28 @@ function currentPredictionDivision(){
 function currentProfileDivisionBase(){
   return divisionBase(currentPredictionDivision()) || "Open";
 }
+function withExactPredictionContext(division, fn){
+  const prevOverride = PREDICTION_DIVISION_OVERRIDE;
+  const target = division || STATE.profile.division || "Open";
+  PREDICTION_DIVISION_OVERRIDE = target;
+  try{
+    return withDivisionContext(target, fn);
+  } finally {
+    PREDICTION_DIVISION_OVERRIDE = prevOverride;
+  }
+}
 // spec (Simulation -> 17-segment connection): official race/manual-test data ALWAYS wins outright
 // when it's fresh (<=STATION_STALE_DAYS, same existing constant used everywhere else in this file —
 // no new threshold). Simulation only ever supplements when official data for that specific segment is
 // either MISSING or STALE. For zero-simulation users this is a no-op — the simulation forEach loops
 // over an empty array, so `out`/candidate list is byte-identical to the pre-existing behavior.
-// Division-aware (spec): both the official Race candidates AND the Simulation candidates are first
-// filtered to the CURRENT profile's Division base (Open vs Pro) — an Open race/simulation is never
-// used as evidence for a Pro athlete's segment, or vice versa. Quick Test (STATE.stationTests) has no
+// Division-aware: normal HPI uses the base division; exact race prediction sets
+// PREDICTION_DIVISION_OVERRIDE and then ALL race/simulation candidates are filtered by the exact
+// selected race Division. This prevents Open/Open Doubles and Pro/Pro Doubles leakage. Quick Test (STATE.stationTests) has no
 // Division concept in its data model and is intentionally left unfiltered (out of scope for this
 // change — flagged in the implementation report, not silently assumed).
 function collectStationCandidates(key){
-  const myDiv=currentProfileDivisionBase();
+  const myDiv=PREDICTION_DIVISION_OVERRIDE ? currentPredictionDivision() : currentProfileDivisionBase();
   const out=[];
   STATE.stationTests.forEach(t=>{ const v=t.values&&t.values[key]; if(v) out.push({date:t.date, value:v, source:"test"}); });
   STATE.races.filter(r=>{
@@ -1666,10 +1676,10 @@ function simulationConfidence(sim){
   return clamp(typeWeight*freshness*completenessFactor, 0, 1);
 }
 // Picks the single best-qualifying Simulation as a race-level candidate — highest confidence first,
-// most recent as tiebreaker. Only considers entries with a parseable totalTime, matching the current
-// profile's Division base, within the same recency window official actuals use.
+// most recent as tiebreaker. During exact race prediction it is scoped to the exact selected Division;
+// otherwise it retains the base-division behavior used by the HPI model.
 function getBestSimulationCandidate(){
-  const myDiv = currentProfileDivisionBase();
+  const myDiv = PREDICTION_DIVISION_OVERRIDE ? currentPredictionDivision() : currentProfileDivisionBase();
   const cands = STATE.simulationTests
     .filter(t=>divisionBase(t.division)===myDiv && t.totalTime)
     .map(t=>{
@@ -2251,7 +2261,7 @@ function transitionBenchmarkSec(){
 // Division-aware: races/simulations are filtered to the current profile's Division base first (see
 // divisionBase()/collectStationCandidates() above for the full rationale).
 function runLegCandidates(runIdx){
-  const myDiv=currentProfileDivisionBase();
+  const myDiv=PREDICTION_DIVISION_OVERRIDE ? currentPredictionDivision() : currentProfileDivisionBase();
   const out=[...STATE.races].filter(r=>{
     return PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv;
   })
@@ -2272,7 +2282,7 @@ function runLegCandidates(runIdx){
   return out;
 }
 function transitionCandidates(){
-  const myDiv=currentProfileDivisionBase();
+  const myDiv=PREDICTION_DIVISION_OVERRIDE ? currentPredictionDivision() : currentProfileDivisionBase();
   const out=[...STATE.races].filter(r=>{
     return PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv;
   })
@@ -2300,9 +2310,9 @@ function transitionCandidates(){
 // from their own paired history only. Never a universal constant, never used with fewer than 2 pairs.
 const TENK_PAIR_WINDOW_DAYS = 45;
 function computePersonalRunToTenKRatio(){
-  const myDiv=currentProfileDivisionBase();
+  const myDiv=PREDICTION_DIVISION_OVERRIDE ? currentPredictionDivision() : currentProfileDivisionBase();
   const runEvents=[];
-  [...STATE.races].filter(r=>divisionBase(r.division)===myDiv).forEach(r=>{
+  [...STATE.races].filter(r=>PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv).forEach(r=>{
     const legs=RUN_KEYS.map(k=>parseTimeToSec(r.runs?.[k])).filter(v=>v!=null);
     if(legs.length) runEvents.push({ date:r.date, paceSecKm: mean(legs) });
   });
@@ -2484,7 +2494,7 @@ function computeGoalScenarios(){
   // pSafe/pReal/pChallenge silently stayed on STATE.profile.division, so Open Doubles and
   // Pro Doubles could show the same 8-week milestone even when their current baselines differed.
   const goalDivForScenario = STATE.profile.goalDivision || STATE.profile.division;
-  const predictGoalScenario = (weeks)=>withDivisionContext(goalDivForScenario, ()=>predictTime(calcHPI(), weeks));
+  const predictGoalScenario = (weeks)=>withExactPredictionContext(goalDivForScenario, ()=>predictTime(calcHPI(), weeks));
   const pSafe=predictGoalScenario(wSafe), pReal=predictGoalScenario(wReal), pChallenge=predictGoalScenario(wChallenge);
   const goalAwareNow=getGoalAwareBaseline(hpiResult);
   const currentSec=goalAwareNow.value;
@@ -2561,7 +2571,7 @@ function computeGoalPlan(){
   const goalDivForMilestone = STATE.profile.goalDivision || STATE.profile.division;
   const milestones=[4,8,12].map(w=>({
     weeks:w,
-    predicted:withDivisionContext(goalDivForMilestone, ()=>predictTime(calcHPI(),w)).predicted
+    predicted:withExactPredictionContext(goalDivForMilestone, ()=>predictTime(calcHPI(),w)).predicted
   }));
 
   const priorityTop3=priority.slice(0,3).map(p=>p.label.replace(" Index",""));
@@ -6288,16 +6298,10 @@ function predictPodiumForDivision(targetDivision, weeksToRace){
   // IMPORTANT: podium prediction must use the exact selected race Division.
   // HPI/physiology remains base-category aware, but race evidence and race benchmarks
   // must not pool Open with Open Doubles or Pro with Pro Doubles.
-  const prevPredictionDivision = PREDICTION_DIVISION_OVERRIDE;
-  PREDICTION_DIVISION_OVERRIDE = div;
-  try{
-    return withDivisionContext(div, ()=>{
-      const targetHpi = calcHPI();
-      return predictTime(targetHpi, weeksToRace);
-    });
-  } finally {
-    PREDICTION_DIVISION_OVERRIDE = prevPredictionDivision;
-  }
+  return withExactPredictionContext(div, ()=>{
+    const targetHpi = calcHPI();
+    return predictTime(targetHpi, weeksToRace);
+  });
 }
 
 async function computePodiumAnalysis(){
