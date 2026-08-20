@@ -5151,6 +5151,29 @@ function numOrNullAlias(r, ...keys){
 // Loose validation: a usable row needs at minimum gender + division to be filterable into any
 // comparison group. Everything else (individual segment times) can be partially missing — a row
 // missing wallball but present for everything else still contributes to every OTHER segment's n.
+// doc11 (포디움 기준 데이터 연결 오류): EXTERNAL_RACE_DB[].age_group previously carried whatever raw
+// string format the source export used, completely unnormalized, then computePodiumComparisonGroup()
+// compares it with EXACT string equality against getAgeGroup(userAge)'s own canonical output
+// ("18-24".."60+"). Any cosmetic difference — stray whitespace ("30 - 34"), an en-dash instead of a
+// hyphen ("30–34"), or a gender/"AG" prefix some exports include ("F30-34", "AG 30-34") — silently
+// failed that comparison and produced "insufficient data" even when abundant real rows existed for
+// that exact age group. This only cleans formatting noise; it never re-buckets a genuinely different
+// band (a real 10-year "30-39" stays "30-39", it is NOT coerced into "30-34" — doc11 §10 explicitly
+// forbids merging different bands to inflate sample size).
+function normalizeAgeGroupLabel(raw){
+  if(raw==null) return null;
+  let s=String(raw).trim();
+  if(!s) return null;
+  s=s.replace(/[–—]/g,"-");                                   // en/em dash -> hyphen
+  s=s.replace(/^(AG|Age\s*Group)\s*[:\-]?\s*/i,"");            // strip "AG "/"Age Group:" prefixes
+  s=s.replace(/^[FMW]\s*[:\-]?\s*(?=\d)/i,"");                 // strip a leading gender-letter prefix (e.g. "F30-34")
+  s=s.trim();
+  const range=s.match(/^(\d{2})\s*-\s*(\d{2})$/);
+  if(range) return `${range[1]}-${range[2]}`;
+  const plus=s.match(/^(\d{2})\s*\+$/);
+  if(plus) return `${plus[1]}+`;
+  return s; // unrecognized format — return the cleaned string as-is rather than discarding real data
+}
 function validateRaceRecordRow(r){
   if(!r || typeof r!=="object") return false;
   const gender=String(r.gender||"").toLowerCase();
@@ -5163,7 +5186,7 @@ function normalizeExternalRaceRow(r){
   const age = r.age!=null && r.age!=="" ? Number(r.age) : null;
   return {
     race_id: r.race_id || uid(), athlete_id: r.athlete_id || null, gender,
-    age, age_group: r.age_group || (age!=null ? getAgeGroup(age) : null),
+    age, age_group: normalizeAgeGroupLabel(r.age_group) || (age!=null ? getAgeGroup(age) : null),
     division: DIVISIONS.includes(r.division) ? r.division : "Open",
     event: r.event || null, country: r.country || null, date: r.date || null,
     overall_time: numOrNull(r.overall_time),
@@ -5800,12 +5823,31 @@ function checkDnaMatrixConsistency(peer){
 function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
   const base = EXTERNAL_RACE_DB.filter(r=>
     r.division===division && r.gender===gender && r.age_group===ageGroup && r.overall_time!=null);
+  let result;
   if(eventName){
     const withEvent = base.filter(r=>r.event && r.event.trim().toLowerCase()===eventName.trim().toLowerCase());
-    if(withEvent.length>=PODIUM_MIN_SAMPLE) return { rows:withEvent, scope:"event", n:withEvent.length };
+    if(withEvent.length>=PODIUM_MIN_SAMPLE) result = { rows:withEvent, scope:"event", n:withEvent.length };
   }
-  if(base.length>=PODIUM_MIN_SAMPLE) return { rows:base, scope:"division-gender-age", n:base.length };
-  return { rows:base, scope:"insufficient", n:base.length };
+  if(!result){
+    result = base.length>=PODIUM_MIN_SAMPLE ? { rows:base, scope:"division-gender-age", n:base.length }
+      : { rows:base, scope:"insufficient", n:base.length };
+  }
+  result.division=division; result.gender=gender; result.ageGroup=ageGroup;
+  logPodiumDebugStats(division, gender, ageGroup, result);
+  return result;
+}
+// doc11 §6: console-only diagnostic (never shown in the general user UI) so a mismatch between
+// "abundant real data exists" and "podium says insufficient" can be root-caused quickly — which exact
+// filter (division / gender / age_group) is silently zeroing out the group.
+function logPodiumDebugStats(division, gender, ageGroup, group){
+  try{
+    const total=EXTERNAL_RACE_DB.length;
+    const genderN=EXTERNAL_RACE_DB.filter(r=>r.gender===gender).length;
+    const divN=EXTERNAL_RACE_DB.filter(r=>r.division===division).length;
+    const ageN=EXTERNAL_RACE_DB.filter(r=>r.age_group===ageGroup).length;
+    const timeN=EXTERNAL_RACE_DB.filter(r=>r.overall_time!=null).length;
+    console.log(`[Podium Debug]\nDB total: ${total}\n${gender}: ${genderN}\n${division}: ${divN}\nAge ${ageGroup}: ${ageN}\nOverall Time: ${timeN}\nFinal group: ${group.n}\nScope: ${group.scope}`);
+  }catch(e){ /* diagnostic only — must never break the real calculation */ }
 }
 function computePodiumBenchmark(eventName, division, gender, ageGroup){
   const group = computePodiumComparisonGroup(eventName, division, gender, ageGroup);
@@ -6858,18 +6900,9 @@ function myRecordRowHtml(bigText, dateText, subText){
 let SIM_QUICK_DRAFT=null, TENK_QUICK_DRAFT=null, SIM_EDIT_ID=null, TENK_EDIT_ID=null;
 function openSimQuickAddModal(existing=null){
   SIM_EDIT_ID = existing?.id || null;
-  if(existing){
-    SIM_QUICK_DRAFT = {
-      date: existing.date, type: existing.type||"full", division: existing.division||STATE.profile.division,
-      totalTime: existing.totalTime||"", note: existing.note||"",
-      runs: Object.fromEntries(RUN_KEYS.map(k=>[k, existing.runs?.[k]]).filter(([,v])=>v)),
-      stations: Object.fromEntries(STATIONS.map(s=>[s.key, existing.stations?.[s.key]]).filter(([,v])=>v)),
-      transition: existing.transition || "",
-    };
-  } else {
-    SIM_QUICK_DRAFT = { date:todayISO(), type:"full", division:STATE.profile.division, totalTime:"", note:"",
-      runs:{}, stations:{}, transition:"" };
-  }
+  SIM_QUICK_DRAFT = existing
+    ? { date:existing.date, type:existing.type||"full", division:existing.division||STATE.profile.division, totalTime:existing.totalTime||"", note:existing.note||"" }
+    : { date:todayISO(), type:"full", division:STATE.profile.division, totalTime:"", note:"" };
   renderSimQuickAddModal(); openModal();
 }
 function deleteSimRecord(id){
@@ -6877,31 +6910,22 @@ function deleteSimRecord(id){
   STATE.simulationTests = STATE.simulationTests.filter(s=>s.id!==id);
   persist(); showToast("Simulation 기록을 삭제했습니다"); renderSimFullListModal();
 }
-// doc7 §2 (full spec): 기존 기록을 불러와서 날짜/유형/Division/Run 1~8/Station/Transition/Total Time을
-// 전부 수정할 수 있어야 하고, 저장 시 새 기록이 아니라 기존 record를 update해야 한다 — 데스크톱의
-// renderSimulationTab() 입력 폼과 동일한 필드 구성을 모바일 모달 레이아웃으로 재사용(계산/저장 로직 중복
-//없이 STATE.simulationTests 스키마 그대로).
+// doc10 §2: detailed Run 1~8/Station/Transition editing moved to the desktop 근력·스테이션 기록 페이지의
+// Simulation 탭 (renderSimulationTab) — this mobile modal stays a LIGHT editor (date/유형/Division/총
+// 기록/메모) for both add and edit, so there's exactly one place that owns detailed segment entry rather
+// than two editors that could drift out of sync. Existing Run/Station/Transition data on a record is
+// preserved untouched when only these light fields are edited here.
+function goToSimulationDetailTab(id){
+  if(id) SIM_EDIT_ID=id;
+  closeModal(); CURRENT_PAGE="strength"; STRENGTH_TAB="simulation"; renderAll();
+}
 function renderSimQuickAddModal(){
   const panel=document.getElementById("modal-panel"); const d=SIM_QUICK_DRAFT; const editing=!!SIM_EDIT_ID;
-  const runRow = (k)=>{
-    const r = d.runs[k]||{};
-    return `<div class="hstack" style="gap:6px;padding:4px 0;align-items:center;">
-      <span style="width:48px;font-size:12px;color:var(--gray);flex-shrink:0;">Run ${k}</span>
-      <input id="simq-run${k}-dist" type="number" placeholder="m" style="width:60px;flex-shrink:0;" value="${r.distanceM??""}">
-      <input id="simq-run${k}-time" placeholder="mm:ss" style="flex:1;min-width:0;" value="${escapeHtml(r.time||"")}">
-    </div>`;
-  };
-  const stRow = (s)=>{
-    const r = d.stations[s.key]||{};
-    return `<div class="hstack" style="gap:6px;padding:4px 0;align-items:center;">
-      <span style="width:96px;font-size:12px;color:var(--gray);flex-shrink:0;">${escapeHtml(s.label)}</span>
-      <input id="simq-st-${s.key}-amt" placeholder="${escapeHtml(s.unit)}" style="width:60px;flex-shrink:0;" value="${escapeHtml(r.amount||"")}">
-      <input id="simq-st-${s.key}-time" placeholder="mm:ss" style="flex:1;min-width:0;" value="${escapeHtml(r.time||"")}">
-    </div>`;
-  };
+  const editingRec = editing ? STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID) : null;
+  const runCount = editingRec ? Object.keys(editingRec.runs||{}).length : 0;
+  const stCount = editingRec ? Object.keys(editingRec.stations||{}).length : 0;
   panel.innerHTML = `
     <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="simq-close">✕</span></div>
-    <p class="lead" style="margin:6px 0 12px;">실제 대회 기록과 분리된 별도 저장소입니다. 입력하지 않은 구간은 비워두면 됩니다 — 임의로 채우지 않습니다.</p>
     <div class="field"><label>날짜</label><input id="simq-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}"></div>
     <div class="field" style="margin-top:10px;"><label>유형</label><select id="simq-type">
       <option value="full" ${d.type==="full"?"selected":""}>Full Simulation</option>
@@ -6911,59 +6935,38 @@ function renderSimQuickAddModal(){
     <div class="field" style="margin-top:10px;"><label>Division (수행 기준)</label><select id="simq-div">${DIVISIONS.map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select></div>
     <div class="field" style="margin-top:10px;"><label>총 기록 (선택, h:mm:ss)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
     <div class="field" style="margin-top:10px;"><label>메모 (선택)</label><input id="simq-note" placeholder="선택사항" value="${escapeHtml(d.note)}"></div>
-    <div class="divider" style="margin:14px 0;"></div>
-    <div class="eyebrow gray" style="margin-bottom:2px;">Run 1~8 (거리m + 기록)</div>
-    ${RUN_KEYS.map(runRow).join("")}
-    <div class="divider" style="margin:14px 0;"></div>
-    <div class="eyebrow gray" style="margin-bottom:2px;">Station (수행량 + 기록)</div>
-    ${STATIONS.map(stRow).join("")}
-    <div class="field" style="margin-top:12px;"><label>Transition/Roxzone (선택, mm:ss)</label><input id="simq-transition" placeholder="mm:ss" value="${escapeHtml(d.transition||"")}"></div>
     <button class="btn" id="simq-save" style="width:100%;justify-content:center;margin-top:16px;">${editing?"수정 저장":"저장"}</button>
+    <div class="card tight" style="margin-top:14px;text-align:center;padding:12px;">
+      ${editing? `<p class="reason-line" style="margin-bottom:8px;">Run ${runCount}/8 · Station ${stCount}/8 입력됨</p>` : ""}
+      <span class="chip" id="simq-goto-detail" style="cursor:pointer;font-size:11.5px;">Run/Station/Transition 상세 ${editing?"수정":"입력"}하기 (PC 근력 페이지) →</span>
+    </div>
   `;
   panel.querySelector("#simq-close").addEventListener("click", closeModal);
   panel.querySelector("#simq-date").addEventListener("change",e=>{ d.date=e.target.value; });
-  panel.querySelector("#simq-type").addEventListener("change",e=>{
-    d.type=e.target.value;
-    const defDist=SIM_RUN_DEFAULT_DIST[d.type];
-    if(defDist!=null){
-      RUN_KEYS.forEach(k=>{ const el=panel.querySelector(`#simq-run${k}-dist`); if(el && !el.value.trim()) el.value=defDist; });
-    }
-  });
+  panel.querySelector("#simq-type").addEventListener("change",e=>{ d.type=e.target.value; });
   panel.querySelector("#simq-div").addEventListener("change",e=>{ d.division=e.target.value; });
   panel.querySelector("#simq-time").addEventListener("change",e=>{ d.totalTime=e.target.value; });
   panel.querySelector("#simq-note").addEventListener("change",e=>{ d.note=e.target.value; });
-  panel.querySelector("#simq-transition").addEventListener("change",e=>{ d.transition=e.target.value; });
+  panel.querySelector("#simq-goto-detail").addEventListener("click",()=>{
+    if(editing){ goToSimulationDetailTab(SIM_EDIT_ID); return; }
+    // no record saved yet in add-mode — create a bare record first (light fields only) so there's
+    // something to attach Run/Station detail to on the desktop tab, then jump there.
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
+    const rec={ id:uid(), date:d.date, type:d.type, division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime.trim()||null, note:d.note||"", source:"manual" };
+    STATE.simulationTests.push(rec); persist();
+    goToSimulationDetailTab(rec.id);
+  });
   panel.querySelector("#simq-save").addEventListener("click",()=>{
     if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
-    const totalTime=panel.querySelector("#simq-time").value.trim();
+    const totalTime=d.totalTime.trim();
     if(totalTime && !parseTimeToSec(totalTime)){ showToast("총 기록을 mm:ss 또는 h:mm:ss 형식으로 입력해주세요"); return; }
-    const runs={};
-    RUN_KEYS.forEach(k=>{
-      const timeStr=panel.querySelector(`#simq-run${k}-time`).value.trim();
-      if(!timeStr) return;
-      const distStr=panel.querySelector(`#simq-run${k}-dist`).value.trim();
-      runs[k]={ distanceM: distStr? Number(distStr): null, time: timeStr };
-    });
-    const stations={};
-    STATIONS.forEach(s=>{
-      const timeStr=panel.querySelector(`#simq-st-${s.key}-time`).value.trim();
-      if(!timeStr) return;
-      const amtStr=panel.querySelector(`#simq-st-${s.key}-amt`).value.trim();
-      stations[s.key]={ amount: amtStr||null, time: timeStr };
-    });
-    const transition=panel.querySelector("#simq-transition").value.trim();
-    if(!Object.keys(runs).length && !Object.keys(stations).length && !totalTime){
-      showToast("최소 한 구간 이상 입력해주세요"); return;
-    }
-    const type=panel.querySelector("#simq-type").value;
-    const division=panel.querySelector("#simq-div").value;
-    const note=panel.querySelector("#simq-note").value.trim();
     if(editing){
       const rec = STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
-      if(rec){ rec.date=d.date; rec.type=type; rec.division=division; rec.totalTime=totalTime||null; rec.note=note||""; rec.runs=runs; rec.stations=stations; rec.transition=transition||null; }
+      if(rec){ rec.date=d.date; rec.type=d.type; rec.division=d.division; rec.totalTime=totalTime||null; rec.note=d.note||""; }
       persist(); closeModal(); showToast("Simulation 기록을 수정했습니다"); renderAll();
     } else {
-      STATE.simulationTests.push({ id:uid(), date:d.date, type, division, runs, stations, transition:transition||null, totalTime:totalTime||null, note:note||"", source:"manual" });
+      if(!totalTime){ showToast("총 기록을 입력하거나, 아래에서 Run/Station 상세를 먼저 입력해주세요"); return; }
+      STATE.simulationTests.push({ id:uid(), date:d.date, type:d.type, division:d.division, runs:{}, stations:{}, transition:null, totalTime, note:d.note||"", source:"manual" });
       persist(); closeModal(); showToast("Simulation 기록이 저장되었습니다"); renderAll();
     }
   });
@@ -7035,7 +7038,9 @@ function renderSimFullListModal(){
   panel.querySelector("#simlist-close").addEventListener("click", closeModal);
   panel.querySelector("#simlist-add").addEventListener("click", ()=>openSimQuickAddModal());
   panel.querySelectorAll(".sim-edit").forEach(el=>el.addEventListener("click",()=>{
-    const rec=STATE.simulationTests.find(s=>s.id===el.dataset.id); if(rec) openSimQuickAddModal(rec);
+    const rec=STATE.simulationTests.find(s=>s.id===el.dataset.id);
+    if(!rec) return;
+    SIM_EDIT_ID=rec.id; closeModal(); CURRENT_PAGE="strength"; STRENGTH_TAB="simulation"; renderAll();
   }));
   panel.querySelectorAll(".sim-del").forEach(el=>el.addEventListener("click",()=>deleteSimRecord(el.dataset.id)));
 }
@@ -7095,6 +7100,16 @@ function renderMyRecordPage(wrap){
         ${tenk.recent.length? tenk.recent.map(l=>myRecordRowHtml(fmtTime(l.avgPaceSecKm*10), fmtDateDots(l.date), "")).join("") : `<div class="empty-note">10K TT 기록이 없습니다</div>`}
       </div>
     </div>
+    <div class="hstack" style="gap:8px;margin-top:4px;">
+      <div class="card tight" id="myrecord-goto-dna" style="flex:1;text-align:center;cursor:pointer;padding:14px 10px;">
+        <div style="font-size:13px;font-weight:700;">🧬 내 위치 확인하기</div>
+        <div class="reason-line" style="margin-top:2px;">DNA →</div>
+      </div>
+      <div class="card tight" id="myrecord-goto-goal" style="flex:1;text-align:center;cursor:pointer;padding:14px 10px;">
+        <div style="font-size:13px;font-weight:700;">🏆 포디움 갈 수 있을까?</div>
+        <div class="reason-line" style="margin-top:2px;">목표 →</div>
+      </div>
+    </div>
   `;
   bindHyroxNameSearch(wrap);
   wrap.querySelector("#myrecord-goto-races")?.addEventListener("click",()=>{ CURRENT_PAGE="races"; RACES_TAB="log"; renderAll(); });
@@ -7102,6 +7117,8 @@ function renderMyRecordPage(wrap){
   wrap.querySelector("#myrecord-add-10k")?.addEventListener("click", ()=>open10kQuickAddModal());
   wrap.querySelector("#myrecord-list-sim")?.addEventListener("click", openSimFullListModal);
   wrap.querySelector("#myrecord-list-10k")?.addEventListener("click", open10kFullListModal);
+  wrap.querySelector("#myrecord-goto-dna")?.addEventListener("click",()=>{ CURRENT_PAGE="mydna"; renderAll(); });
+  wrap.querySelector("#myrecord-goto-goal")?.addEventListener("click",()=>{ CURRENT_PAGE="mygoal"; renderAll(); });
 }
 
 /* ---- DNA (simplified) ---- */
@@ -7109,6 +7126,11 @@ const MY_DNA_AXES = ["running","engine","strengthEnd","skill","raceExec"];
 function renderMyDnaPage(wrap){
   const hpiResult=calcHPI();
   const peer=computePeerAnalysis();
+  // "기록 등록하러 가기" shortcut uses the SAME literal check as 목표 page (racesByDivision existence) —
+  // !peer alone conflates "no race at all" with "a race exists but has zero segment splits filled in",
+  // which would otherwise show this prompt to someone who already registered a race with just an
+  // overall time and no Run/Station breakdown yet.
+  const hasRace = !!(racesByDivision(STATE.profile.division)[0]);
   const strengthRank = getDnaStrengthRanking(3);
   const improvementRank = getDnaWeaknessRanking(3);
   const strengths = strengthRank.items, improvements = improvementRank.items;
@@ -7142,8 +7164,20 @@ function renderMyDnaPage(wrap){
     <div class="card tight" style="text-align:center;">
       <span class="chip" id="mydna-goto-detail" style="cursor:pointer;font-size:11px;padding:8px 14px;">상세 분석 보기 →</span>
     </div>
+    <div class="hstack" style="gap:8px;margin-top:4px;">
+      ${!hasRace? `<div class="card tight" id="mydna-goto-record" style="flex:1;text-align:center;cursor:pointer;padding:14px 10px;">
+        <div style="font-size:13px;font-weight:700;">🏁 기록 등록하러 가기</div>
+        <div class="reason-line" style="margin-top:2px;">기록 →</div>
+      </div>` : ""}
+      <div class="card tight" id="mydna-goto-goal" style="flex:1;text-align:center;cursor:pointer;padding:14px 10px;">
+        <div style="font-size:13px;font-weight:700;">🏆 포디움 갈 수 있을까?</div>
+        <div class="reason-line" style="margin-top:2px;">목표 →</div>
+      </div>
+    </div>
   `;
   wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{ CURRENT_PAGE="peer"; renderAll(); });
+  wrap.querySelector("#mydna-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
+  wrap.querySelector("#mydna-goto-goal")?.addEventListener("click",()=>{ CURRENT_PAGE="mygoal"; renderAll(); });
 }
 
 /* ---- 목표 (simplified) + 포디움 가능성 ---- */
@@ -7158,8 +7192,18 @@ function renderMyGoalPage(wrap){
   const p=STATE.profile;
   const effectiveGoalDiv = p.goalDivision || p.division;
   const canCompute = !!p.targetDate;
+  const hasRace = !!(racesByDivision(STATE.profile.division)[0]);
   wrap.innerHTML = `
     <div><div class="eyebrow">MY NEXT RACE</div><h1 class="page-title">목표</h1></div>
+    ${!hasRace? `<div class="card tight" id="mygoal-goto-record" style="cursor:pointer;padding:14px 16px;">
+      <div class="row-between">
+        <div>
+          <div style="font-size:13px;font-weight:700;">🏁 기록 등록하러 가기</div>
+          <div class="reason-line" style="margin-top:2px;">HYROX 대회 기록이 있어야 더 정확한 포디움 분석이 가능합니다</div>
+        </div>
+        <span style="font-size:18px;color:var(--gray-dim);">→</span>
+      </div>
+    </div>` : ""}
     <div class="card">
       <div class="field"><label>목표 대회명 / 지역</label><input id="mg-event" placeholder="예: HYROX Seoul" value="${escapeHtml(p.targetEventName)}"></div>
       <div class="field" style="margin-top:10px;"><label>날짜 (YYYY-MM-DD)</label><input id="mg-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="2026-10-18" value="${escapeHtml(p.targetDate)}"></div>
@@ -7172,6 +7216,7 @@ function renderMyGoalPage(wrap){
 
     <div id="mg-podium-result"></div>
   `;
+  wrap.querySelector("#mygoal-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
   wrap.querySelector("#mg-save").addEventListener("click",()=>{
     STATE.profile.targetEventName=wrap.querySelector("#mg-event").value.trim();
     STATE.profile.targetDate=wrap.querySelector("#mg-date").value.trim();
@@ -7270,12 +7315,14 @@ function renderMyGoalPodiumResult(wrap){
     <div style="padding:18px 20px;">
       <div class="eyebrow gray" style="margin-bottom:10px;">포디움 기준 기록</div>
       ${podium.map((t,i)=>`<div class="row-between" style="padding:6px 0;"><span style="font-size:13.5px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
+      <div class="divider" style="margin:12px 0;"></div>
+      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='female'?'Female':'Male', r.benchmark.division, r.benchmark.ageGroup].filter(Boolean).join(' · '))}</span></div>
+      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">데이터</span><span style="font-size:12.5px;font-weight:600;">${r.benchmark.scope==='event' ? `${escapeHtml(r.eventName||'해당 대회')} · ${r.benchmark.n.toLocaleString()}명` : `전체 · ${r.benchmark.n.toLocaleString()}명`}</span></div>
     </div>
 
     <div class="divider" style="margin:0;"></div>
     <div style="padding:14px 20px 18px;">
       <div class="row-between"><span style="font-size:12px;color:var(--gray);">신뢰도</span><span class="badge ${r.overallConfidence==='HIGH'?'elite':r.overallConfidence==='MEDIUM'?'med':'crit'}">${r.overallConfidence}</span></div>
-      <p class="reason-line" style="margin-top:6px;">동일 조건(Division·성별·연령대${r.benchmark.scope==='event'?'·대회':''}) 실제 선수 데이터 ${r.benchmark.n}건 기준</p>
     </div>
   </div>`;
 }
@@ -8631,7 +8678,11 @@ function hyroxDbRowToExternal(row){
   const runs = Array.isArray(row.runs_json) ? row.runs_json : [];
   const stations = Array.isArray(row.stations_json) ? row.stations_json : [];
   const genderRaw = String(row.gender||"").trim().toLowerCase();
-  const gender = genderRaw.startsWith("f") || genderRaw.includes("female") || genderRaw.includes("women") ? "female" : "male";
+  // doc11 §2: the old check only matched "female"/"women" (plural) — "woman" (singular) has a
+  // different spelling ("wom-a-n" vs "wom-e-n") and silently fell through to the male default, quietly
+  // undercounting real female rows (including Doubles entries) before they ever reached the podium
+  // comparison-group filter. Matching the shared "wom" prefix catches both spellings plus any casing.
+  const gender = genderRaw==="f" || genderRaw.includes("female") || genderRaw.includes("wom") ? "female" : "male";
   const division = DIVISIONS.includes(row.division) ? row.division : hyroxCsvDivision(row.division);
   const total = parseTimeToSec(row.total_time);
   const obj = {
@@ -9395,54 +9446,66 @@ function renderQuickTestTab(wrap){
 }
 const SIM_RUN_DEFAULT_DIST = { full:1000, half:500, custom:null };
 function renderSimulationTab(wrap){
+  const editingRec = SIM_EDIT_ID ? STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID) : null;
+  if(SIM_EDIT_ID && !editingRec) SIM_EDIT_ID=null; // stale id (e.g. deleted elsewhere) — fall back to add mode
+  const editing = !!editingRec;
+  const runVal = (k,field)=> editingRec?.runs?.[k]?.[field];
+  const stVal = (key,field)=> editingRec?.stations?.[key]?.[field];
   wrap.innerHTML = `
     <div class="card">
-      <div class="row-between"><h2 class="section-title">🏁 Simulation 기록</h2></div>
+      <div class="row-between"><h2 class="section-title">🏁 Simulation 기록 ${editing?"수정":""}</h2>${editing?`<span class="chip" id="sim-edit-cancel" style="cursor:pointer;">수정 취소</span>`:""}</div>
       <p class="lead" style="margin:6px 0 12px;">실제 대회가 아닌 자체 시뮬레이션 기록입니다. <b style="color:var(--orange);">대회 기록(STATE.races)과 완전히 분리된 별도 저장소</b>에 저장되어, Division 전환 계산이나 실제 대회 Backtest에 절대 섞이지 않습니다. 입력하지 않은 구간은 비워두면 됩니다 — 임의로 채우지 않습니다.</p>
       <div class="grid grid-3">
-        ${field("날짜", `<input id="sim-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${todayISO()}">`)}
-        ${field("유형", `<select id="sim-type"><option value="full">Full Simulation</option><option value="half">Half Simulation</option><option value="custom">Custom Simulation</option></select>`)}
-        ${field("Division (수행 기준)", `<select id="sim-division"><option value="Open" ${currentProfileDivisionBase()==="Open"?"selected":""}>Open</option><option value="Pro" ${currentProfileDivisionBase()==="Pro"?"selected":""}>Pro</option></select>`)}
-        ${field("총 기록 (선택, h:mm:ss)", `<input id="sim-total" placeholder="예: 1:32:00">`)}
+        ${field("날짜", `<input id="sim-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(editingRec?.date||todayISO())}">`)}
+        ${field("유형", `<select id="sim-type">
+          <option value="full" ${(editingRec?.type||"full")==="full"?"selected":""}>Full Simulation</option>
+          <option value="half" ${editingRec?.type==="half"?"selected":""}>Half Simulation</option>
+          <option value="custom" ${editingRec?.type==="custom"?"selected":""}>Custom Simulation</option>
+        </select>`)}
+        ${field("Division (수행 기준)", `<select id="sim-division"><option value="Open" ${(editingRec?.division||currentProfileDivisionBase())==="Open"?"selected":""}>Open</option><option value="Pro" ${(editingRec?.division||currentProfileDivisionBase())==="Pro"?"selected":""}>Pro</option></select>`)}
+        ${field("총 기록 (선택, h:mm:ss)", `<input id="sim-total" placeholder="예: 1:32:00" value="${escapeHtml(editingRec?.totalTime||"")}">`)}
       </div>
       <p class="reason-line" style="margin:4px 0;">Division은 이 Simulation을 <b>어떤 기준(Open/Pro 하중)으로 수행했는지</b> 표시합니다 — 현재 프로필 Division과 다르면, 이 기록은 현재 예측에 직접 반영되지 않고 보존만 됩니다.</p>
       <p class="reason-line" id="sim-type-hint" style="margin:10px 0 4px;">Full = Run 기본 1000m로 채워둡니다 (수정 가능). Half = 기본 500m로 채워두되 실제 수행 거리로 자유롭게 바꿔주세요. Custom = 거리를 직접 입력해주세요 (기본값 없음).</p>
       <div class="eyebrow gray" style="margin-top:10px;margin-bottom:4px;">Run 1~8 (거리 + 기록)</div>
       <div class="grid grid-4">
         ${RUN_KEYS.map(k=>`<div class="field"><label>Run ${k}</label><div class="hstack" style="gap:4px;">
-          <input id="sim-run${k}-dist" type="number" placeholder="m" style="width:70px;" value="${SIM_RUN_DEFAULT_DIST.full}">
-          <input id="sim-run${k}-time" placeholder="mm:ss">
+          <input id="sim-run${k}-dist" type="number" placeholder="m" style="width:70px;" value="${runVal(k,'distanceM') ?? (editing? "" : SIM_RUN_DEFAULT_DIST.full)}">
+          <input id="sim-run${k}-time" placeholder="mm:ss" value="${escapeHtml(runVal(k,'time')||"")}">
         </div></div>`).join("")}
       </div>
       <div class="eyebrow gray" style="margin-top:14px;margin-bottom:4px;">Station (수행량 + 기록)</div>
       <div class="grid grid-4">
         ${STATIONS.map(st=>`<div class="field"><label>${st.label}</label><div class="hstack" style="gap:4px;">
-          <input id="sim-${st.key}-amt" placeholder="수행량" style="width:70px;" value="${st.unit}">
-          <input id="sim-${st.key}-time" placeholder="mm:ss">
+          <input id="sim-${st.key}-amt" placeholder="수행량" style="width:70px;" value="${escapeHtml(stVal(st.key,'amount') ?? (editing? "" : st.unit))}">
+          <input id="sim-${st.key}-time" placeholder="mm:ss" value="${escapeHtml(stVal(st.key,'time')||"")}">
         </div></div>`).join("")}
       </div>
       <div class="grid grid-3" style="margin-top:10px;">
-        ${field("Transition/Roxzone (선택)", `<input id="sim-transition" placeholder="mm:ss">`)}
+        ${field("Transition/Roxzone (선택)", `<input id="sim-transition" placeholder="mm:ss" value="${escapeHtml(editingRec?.transition||"")}">`)}
+        ${field("메모 (선택)", `<input id="sim-note" placeholder="선택사항" value="${escapeHtml(editingRec?.note||"")}">`)}
       </div>
-      <div style="margin-top:12px;"><button class="btn sm" id="sim-add">Simulation 기록 추가</button></div>
+      <div style="margin-top:12px;"><button class="btn sm" id="sim-add">${editing?"수정 저장":"Simulation 기록 추가"}</button></div>
       <div id="sim-status" style="margin-top:8px;font-size:12px;"></div>
     </div>
 
     <div class="card">
       <h2 class="section-title">Simulation 기록 (${STATE.simulationTests.length})</h2>
       ${STATE.simulationTests.length? `<div style="overflow-x:auto;"><table style="margin-top:10px;"><thead><tr><th>날짜</th><th>유형</th><th>Division</th><th class="num">Run 입력수</th><th class="num">Station 입력수</th><th class="num">총기록</th><th></th></tr></thead>
-        <tbody>${[...STATE.simulationTests].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr>
+        <tbody>${[...STATE.simulationTests].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr ${t.id===SIM_EDIT_ID?'style="background:var(--surface2);"':''}>
           <td style="white-space:nowrap;">${t.date}</td><td>${t.type==="full"?"Full":t.type==="half"?"Half":"Custom"}</td>
           <td>${t.division||`<span style="color:var(--gray-dim);">미분류</span>`}</td>
           <td class="num mono">${Object.keys(t.runs||{}).length}</td><td class="num mono">${Object.keys(t.stations||{}).length}</td>
-          <td class="num mono">${t.totalTime||"—"}</td><td><span class="list-remove" data-del-sim="${t.id}">✕</span></td></tr>`).join("")}</tbody></table></div>`
+          <td class="num mono">${t.totalTime||"—"}</td>
+          <td class="hstack" style="gap:8px;"><span class="list-remove" data-edit-sim="${t.id}" style="color:var(--orange);">수정</span><span class="list-remove" data-del-sim="${t.id}">✕</span></td></tr>`).join("")}</tbody></table></div>`
         : `<div class="empty-note">Simulation 기록이 없습니다 — 위에서 추가해보세요</div>`}
     </div>
   `;
+  wrap.querySelector("#sim-edit-cancel")?.addEventListener("click",()=>{ SIM_EDIT_ID=null; renderAll(); });
   wrap.querySelector("#sim-type")?.addEventListener("change",(e)=>{
     const type=e.target.value;
     const defDist = SIM_RUN_DEFAULT_DIST[type];
-    RUN_KEYS.forEach(k=>{ const el=wrap.querySelector(`#sim-run${k}-dist`); if(el) el.value = defDist==null ? "" : defDist; });
+    RUN_KEYS.forEach(k=>{ const el=wrap.querySelector(`#sim-run${k}-dist`); if(el && !el.value.trim()) el.value = defDist==null ? "" : defDist; });
     const hint=wrap.querySelector("#sim-type-hint");
     if(hint) hint.textContent = type==="full" ? "Full = Run 기본 1000m로 채워둡니다 (수정 가능)."
       : type==="half" ? "Half = 기본 500m로 채워두되 실제 수행 거리로 자유롭게 바꿔주세요."
@@ -9470,20 +9533,33 @@ function renderSimulationTab(wrap){
     });
     const transition=wrap.querySelector("#sim-transition").value.trim();
     const totalTime=wrap.querySelector("#sim-total").value.trim();
+    const note=wrap.querySelector("#sim-note").value.trim();
     if(!Object.keys(runs).length && !Object.keys(stations).length && !totalTime){
       statusEl.style.color="var(--red)"; statusEl.textContent="최소 한 구간 이상 입력해주세요."; return;
     }
-    // spec: NEVER pushed into STATE.races — a dedicated store the existing Division Conversion /
-    // official-race Backtest / predictTime()/calcHPI()/computeTrainingPriority()/
-    // computeStationPriority() code paths don't read from, by construction (none of those functions
-    // reference STATE.simulationTests — verified, none touched in this change).
-    STATE.simulationTests.push({ id:uid(), date:wrap.querySelector("#sim-date").value||todayISO(),
-      type, division:wrap.querySelector("#sim-division").value, runs, stations, transition:transition||null, totalTime:totalTime||null, source:"manual" });
-    persist(); showToast("Simulation 기록이 추가되었습니다 (실제 대회 기록과 별도 저장)");
-    statusEl.style.color="var(--green)"; statusEl.textContent="저장 완료";
-    renderAll();
+    const date=wrap.querySelector("#sim-date").value||todayISO();
+    const division=wrap.querySelector("#sim-division").value;
+    if(editing){
+      const rec=STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
+      if(rec){ rec.date=date; rec.type=type; rec.division=division; rec.runs=runs; rec.stations=stations;
+        rec.transition=transition||null; rec.totalTime=totalTime||null; rec.note=note||""; }
+      persist(); showToast("Simulation 기록을 수정했습니다"); SIM_EDIT_ID=null; renderAll();
+    } else {
+      // spec: NEVER pushed into STATE.races — a dedicated store the existing Division Conversion /
+      // official-race Backtest / predictTime()/calcHPI()/computeTrainingPriority()/
+      // computeStationPriority() code paths don't read from, by construction (none of those functions
+      // reference STATE.simulationTests — verified, none touched in this change).
+      STATE.simulationTests.push({ id:uid(), date, type, division, runs, stations, transition:transition||null, totalTime:totalTime||null, note:note||"", source:"manual" });
+      persist(); showToast("Simulation 기록이 추가되었습니다 (실제 대회 기록과 별도 저장)");
+      statusEl.style.color="var(--green)"; statusEl.textContent="저장 완료";
+      renderAll();
+    }
   });
-  wrap.querySelectorAll("[data-del-sim]").forEach(b=>b.addEventListener("click",()=>{ STATE.simulationTests=STATE.simulationTests.filter(t=>t.id!==b.dataset.delSim); persist(); renderAll(); }));
+  wrap.querySelectorAll("[data-edit-sim]").forEach(b=>b.addEventListener("click",()=>{ SIM_EDIT_ID=b.dataset.editSim; renderAll(); }));
+  wrap.querySelectorAll("[data-del-sim]").forEach(b=>b.addEventListener("click",()=>{
+    if(b.dataset.delSim===SIM_EDIT_ID) SIM_EDIT_ID=null;
+    STATE.simulationTests=STATE.simulationTests.filter(t=>t.id!==b.dataset.delSim); persist(); renderAll();
+  }));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -9752,7 +9828,7 @@ function renderTrainingLogTab(wrap){
 
     <div class="card">
       <h2 class="section-title">최근 기록 (${STATE.trainingLog.length})</h2>
-      ${STATE.trainingLog.length? `<table style="margin-top:10px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
+      ${STATE.trainingLog.length? `<div style="overflow-x:auto;"><table style="margin-top:10px;min-width:920px;"><thead><tr><th>날짜</th><th>유형</th><th class="num">거리</th><th class="num">시간(분)</th><th class="num">페이스</th><th class="num">평균HR</th><th class="num">최고HR</th><th class="num">휴식HR</th><th class="num">HR Drift</th><th class="num">RPE</th><th></th><th></th><th></th></tr></thead>
         <tbody>${[...STATE.trainingLog].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,60).map(t=>`<tr>
           <td>${t.date}</td><td>${typeLabel(t.type)}</td>
           <td class="num mono">${t.distanceKm?t.distanceKm+"km":"—"}</td>
@@ -9766,7 +9842,7 @@ function renderTrainingLogTab(wrap){
           <td>${t.painFlag?`<span class="badge crit">${escapeHtml(t.painArea||"통증")}</span>`:""}</td>
           <td><span class="chip" style="font-size:9px;padding:2px 7px;">${t.source==="csv"?"CSV":t.source==="apple"?"Apple":t.source==="quick"?"빠른기록":"수기"}</span></td>
           <td><span class="list-remove" data-del-tl="${t.id}">✕</span></td>
-        </tr>`).join("")}</tbody></table>`
+        </tr>`).join("")}</tbody></table></div>`
         : `<div class="empty-note">훈련 기록이 없습니다</div>`}
     </div>
   `;
@@ -10613,9 +10689,6 @@ function renderPeer(wrap){
     { label:"Grip", score:strengthIdx.grip },
     { label:"Fatigue Res.", score:strengthIdx.fatigueResistance },
   ];
-  const baseTotal = parseTimeToSec(race.officialTime);
-  const sim = simulateGoal(baseTotal, SIM_STATE.runPace, SIM_STATE.stations);
-
   // ---- new user-friendly framing (spec) — all derived from the SAME analysis object above ----
   const typeCombo = raceDnaTypeCombo(strengthIdx, dataSource);
   const strengthsTop3 = buildStrengthsTop3(segments);
@@ -10782,33 +10855,7 @@ function renderPeer(wrap){
       })()}
       ` : ""}
     </div>
-
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">목표 기록 시뮬레이션</h2></div>
-      <p class="lead" style="margin:6px 0 12px;">특정 구간을 몇 초 개선하면 최종 기록이 어떻게 바뀌는지 계산합니다. 값을 입력하면 즉시 반영됩니다.</p>
-      <div class="grid grid-4">
-        ${field("Run Pace 개선 (초/km, ×8km)", `<input id="sim-run" type="number" value="${SIM_STATE.runPace}">`)}
-        ${STATIONS.map(s=>field(`${s.label} 개선(초)`, `<input data-sim-station="${s.key}" type="number" value="${SIM_STATE.stations[s.key]||0}">`)).join("")}
-      </div>
-      <div class="divider" style="margin:14px 0;"></div>
-      <div class="step-chain">
-        ${sim.steps.map((st,i)=>`
-          <div class="hstack" style="padding:6px 0;">
-            <span class="mono" style="width:26px;color:var(--gray-dim);">${i===0?"":"↓"}</span>
-            <span style="flex:1;font-size:12.5px;color:${st.delta?'var(--gray)':'var(--white)'};">${st.label}</span>
-            <span class="mono" style="font-weight:700;">${fmtTime(st.value)}</span>
-          </div>`).join("")}
-      </div>
-      <div class="step-conclusion" style="margin-top:10px;">
-        <div class="lbl">예상 최종 기록</div>
-        <div class="val">${fmtTime(sim.finalTotal)} <span style="color:var(--green);font-size:12px;font-weight:600;">(${sim.totalSaved>=0?"-":"+"}${fmtTime(Math.abs(sim.totalSaved))})</span></div>
-      </div>
-    </div>
   `;
-  wrap.querySelector("#sim-run").addEventListener("input",(e)=>{ SIM_STATE.runPace=Number(e.target.value)||0; renderPeer(wrap); });
-  wrap.querySelectorAll("[data-sim-station]").forEach(inp=>inp.addEventListener("input",(e)=>{
-    SIM_STATE.stations[e.target.dataset.simStation]=Number(e.target.value)||0; renderPeer(wrap);
-  }));
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
 }
