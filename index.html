@@ -10,7 +10,7 @@
   // HPS build cache-buster.
   // A new build version forces Safari/GitHub Pages to request this HTML again.
   (function(){
-    var HPS_BUILD_VERSION = "20260818-2205";
+    var HPS_BUILD_VERSION = "20260820-division-fix-01";
     try {
       var url = new URL(window.location.href);
       if (url.searchParams.get("hpsv") !== HPS_BUILD_VERSION) {
@@ -769,8 +769,16 @@ function divisionBase(divisionStr){
 // Optional exact-Division context used only while a Division-specific prediction is being
 // calculated. Normal app behavior remains unchanged when this is null.
 let PREDICTION_DIVISION_OVERRIDE = null;
+
+// Race prediction has two distinct concepts:
+// 1) base division (Open / Pro / Mixed) for physiological/HPI modeling;
+// 2) exact race division (Open / Open Doubles / Pro / Mixed Doubles / Pro Doubles)
+//    for race evidence and division-specific benchmark lookup.
+function currentPredictionDivision(){
+  return PREDICTION_DIVISION_OVERRIDE || STATE.profile.division || "Open";
+}
 function currentProfileDivisionBase(){
-  return PREDICTION_DIVISION_OVERRIDE || divisionBase(STATE.profile.division) || "Open";
+  return divisionBase(currentPredictionDivision()) || "Open";
 }
 // spec (Simulation -> 17-segment connection): official race/manual-test data ALWAYS wins outright
 // when it's fresh (<=STATION_STALE_DAYS, same existing constant used everywhere else in this file —
@@ -786,7 +794,9 @@ function collectStationCandidates(key){
   const myDiv=currentProfileDivisionBase();
   const out=[];
   STATE.stationTests.forEach(t=>{ const v=t.values&&t.values[key]; if(v) out.push({date:t.date, value:v, source:"test"}); });
-  STATE.races.filter(r=>divisionBase(r.division)===myDiv).forEach(r=>{ const v=r.stations&&r.stations[key]; if(v) out.push({date:r.date, value:v, source:"race"}); });
+  STATE.races.filter(r=>{
+    return PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv;
+  }).forEach(r=>{ const v=r.stations&&r.stations[key]; if(v) out.push({date:r.date, value:v, source:"race"}); });
   // doc12 §3 재검토: 이전에는 최근 공식 기록(<=21일)이 있으면 Simulation 후보 자체를 후보 목록에서
   // 아예 배제했다 — 21일 이내 공식 기록이 있다는 이유만으로 그보다 더 최근의 좋은 Simulation 신호가
   // 100% 차단되는 문제(TEST-04)였다. 이제는 항상 후보로 추가하고, 아래 recency 정렬이 실제로 더 최근인
@@ -798,7 +808,9 @@ function collectStationCandidates(key){
     // spec: only counts when the performed amount EXACTLY matches the official station distance/reps
     // (e.g. "50m" for Sled Push) — a half-distance rep is never blended into a full-distance benchmark.
     // No unit conversion/estimation attempted; string match only (trim+case-insensitive).
-    STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+    STATE.simulationTests.filter(t=>{
+    return PREDICTION_DIVISION_OVERRIDE ? t.division===myDiv : divisionBase(t.division)===myDiv;
+  }).forEach(t=>{
       const s=t.stations && t.stations[key];
       if(!s || !s.time || !s.amount) return;
       if(String(s.amount).trim().toLowerCase()!==String(officialUnit).trim().toLowerCase()) return;
@@ -2191,7 +2203,7 @@ const SEGMENT_LIST = [
 function getSegmentBenchmarkSec(segmentKey){
   const ageBand = deriveAgeBand(STATE.profile.age);
   const benchGender = deriveBenchmarkGender();
-  const derived = queryDerivedBenchmark(STATE.profile.division, benchGender, ageBand, segmentKey);
+  const derived = queryDerivedBenchmark(currentPredictionDivision(), benchGender, ageBand, segmentKey);
   if(derived && derived.p50) return { sec:derived.p50, source:derived.benchmark_source, sampleN:derived.sample_n, confidence:derived.confidence };
   return null;
 }
@@ -2240,12 +2252,16 @@ function transitionBenchmarkSec(){
 // divisionBase()/collectStationCandidates() above for the full rationale).
 function runLegCandidates(runIdx){
   const myDiv=currentProfileDivisionBase();
-  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv)
+  const out=[...STATE.races].filter(r=>{
+    return PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv;
+  })
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.runs?.[runIdx]), source:"race" }))
     .filter(c=>c.sec!=null);
   // doc12 §3: 더 이상 "최근 공식 기록<=21일" 이유만으로 Simulation 후보를 배제하지 않음 — 항상 추가하고
   // recency 정렬로 실제 더 최근인 쪽이 자연스럽게 선택되도록 함 (collectStationCandidates와 동일 원칙).
-  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+  STATE.simulationTests.filter(t=>{
+    return PREDICTION_DIVISION_OVERRIDE ? t.division===myDiv : divisionBase(t.division)===myDiv;
+  }).forEach(t=>{
     const r=t.runs && t.runs[runIdx];
     if(!r || !r.time || r.distanceM==null || r.distanceM<=0) return; // never guess a missing distance
     const timeSec=parseTimeToSec(r.time);
@@ -2257,10 +2273,14 @@ function runLegCandidates(runIdx){
 }
 function transitionCandidates(){
   const myDiv=currentProfileDivisionBase();
-  const out=[...STATE.races].filter(r=>divisionBase(r.division)===myDiv)
+  const out=[...STATE.races].filter(r=>{
+    return PREDICTION_DIVISION_OVERRIDE ? r.division===myDiv : divisionBase(r.division)===myDiv;
+  })
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.transition), source:"race" }))
     .filter(c=>c.sec!=null);
-  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+  STATE.simulationTests.filter(t=>{
+    return PREDICTION_DIVISION_OVERRIDE ? t.division===myDiv : divisionBase(t.division)===myDiv;
+  }).forEach(t=>{
     if(!t.transition) return;
     const sec=parseTimeToSec(t.transition);
     if(!sec) return;
@@ -2286,7 +2306,9 @@ function computePersonalRunToTenKRatio(){
     const legs=RUN_KEYS.map(k=>parseTimeToSec(r.runs?.[k])).filter(v=>v!=null);
     if(legs.length) runEvents.push({ date:r.date, paceSecKm: mean(legs) });
   });
-  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+  STATE.simulationTests.filter(t=>{
+    return PREDICTION_DIVISION_OVERRIDE ? t.division===myDiv : divisionBase(t.division)===myDiv;
+  }).forEach(t=>{
     const legs=RUN_KEYS.map(k=>{
       const r=t.runs&&t.runs[k]; if(!r||!r.time||!r.distanceM) return null;
       const sec=parseTimeToSec(r.time); return sec? (sec/r.distanceM)*1000 : null;
@@ -2536,7 +2558,11 @@ function computeGoalPlan(){
   }
 
   const weeksToRace=daysToRace()!=null ? Math.max(0,daysToRace()/7) : null;
-  const milestones=[4,8,12].map(w=>({ weeks:w, predicted:predictTime(hpiResult,w).predicted }));
+  const goalDivForMilestone = STATE.profile.goalDivision || STATE.profile.division;
+  const milestones=[4,8,12].map(w=>({
+    weeks:w,
+    predicted:withDivisionContext(goalDivForMilestone, ()=>predictTime(calcHPI(),w)).predicted
+  }));
 
   const priorityTop3=priority.slice(0,3).map(p=>p.label.replace(" Index",""));
 
@@ -6259,16 +6285,19 @@ function computePodiumSafeTarget(ciLow, ciHigh, cutoffSec){
 // STATE.profile.division is always restored by withDivisionContext().
 function predictPodiumForDivision(targetDivision, weeksToRace){
   const div = targetDivision || STATE.profile.division;
-  // IMPORTANT: use the SAME production prediction context as Goal Setting.
-  // Goal Setting's Division selector ultimately feeds the existing divisionBase()
-  // prediction/segment logic (Open/Open Doubles share the Open physical-load model;
-  // Pro/Pro Doubles share the Pro model). Do NOT force an exact-Division override here,
-  // because that bypasses the same race/segment candidates Goal Setting uses and was
-  // the reason Podium could differ from Goal Setting by a few seconds.
-  return withDivisionContext(div, ()=>{
-    const targetHpi = calcHPI();
-    return predictTime(targetHpi, weeksToRace);
-  });
+  // IMPORTANT: podium prediction must use the exact selected race Division.
+  // HPI/physiology remains base-category aware, but race evidence and race benchmarks
+  // must not pool Open with Open Doubles or Pro with Pro Doubles.
+  const prevPredictionDivision = PREDICTION_DIVISION_OVERRIDE;
+  PREDICTION_DIVISION_OVERRIDE = div;
+  try{
+    return withDivisionContext(div, ()=>{
+      const targetHpi = calcHPI();
+      return predictTime(targetHpi, weeksToRace);
+    });
+  } finally {
+    PREDICTION_DIVISION_OVERRIDE = prevPredictionDivision;
+  }
 }
 
 async function computePodiumAnalysis(){
