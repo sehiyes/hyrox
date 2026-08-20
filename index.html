@@ -2159,6 +2159,43 @@ function transitionCandidates(){
 // resolves ONE segment's current value. Priority: fresh actual (<=14d, same threshold as stations
 // elsewhere) > stale actual with a small capped nudge from the training-log trend (mirrors
 // getStationDataMeta's own logic, reused for stations) > benchmark reference (flagged, not "actual").
+// spec (doc8, 추가 필수사항): "10K TT를 HYROX Run pace와 동일시하지 말고, 기존 HYROX 데이터에서 확인
+// 가능한 관계/보정 로직을 사용" — a flat 10K TT pace is NOT the same as HYROX run-leg pace (fatigue,
+// footing, station transitions all slow it down), so this derives the athlete's OWN personal ratio
+// between their real HYROX run-leg pace (race or simulation) and their nearest-preceding 10K TT pace,
+// from their own paired history only. Never a universal constant, never used with fewer than 2 pairs.
+const TENK_PAIR_WINDOW_DAYS = 45;
+function computePersonalRunToTenKRatio(){
+  const myDiv=currentProfileDivisionBase();
+  const runEvents=[];
+  [...STATE.races].filter(r=>divisionBase(r.division)===myDiv).forEach(r=>{
+    const legs=RUN_KEYS.map(k=>parseTimeToSec(r.runs?.[k])).filter(v=>v!=null);
+    if(legs.length) runEvents.push({ date:r.date, paceSecKm: mean(legs) });
+  });
+  STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
+    const legs=RUN_KEYS.map(k=>{
+      const r=t.runs&&t.runs[k]; if(!r||!r.time||!r.distanceM) return null;
+      const sec=parseTimeToSec(r.time); return sec? (sec/r.distanceM)*1000 : null;
+    }).filter(v=>v!=null);
+    if(legs.length) runEvents.push({ date:t.date, paceSecKm: mean(legs) });
+  });
+  const tenKEvents = STATE.trainingLog.filter(l=>l.type==="tt" && l.distanceKm!=null && l.distanceKm>=9 && l.distanceKm<=11 && l.avgPaceSecKm)
+    .map(l=>({ date:l.date, paceSecKm:Number(l.avgPaceSecKm) }));
+  if(!runEvents.length || !tenKEvents.length) return null;
+  const ratios=[];
+  runEvents.forEach(re=>{
+    const nearby = tenKEvents.filter(te=>{ const d=daysBetween(te.date, re.date); return d>=0 && d<=TENK_PAIR_WINDOW_DAYS; })
+      .sort((a,b)=>daysBetween(a.date,re.date)-daysBetween(b.date,re.date));
+    if(nearby.length) ratios.push(re.paceSecKm/nearby[0].paceSecKm);
+  });
+  if(ratios.length<2) return null;
+  ratios.sort((a,b)=>a-b);
+  const mid=Math.floor(ratios.length/2);
+  const median = ratios.length%2 ? ratios[mid] : (ratios[mid-1]+ratios[mid])/2;
+  // sanity bounds only guard a single noisy pair from producing a nonsense multiplier — the value
+  // itself always comes from the athlete's own real paired data, never invented.
+  return { ratio: clamp(median, 0.7, 1.6), n: ratios.length };
+}
 function resolveSegment(seg){
   const b=bench();
   if(seg.type==="station"){
@@ -2188,8 +2225,19 @@ function resolveSegment(seg){
       return { ...seg, sec, rawSec:top.sec, date:top.date, ageDays, isFresh, source:top.source, adjusted,
         benchmark:legBench.sec, benchmarkSource:legBench.source, basis: isFresh?"actual":(adjusted?"actual-adjusted":"actual-stale") };
     }
-    // no race run-split at all -> fall back to recent logged running pace (Tier 2 signal only)
+    // no race run-split at all -> fall back to recent logged running pace (Tier 2 signal only),
+    // refined by the personal 10K->HYROX-run-leg calibration above when enough of the athlete's own
+    // paired data exists — otherwise identical to the previous flat recentRunPaceAvg() behavior.
     const paceAvg=recentRunPaceAvg(21);
+    const latestTenK = STATE.trainingLog.filter(l=>l.type==="tt" && l.distanceKm!=null && l.distanceKm>=9 && l.distanceKm<=11 && l.avgPaceSecKm)
+      .sort((a,b)=>b.date.localeCompare(a.date))[0];
+    const personalRatio = latestTenK ? computePersonalRunToTenKRatio() : null;
+    if(latestTenK && personalRatio && daysBetween(latestTenK.date, todayISO())<=21){
+      const calibratedSec = Number(latestTenK.avgPaceSecKm) * personalRatio.ratio;
+      const sec = paceAvg ? (calibratedSec+paceAvg)/2 : calibratedSec;
+      return { ...seg, sec, benchmark:legBench.sec, benchmarkSource:legBench.source, basis:"estimated-10k-calibrated",
+        source:"trainingLog", calibration:{ ratio:Math.round(personalRatio.ratio*100)/100, pairSamples:personalRatio.n, tenKDate:latestTenK.date } };
+    }
     if(paceAvg) return { ...seg, sec:paceAvg, benchmark:legBench.sec, benchmarkSource:legBench.source, basis:"estimated-training-pace", source:"trainingLog" };
     return { ...seg, sec:null, benchmark:legBench.sec, benchmarkSource:legBench.source, basis:"benchmark-only" };
   }
@@ -5315,12 +5363,25 @@ function deriveBenchmarkGender(){
 // GLOBAL_HISTORICAL_AGE_RELAXED -> GLOBAL_MATRIX -> null (caller falls through to the existing
 // hardcoded bench() as STATIC_FALLBACK). Each step queries ONE source in isolation — never merged.
 const DERIVED_BENCHMARK_FALLBACK_ORDER = ["ASIA","ASIA_AGE_RELAXED","GLOBAL_HISTORICAL","GLOBAL_HISTORICAL_AGE_RELAXED","GLOBAL_MATRIX"];
+// KEY-MAPPING FIX (found while wiring DNA -> Podium, doc8): benchmark_rows[].segment uses "run_1".."run_8"
+// (underscore) for individual run legs, but every caller in this file (PEER_SEGMENTS, SEGMENT_LIST,
+// runLegBenchmarkSec/"run"+runIdx) uses "run1".."run8" (no underscore). That mismatch meant EVERY
+// per-run-leg lookup against the real ASIA/Global derived benchmark silently failed and fell straight
+// through to STATIC_FALLBACK — for every user, no matter how much real Run-leg data existed — which is
+// almost certainly the actual root cause behind the recurring "Run 1-8 percentile" issues in this
+// project. Normalizing the key here (once, inside the resolver) fixes every caller at once: DNA's own
+// Run 1-8 percentile/Z-score (queryPeerSegmentStats), the segment-model prediction baseline
+// (getSegmentBenchmarkSec/runLegBenchmarkSec), and the new Podium DNA connection below.
+function normalizeDerivedBenchmarkSegmentKey(segment){
+  return /^run[1-8]$/.test(segment) ? "run_"+segment.slice(3) : segment;
+}
 function queryDerivedBenchmark(division, gender, ageBand, segment){
   if(!DERIVED_BENCHMARK.length) return null;
+  const normalizedSegment = normalizeDerivedBenchmarkSegmentKey(segment);
   for(const source of DERIVED_BENCHMARK_FALLBACK_ORDER){
     const ageRelaxed = source.endsWith("_AGE_RELAXED") || source==="GLOBAL_MATRIX";
     const row = DERIVED_BENCHMARK.find(r=> r.benchmark_source===source && r.division===division && r.gender===gender
-      && r.segment===segment && r.age_band===(ageRelaxed?null:ageBand));
+      && r.segment===normalizedSegment && r.age_band===(ageRelaxed?null:ageBand));
     if(row) return row;
   }
   return null;
@@ -5624,6 +5685,88 @@ const PODIUM_RANGE_Z = 1.036;
 
 // spec §11: 대회/지역 -> Division/Gender/AgeGroup 순으로 fallback. EXTERNAL_RACE_DB is the SAME table
 // hyroxDbRowToExternal()/queryPeerSegmentStats() already populate and read — no new data structure.
+/* ---------------------------------------------------------------------- */
+/* PODIUM <-> DNA CONNECTION (doc8)                                        */
+/*   predictTime()'s existing Segment Model (buildRaceSegmentModel ->      */
+/*   resolveSegment, which already prioritizes real race/simulation actuals*/
+/*   and already falls back to the SAME queryDerivedBenchmark() ASIA/Global*/
+/*   chain DNA uses) is the SAME underlying real data DNA's percentile is  */
+/*   computed from — actual seconds vs. peer-mean seconds. Re-injecting a  */
+/*   percentile-derived "adjustment" into predictedSec on top of that would*/
+/*   double-count the same facts, which is exactly the kind of invented    */
+/*   formula doc8 §18/§28 forbids. So this layer does NOT touch            */
+/*   predictedSec's formula. What it DOES add, as genuinely new/missing    */
+/*   connections:                                                          */
+/*     1) computeDnaRaceCompetitiveScore() — a race-time-WEIGHTED DNA       */
+/*        aggregate (doc8 §6/§7/§9 explicitly forbid a flat average across */
+/*        segments) surfaced on the Podium card as "DNA Race Score".       */
+/*     2) matrixImpliedPercentile()/checkDnaMatrixConsistency() — cross-    */
+/*        checks DNA percentile against GLOBAL_MATRIX's own P1-P100 time   */
+/*        buckets for the same segment and flags large disagreements as a  */
+/*        diagnostic (doc8 §13/§23, PODIUM-DNA-08) — surfaced, not hidden. */
+/*     3) The 10K-calibration + Simulation connections above already flow  */
+/*        into predictedSec THROUGH the existing Segment Model — this is   */
+/*        the real mechanism doc8's "predictedSec 자체를 변경" ask maps to. */
+/* ---------------------------------------------------------------------- */
+// Time-weighted DNA aggregate: each segment's percentile is weighted by its share of the athlete's
+// OWN actual total race time, not counted equally with every other segment — a 20s Sled Push swing
+// matters far less to the overall race than a 3min Running total swing (doc8 §6/§7 explicitly forbid
+// the flat/simple average). Uses computePeerAnalysis()'s own segment percentiles/actuals as-is — no
+// new statistics, purely a race-level aggregation layer on top of the existing DNA numbers.
+function computeDnaRaceCompetitiveScore(peer){
+  if(!peer) return null;
+  const withData = peer.segments.filter(s=>s.actual!=null && s.percentile!=null && s.actual>0);
+  if(!withData.length) return null;
+  const totalSec = withData.reduce((sum,s)=>sum+s.actual,0);
+  if(totalSec<=0) return null;
+  const weightedPercentile = withData.reduce((sum,s)=> sum + s.percentile*(s.actual/totalSec), 0);
+  return { score: clamp(weightedPercentile,0.5,99.5), segmentCount: withData.length, totalWeightedSec: totalSec };
+}
+// benchmark_rows' p1..p100 fields are TIME buckets in ASCENDING order (a small bucket number = a FAST/
+// elite time; a large one = a SLOW time) — the OPPOSITE convention from DNA's own percentile (higher =
+// better/faster). This interpolates the athlete's actual segment time within the row's real buckets and
+// flips it to DNA's "higher = better" convention, so the two numbers are directly comparable. Returns
+// null (never a guess) when the row has fewer than 2 usable buckets.
+const BENCHMARK_PERCENTILE_BUCKETS = [
+  { key:"p1", pct:1 }, { key:"p10", pct:10 }, { key:"p25", pct:25 }, { key:"p50", pct:50 },
+  { key:"p75", pct:75 }, { key:"p90", pct:90 }, { key:"p100", pct:100 },
+];
+function matrixImpliedPercentile(row, actualSec){
+  if(!row || actualSec==null) return null;
+  const buckets = BENCHMARK_PERCENTILE_BUCKETS.map(b=>({ pct:b.pct, sec:row[b.key] })).filter(b=>b.sec!=null).sort((a,b)=>a.sec-b.sec);
+  if(buckets.length<2) return null;
+  if(actualSec<=buckets[0].sec) return clamp(100-buckets[0].pct, 0.5, 99.5);
+  if(actualSec>=buckets[buckets.length-1].sec) return clamp(100-buckets[buckets.length-1].pct, 0.5, 99.5);
+  for(let i=0;i<buckets.length-1;i++){
+    const a=buckets[i], b=buckets[i+1];
+    if(actualSec>=a.sec && actualSec<=b.sec){
+      const frac=(actualSec-a.sec)/(b.sec-a.sec);
+      const timeRankPct=a.pct+frac*(b.pct-a.pct);
+      return clamp(100-timeRankPct, 0.5, 99.5);
+    }
+  }
+  return null;
+}
+const DNA_MATRIX_DIVERGENCE_THRESHOLD = 20; // percentile points — diagnostic-only flag, not a correction
+function checkDnaMatrixConsistency(peer){
+  if(!peer || !DERIVED_BENCHMARK.length) return [];
+  const benchGender = deriveBenchmarkGender();
+  const flags=[];
+  peer.segments.forEach(seg=>{
+    if(seg.actual==null || seg.percentile==null) return;
+    const segKey = seg.key==="roxzone" ? "transition" : normalizeDerivedBenchmarkSegmentKey(seg.key);
+    const matrixRow = DERIVED_BENCHMARK.find(r=>r.benchmark_source==="GLOBAL_MATRIX" && r.division===STATE.profile.division
+      && r.gender===benchGender && r.segment===segKey);
+    if(!matrixRow) return;
+    const matrixPct = matrixImpliedPercentile(matrixRow, seg.actual);
+    if(matrixPct==null) return;
+    const diff = Math.abs(seg.percentile-matrixPct);
+    if(diff>=DNA_MATRIX_DIVERGENCE_THRESHOLD){
+      flags.push({ key:seg.key, label:seg.label, dnaPercentile:round1(seg.percentile), matrixPercentile:round1(matrixPct), diff:round1(diff), dnaSource:seg.benchmarkSource });
+    }
+  });
+  return flags;
+}
 function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
   const base = EXTERNAL_RACE_DB.filter(r=>
     r.division===division && r.gender===gender && r.age_group===ageGroup && r.overall_time!=null);
@@ -5663,6 +5806,12 @@ function computePodiumAnalysis(){
   const dRace=daysToRace();
   const weeksToRace = dRace!=null ? clamp(dRace/7,0,20) : 0;
   const pred=predictTime(hpiResult, weeksToRace); // unmodified prediction engine — current estimate + range
+  // doc8: DNA Race Score + Matrix consistency, surfaced alongside (not injected into) pred — see the
+  // PODIUM <-> DNA CONNECTION block above for why predictedSec itself is intentionally left untouched.
+  const peer = computePeerAnalysis();
+  const dnaScore = computeDnaRaceCompetitiveScore(peer);
+  const dnaConsistencyFlags = checkDnaMatrixConsistency(peer);
+  const dnaWeaknessRank = getDnaWeaknessRanking(3);
   const goalDiv = p.goalDivision || p.division;
   const genderStr = p.gender==="female" ? "female":"male";
   const ageGroup = getAgeGroup(Number(p.age));
@@ -5670,7 +5819,7 @@ function computePodiumAnalysis(){
   const benchmark = computePodiumBenchmark(eventName, goalDiv, genderStr, ageGroup);
   const predConf = calcPredictionConfidence();
   const result = { predicted:pred.predicted, ciLow:pred.ciLow, ciHigh:pred.ciHigh, predConfidence:predConf.label,
-    benchmark, goalDiv, eventName, weeksToRace, dRace };
+    benchmark, goalDiv, eventName, weeksToRace, dRace, dnaScore, dnaConsistencyFlags, dnaWeaknessRank };
   if(benchmark.scope==="insufficient"){ result.status="insufficient"; return result; }
   const cutoff = benchmark.podium[Math.min(2, benchmark.podium.length-1)];
   result.status="ok";
@@ -6917,7 +7066,7 @@ function renderMyGoalPodiumResult(wrap){
   }
   const podium=r.benchmark.podium;
   const gapPositive = r.gapSec>0; // still need to get faster
-  const rank = getDnaWeaknessRanking(3);
+  const rank = r.dnaWeaknessRank || getDnaWeaknessRanking(3);
   const medalEmoji=["🥇","🥈","🥉"];
   el.innerHTML = `<div class="card" style="margin-top:14px;padding:0;overflow:hidden;border:1px solid var(--line);">
     <div style="padding:22px 20px 20px;text-align:center;background:radial-gradient(120% 140% at 50% -10%, var(--orange-glow), transparent 60%);border-bottom:1px solid var(--line);">
@@ -6927,6 +7076,9 @@ function renderMyGoalPodiumResult(wrap){
       <div style="font-size:11px;letter-spacing:1px;color:var(--gray-dim);margin-top:2px;">PODIUM CHANCE</div>
       <div style="display:inline-block;margin-top:10px;padding:5px 14px;border-radius:20px;background:var(--surface2);font-size:13px;font-weight:700;">${r.qual.emoji} ${r.qual.label}</div>
       <p class="reason-line" style="font-family:var(--font-body);color:var(--white);margin-top:10px;">${podiumQualSentence(r.probability)}</p>
+      ${r.dnaScore ? `<div style="display:inline-flex;align-items:center;gap:6px;margin-top:12px;padding:6px 14px;border-radius:20px;background:var(--surface2);">
+        <span style="font-size:11px;color:var(--gray-dim);">DNA Race Score</span><span class="mono" style="font-size:14px;font-weight:800;color:var(--orange);">${round1(r.dnaScore.score)}%</span>
+      </div>` : ""}
     </div>
 
     <div style="padding:18px 20px;">
@@ -6947,6 +7099,11 @@ function renderMyGoalPodiumResult(wrap){
       <div class="row-between" style="padding:8px 0 0;margin-top:10px;border-top:1px solid var(--line);">
         <span style="font-size:11.5px;color:var(--gray);">안정적인 목표</span><span class="mono" style="font-size:13px;font-weight:700;color:var(--green);">${fmtTime(r.safeTarget)}</span>
       </div>
+      ${r.dnaScore ? `<p class="reason-line" style="margin-top:8px;">DNA Race Score는 Run 1~8·Station·Transition 각 구간의 동일 그룹 percentile을 <b>실제 소요 시간 비중으로 가중 평균</b>한 값입니다 (단순 평균 아님) — 위 예상 기록에는 이미 실제 기록·최근 Simulation·ASIA/Global 벤치마크가 반영되어 있고, 이 점수는 그 근거를 요약해서 보여드리는 것입니다.</p>` : ""}
+      ${r.dnaConsistencyFlags && r.dnaConsistencyFlags.length ? `<div style="margin-top:10px;padding:9px 11px;background:var(--surface2);border-radius:8px;">
+        <div style="font-size:11.5px;font-weight:700;color:var(--amber);">⚠ Benchmark 소스 확인 필요</div>
+        ${r.dnaConsistencyFlags.map(f=>`<div class="reason-line" style="margin-top:3px;">${escapeHtml(f.label)}: DNA ${f.dnaPercentile}% vs GLOBAL MATRIX ${f.matrixPercentile}% (차이 ${f.diff}%p, 현재 DNA 소스: ${escapeHtml(f.dnaSource||"—")})</div>`).join("")}
+      </div>` : ""}
     </div>
 
     <div class="divider" style="margin:0;"></div>
@@ -6960,7 +7117,7 @@ function renderMyGoalPodiumResult(wrap){
             ${it.reason? `<div class="reason-line" style="margin-top:1px;">${escapeHtml(it.reason)}</div>` : ""}
           </div>
         </div>`).join("") : `<div class="empty-note">데이터가 더 쌓이면 표시됩니다</div>`}
-      ${rank.source!=="dna" ? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ 동일 그룹 비교 데이터가 부족해 훈련 우선순위 지표로 대체 표시 중입니다.</p>` : `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ DNA 페이지의 동일 그룹 비교 기준과 동일합니다.</p>`}
+      ${rank.source!=="dna" ? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ 동일 그룹 비교 데이터가 부족해 훈련 우선순위 지표로 대체 표시 중입니다.</p>` : `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">※ DNA 페이지의 동일 그룹 비교 기준과 동일합니다. 강점 구간(예: 이미 빠른 구간)은 이 목록에 포함되지 않습니다.</p>`}
     </div>
 
     <div class="divider" style="margin:0;"></div>
