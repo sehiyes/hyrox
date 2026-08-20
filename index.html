@@ -457,6 +457,42 @@ function escapeHtml(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&
 /* ---------------------------------------------------------------------- */
 const MEM_FALLBACK = {};
 let storageWarned = false;
+/* BUG FIX — "업로드 이력이 매번 사라짐"
+ *
+ * window.storage 는 이 앱이 Claude artifact 안에서 실행될 때만 존재하는 API다.
+ * GitHub Pages / 자체 호스팅 / file:// 로 열면 window.storage 가 아예 없어서,
+ * 아래 두 함수가 전부 MEM_FALLBACK(= 단순 자바스크립트 객체)으로 떨어졌다.
+ * MEM_FALLBACK 은 페이지를 새로고침하면 통째로 사라진다.
+ *
+ * STATE(hps:state:v1)는 로그인 시 Supabase user_data 로 따로 동기화되기 때문에
+ * 살아남았지만, 업로드 이력(hps:hyroxUploadLog:v1)은 Supabase 동기화 대상이
+ * 아니라서 새로고침 때마다 초기화됐던 것이다.
+ *
+ * 그래서 localStorage 계층을 중간에 추가한다:
+ *   window.storage  (있으면 최우선)  ->  localStorage  ->  MEM_FALLBACK
+ * localStorage 는 용량 한도(~5MB)가 있으므로 실패해도 절대 던지지 않고,
+ * 그 경우 기존처럼 MEM_FALLBACK 으로 세션 내에서만 유지된다.
+ */
+const LS_PREFIX = "hps:ls:";
+function lsGet(key){
+  try{
+    if(typeof localStorage==="undefined") return undefined;
+    const raw=localStorage.getItem(LS_PREFIX+key);
+    return raw==null? undefined : JSON.parse(raw);
+  }catch(e){ return undefined; }
+}
+function lsSet(key, value){
+  try{
+    if(typeof localStorage==="undefined") return false;
+    localStorage.setItem(LS_PREFIX+key, JSON.stringify(value));
+    return true;
+  }catch(e){
+    // QuotaExceededError 등 — EXTERNAL_RACE_DB 처럼 큰 데이터는 여기서 실패할 수 있다.
+    // 실패해도 조용히 넘어간다 (MEM_FALLBACK 과 Supabase 동기화가 각각 제 역할을 한다).
+    if(!lsSet._warned){ console.warn("localStorage 저장 실패(세션 내 데이터는 유지됩니다):", e?.name||e); lsSet._warned=true; }
+    return false;
+  }
+}
 const StorageService = {
   async get(key, fallback){
     try{
@@ -465,19 +501,25 @@ const StorageService = {
         return r ? JSON.parse(r.value) : fallback;
       }
     }catch(e){ /* key not found or storage unavailable */ }
-    return key in MEM_FALLBACK ? MEM_FALLBACK[key] : fallback;
+    if(key in MEM_FALLBACK) return MEM_FALLBACK[key];
+    const fromLs = lsGet(key);
+    if(fromLs!==undefined){ MEM_FALLBACK[key]=fromLs; return fromLs; }
+    return fallback;
   },
   async set(key, value){
     MEM_FALLBACK[key]=value;
+    let persisted=false;
     try{
       if(window.storage && window.storage.set){
         await window.storage.set(key, JSON.stringify(value), false);
+        persisted=true;
       }
     }catch(e){
       // transient platform-side hiccup — MEM_FALLBACK above already keeps data intact for this session,
       // so this is non-fatal. Log once rather than spamming on every keystroke's debounced autosave.
       if(!storageWarned){ console.warn("자동저장에 일시적 문제가 있습니다 (세션 내 데이터는 유지됩니다):", e?.message||e); storageWarned=true; }
     }
+    if(!persisted) lsSet(key, value);
   }
 };
 
@@ -6916,12 +6958,44 @@ async function fetchPodiumDivisionRowsFromSupabase(division){
 //드는 데 필요한 기준"이 아니다. 아래는 이벤트(대회)별로 실제 3위 기록을 먼저 추출하고, 그 분포의
 // median(또는 지정 percentile)을 최종 기준으로 삼는다 — 특정 대회 하나의 극단적으로 빠른 기록 때문에
 // 기준이 지나치게 낮아지는 것도 방지된다.
+/* DATA-QUALITY FIX — event 라벨에 연도가 빠진 행 처리
+ *
+ * Supabase hyrox_results 의 일부 행은 event 가 "HYROX Incheon" 처럼 연도 없이 저장돼 있다.
+ * 그러면 2024 Incheon 과 2025 Incheon 이 같은 대회 하나로 합쳐진다. 표시가 헷갈리는 것으로
+ * 끝나지 않는다 — 포디움 기준이 "대회별 3위의 median" 이라, 두 해가 한 대회로 묶이면
+ * 그 안에서 뽑히는 "3위"는 두 대회를 통합한 3위가 되어 기준 자체가 왜곡된다.
+ * (예: 2024 3·2·1위가 상위를 차지하면 2025 대회의 3위는 아예 반영되지 않는다.)
+ *
+ * DB를 고치는 게 근본 해결이지만(아래 SQL 참고), 그 전까지도 결과가 틀리면 안 되므로
+ * 읽는 시점에 date 로 연도를 복원해서 대회 키를 분리한다. 원본 데이터는 건드리지 않는다.
+ *   "HYROX Incheon" + date 2024-11-02  ->  "HYROX Incheon 2024"
+ *   "HYROX Incheon 2025"               ->  그대로 (이미 연도 있음)
+ *   "HYROX Incheon" + date 없음        ->  "HYROX Incheon (연도미상)"
+ */
+function eventHasYear(name){ return /\b(19|20)\d{2}\b/.test(String(name||"")); }
+function canonicalEventKey(row){
+  const raw=String(row&&row.event||"").trim();
+  if(!raw) return "";
+  if(eventHasYear(raw)) return raw;
+  const y=String(row&&row.date||"").slice(0,4);
+  return /^(19|20)\d{2}$/.test(y) ? `${raw} ${y}` : `${raw} (연도미상)`;
+}
+// 사용자가 입력한 대회명이 연도 없이 들어와도 매칭되도록 느슨하게 비교한다.
+function eventNameMatches(row, query){
+  if(!query) return true;
+  const q=String(query).trim().toLowerCase();
+  if(!q) return true;
+  const raw=String(row&&row.event||"").trim().toLowerCase();
+  const key=canonicalEventKey(row).toLowerCase();
+  return raw===q || key===q || key.includes(q) || raw.includes(q);
+}
 const PODIUM_MIN_EVENT_FINISHERS = 3; // an event needs >=3 valid finishers to have a real 3rd place
 const PODIUM_MIN_EVENTS_FOR_TIER = 1; // >=1 qualifying event required before a tier is usable at all
 function computeEventPodiums(rows){
   const byEvent=new Map();
   rows.forEach(r=>{
-    const key=(r.event||"").trim();
+    // 연도가 빠진 event 라벨은 date 로 연도를 복원해 대회를 분리한다 (canonicalEventKey 헤더 참고).
+    const key=canonicalEventKey(r);
     if(!key) return; // no event label — can't attribute to a specific race, excluded from event-level analysis
     if(!byEvent.has(key)) byEvent.set(key, []);
     byEvent.get(key).push(r);
@@ -6991,7 +7065,8 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
   if(eventName){
     const ageFiltered = genderRows.filter(r=>r.age_group===ageGroup);
     const validRows = ageFiltered.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
-    const evRows = validRows.filter(r=>r.event && r.event.trim().toLowerCase()===eventName.trim().toLowerCase());
+    // 연도 없이 저장된 event 라벨도 매칭되도록 canonicalEventKey 기준으로 비교한다.
+    const evRows = validRows.filter(r=>eventNameMatches(r, eventName));
     if(evRows.length>=PODIUM_MIN_EVENT_FINISHERS){
       const sorted=[...evRows].sort((a,b)=>a.overall_time-b.overall_time);
       const built = { podium:[sorted[0].overall_time, sorted[1].overall_time, sorted[2].overall_time],
@@ -10071,18 +10146,27 @@ async function appendHyroxUploadLog(entry){
     if(!Array.isArray(log)) log=[];
     log.unshift(entry);
     log = log.slice(0,100);
+    // shared 저장소(여러 관리자 공유)는 window.storage 가 있을 때만 가능하다. 없을 때는
+    // StorageService 를 통해 localStorage 로 내려가 최소한 이 브라우저에서는 이력이 남는다.
     if(window.storage && window.storage.set) await window.storage.set("hps:hyroxUploadLog:v1", JSON.stringify(log), true);
-    else await StorageService.set("hps:hyroxUploadLog:v1", log);
+    await StorageService.set("hps:hyroxUploadLog:v1", log);
   }catch(e){ console.warn("upload log 저장 실패(업로드 자체는 정상 처리됨):", e?.message||e); }
 }
 async function loadHyroxUploadLog(){
+  let shared=null;
   try{
     if(window.storage && window.storage.get){
       const r = await window.storage.get("hps:hyroxUploadLog:v1", true);
-      return r ? JSON.parse(r.value) : [];
+      shared = r ? JSON.parse(r.value) : null;
     }
   }catch(e){ /* 키 없음 — 정상 */ }
-  return await StorageService.get("hps:hyroxUploadLog:v1", []);
+  const local = await StorageService.get("hps:hyroxUploadLog:v1", []);
+  // 공유 이력과 로컬 이력을 id 기준으로 합쳐서 최신순으로. 둘 중 하나만 있어도 정상 동작한다.
+  const merged = [...(Array.isArray(shared)?shared:[]), ...(Array.isArray(local)?local:[])];
+  const seen=new Set(), out=[];
+  merged.forEach(e=>{ const k=e&&(e.id||`${e.uploadedAt}|${e.fileName}`); if(!k||seen.has(k)) return; seen.add(k); out.push(e); });
+  out.sort((a,b)=>String(b.uploadedAt||"").localeCompare(String(a.uploadedAt||"")));
+  return out.slice(0,100);
 }
 /* ----------------------------------------------------------------------
  * HYROX RESULT SEARCH DB — Supabase-backed
@@ -12779,6 +12863,39 @@ function podiumBasisRowsHtml(rows){
 // 실제 HYROX 결과 DB 가져오기 — Race DNA 페이지에서 여기로 이동 (DNA 페이지는 분석 결과만 보여주고,
 // 데이터 관리는 모델 설명 쪽 탭에서 하도록 분리).
 
+/* 업로드 이력은 "누가 언제 올렸는가"의 기록이고, 이건 한 번 사라지면 복구할 방법이 없다.
+   하지만 "지금 DB에 어떤 대회가 몇 건 들어있는가"는 데이터 자체에서 항상 다시 계산할 수
+   있다. 이력이 비어 있어도 실무적으로 알고 싶은 건 대부분 이쪽이므로 같이 보여준다.
+   이미 동기화된 EXTERNAL_RACE_DB 를 로컬에서 집계하므로 추가 쿼리가 없다. */
+function hyroxDbEventSummaryHtml(){
+  const agg={};
+  (EXTERNAL_RACE_DB||[]).forEach(r=>{
+    const k=canonicalEventKey(r)||"(대회명 없음)";
+    const a=agg[k]=agg[k]||{ event:k, n:0, divisions:new Set(), minDate:null, maxDate:null };
+    a.n++;
+    if(r.division) a.divisions.add(r.division);
+    if(!eventHasYear(r.event)) a.yearRecovered=true;
+    if(r.date){ if(!a.minDate||r.date<a.minDate) a.minDate=r.date; if(!a.maxDate||r.date>a.maxDate) a.maxDate=r.date; }
+  });
+  const rows=Object.values(agg).sort((a,b)=>b.n-a.n);
+  if(!rows.length) return `<div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray">📦 현재 DB 구성</div>
+    <div class="empty-note">동기화된 DNA 비교 데이터가 없습니다.</div>`;
+  return `<div class="divider" style="margin:14px 0;"></div>
+    <div class="row-between"><div class="eyebrow gray">📦 현재 DB 구성 (대회별)</div>
+      <span class="mono" style="font-size:11px;color:var(--gray-dim);">${rows.length}개 대회 · ${(EXTERNAL_RACE_DB||[]).length.toLocaleString()}건</span></div>
+    <p class="reason-line" style="margin:6px 0 8px;">업로드 이력과 달리 이건 <b>데이터에서 직접 집계</b>한 것이라 이력이 없어도 항상 볼 수 있습니다. 단, 스플릿이 인식된 행(DNA 계산 가능 행) 기준이라 <code>hyrox_results</code> 전체 행 수보다 적을 수 있습니다.</p>
+    ${rows.some(a=>a.yearRecovered)? `<p class="reason-line" style="margin:0 0 8px;color:var(--amber);">⚠ <b>연도 보정됨</b> 표시가 붙은 대회는 Supabase <code>event</code> 값에 연도가 없어서, 각 행의 <code>date</code>로 연도를 복원해 분리한 것입니다. 포디움 기준(대회별 3위 median)이 연도별로 올바르게 나뉘도록 보정되지만, <b>원본 데이터를 고치는 편이 안전합니다</b> — <code>date</code>가 비어 있는 행은 "(연도미상)"으로 묶여 여전히 섞입니다.</p>`:""}
+    <div style="overflow-x:auto;"><table><thead><tr><th>대회</th><th class="num">건수</th><th>기간</th><th>Division</th></tr></thead><tbody>
+      ${rows.slice(0,60).map(a=>`<tr>
+        <td>${escapeHtml(a.event)}</td>
+        <td class="num mono">${a.n.toLocaleString()}</td>
+        <td style="white-space:nowrap;color:var(--gray-dim);font-size:11px;">${a.minDate? (a.minDate===a.maxDate? a.minDate : `${a.minDate} ~ ${a.maxDate}`) : "—"}</td>
+        <td style="font-size:11px;color:var(--gray-dim);">${escapeHtml([...a.divisions].join(", ")||"—")}${a.yearRecovered? ` <span class="chip" style="font-size:9.5px;color:var(--amber);">연도 보정됨</span>`:""}</td>
+      </tr>`).join("")}
+    </tbody></table></div>
+    ${rows.length>60? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">상위 60개 대회만 표시</p>`:""}`;
+}
 function renderModelDnaImportTab(wrap){
   const dbSize = EXTERNAL_RACE_DB.length;
   const sourceLabel = { supabase:"🟢 Supabase 공용 데이터셋", local:"🟡 로컬 캐시(오프라인)", none:"⚪ 데이터 없음" }[EXTERNAL_RACE_DB_SOURCE] || "⚪ 데이터 없음";
@@ -12856,7 +12973,8 @@ function renderModelDnaImportTab(wrap){
           <td class="num mono" style="color:var(--green);">${e.newRecords!=null?"+"+e.newRecords.toLocaleString():"확인불가"}</td>
           <td class="num mono">${e.totalAfter!=null?e.totalAfter.toLocaleString():"—"}</td>
         </tr>`).join("")}
-      </tbody></table></div>` : `<div class="empty-note">아직 업로드 이력이 없습니다</div>`}
+      </tbody></table></div>` : `<div class="empty-note">아직 업로드 이력이 없습니다 — 아래 "현재 DB 구성"에서 실제로 들어있는 대회는 확인할 수 있습니다.</div>`}
+      ${hyroxDbEventSummaryHtml()}
     `;
   }).catch(()=>{ logCard.querySelector("span.mono") && (logCard.querySelector("span.mono").textContent="불러오기 실패"); });
 
