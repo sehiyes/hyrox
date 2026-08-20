@@ -6144,9 +6144,13 @@ async function computePodiumBenchmark(eventName, division, gender, ageGroup){
 // null so the UI falls back to the existing ranked weakness list instead of a fabricated breakdown.
 const PODIUM_GAP_SEGMENT_FIELD = { ski:"ski", sledPush:"sled_push", sledPull:"sled_pull", burpee:"burpee",
   row:"row", carry:"carry", lunge:"lunge", wallball:"wallball" };
-function computePodiumGapDecomposition(predictedSec, cutoffRow){
+function computePodiumGapDecomposition(predictedSec, cutoffRow, targetDivision){
   if(!cutoffRow || predictedSec==null) return null;
-  const model = buildRaceSegmentModel();
+  // Podium GAP must use the same Division context as the predicted athlete time.
+  // Do not permanently mutate the athlete's base/profile Division.
+  const model = targetDivision
+    ? withDivisionContext(targetDivision, ()=>buildRaceSegmentModel())
+    : buildRaceSegmentModel();
   if(!model.total || model.total<=0) return null;
   const scale = predictedSec/model.total;
   const rows=[];
@@ -6183,20 +6187,39 @@ function computePodiumSafeTarget(ciLow, ciHigh, cutoffSec){
   const buffer = clamp(sigma*0.6, 15, 180);
   return cutoffSec - buffer;
 }
+
+// PODIUM DIVISION-AWARE PREDICTION
+// The podium benchmark already uses the selected goal Division, but the previous
+// implementation fed it a prediction from the athlete's base/profile Division.
+// That made Open / Open Doubles / Pro Doubles show the same "현재 예상 기록".
+// Reuse the existing production prediction engine under a temporary Division context
+// so all of its existing race/segment/benchmark fallback logic remains intact.
+// STATE.profile.division is always restored by withDivisionContext().
+function predictPodiumForDivision(targetDivision, weeksToRace){
+  const div = targetDivision || STATE.profile.division;
+  return withDivisionContext(div, ()=>{
+    const targetHpi = calcHPI();
+    return predictTime(targetHpi, weeksToRace);
+  });
+}
+
 async function computePodiumAnalysis(){
   const p=STATE.profile;
-  if(!p.targetDate) return null;
-  const hpiResult=calcHPI();
+  // Podium prediction uses the same race-date horizon as the Prediction page.
+  // e.g. 4 weeks to race -> 4-week forecast, 1 week -> 1-week forecast.
+  // The selected Division must also be the Division used by the prediction engine.
   const dRace=daysToRace();
   const weeksToRace = dRace!=null ? clamp(dRace/7,0,20) : 0;
-  const pred=predictTime(hpiResult, weeksToRace); // unmodified prediction engine — current estimate + range
+  // IMPORTANT: prediction and podium benchmark must use the SAME selected Division.
+  // Use the actual runway to race day, exactly like the Prediction page.
+  const goalDiv = p.goalDivision || p.division;
+  const pred = predictPodiumForDivision(goalDiv, weeksToRace);
   // doc8: DNA Race Score + Matrix consistency, surfaced alongside (not injected into) pred — see the
   // PODIUM <-> DNA CONNECTION block above for why predictedSec itself is intentionally left untouched.
   const peer = computePeerAnalysis();
   const dnaScore = computeDnaRaceCompetitiveScore(peer);
   const dnaConsistencyFlags = checkDnaMatrixConsistency(peer);
   const dnaWeaknessRank = getDnaWeaknessRanking(3);
-  const goalDiv = p.goalDivision || p.division;
   const genderStr = (p.goalGender || p.gender)==="female" ? "female":"male";
   const ageGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
   const eventName = (p.targetEventName||"").trim();
@@ -6209,7 +6232,8 @@ async function computePodiumAnalysis(){
   const cutoffRow = benchmark.podiumRows ? benchmark.podiumRows[Math.min(2, benchmark.podiumRows.length-1)] : null;
   result.status="ok";
   result.cutoff=cutoff;
-  result.gapDecomposition = computePodiumGapDecomposition(pred.predicted, cutoffRow);
+  result.gapDecomposition = computePodiumGapDecomposition(pred.predicted, cutoffRow, goalDiv);
+  result.predictionDivision = goalDiv;
   result.probability=computePodiumProbability(pred.predicted, pred.ciLow, pred.ciHigh, cutoff);
   result.qual=probToQualLabel(result.probability);
   result.safeTarget=computePodiumSafeTarget(pred.ciLow, pred.ciHigh, cutoff);
@@ -7574,7 +7598,7 @@ function renderMyGoalPodiumResult(wrap){
       <div class="eyebrow gray">🏆 포디움 가능성</div>
       <p class="lead" style="margin:8px 0;">${escapeHtml(r.goalDiv)} · 동일 조건 실제 선수 데이터 ${r.benchmark.n}건 — <b style="color:var(--amber);">포디움 기준 데이터가 부족합니다.</b></p>
       <div class="divider" style="margin:10px 0;"></div>
-      <div class="row-between"><span style="font-size:12.5px;color:var(--gray);">현재 예상 기록</span><span class="mono" style="font-size:15px;font-weight:700;">${fmtTime(r.predicted)}</span></div>
+      <div class="row-between"><span style="font-size:12.5px;color:var(--gray);">대회 당일 예상 기록</span><span class="mono" style="font-size:15px;font-weight:700;">${fmtTime(r.predicted)}</span></div>
       <p class="reason-line" style="margin-top:8px;">이 예상 기록의 신뢰도는 <b>${r.predConfidence}</b>입니다. 동일 Division·성별·연령대의 실제 결과 데이터가 더 쌓이면 포디움 기준을 계산해드립니다.</p>
     </div>`;
     return;
@@ -7599,7 +7623,7 @@ function renderMyGoalPodiumResult(wrap){
     <div style="padding:18px 20px;">
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;text-align:center;">
         <div>
-          <div style="font-size:10.5px;color:var(--gray-dim);">현재 예상 기록</div>
+          <div style="font-size:10.5px;color:var(--gray-dim);">대회 당일 예상 기록</div>
           <div style="font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:3px;">${fmtTime(r.predicted)}</div>
         </div>
         <div>
