@@ -734,6 +734,15 @@ function latestRace(divisionOverride){
   return r[0]||null;
 }
 const STATION_STALE_DAYS = 14;
+// doc9 §30-4: a SEPARATE, more lenient threshold than STATION_STALE_DAYS (14d, used elsewhere for the
+// small ±adjustment-nudge decision) specifically for "should Simulation even be considered at all when
+// an Official record already exists for this segment". The doc's own worked examples put Official-20-
+// days on the "still just use Official, ignore a newer Simulation" side and Official-30-days on the
+// "let Simulation supplement it" side — 21 days (3 weeks) sits between those two examples. Below this
+// threshold, Official is used directly and Simulation is never even added to the candidate pool for
+// that segment, however much fresher the Simulation entry is; at or beyond it, Simulation candidates
+// are added and normal recency ordering decides (unchanged mechanism, just gated at a different point).
+const OFFICIAL_VS_SIMULATION_GRACE_DAYS = 21;
 // cardio-driven stations: a measured running-pace trend is a fairly direct signal, so a larger cap applies.
 const ENGINE_STATIONS_ADJUSTABLE = ["ski","row","burpee"];
 const MAX_STALE_ADJUST_PCT = 0.05; // hard cap: ±5%, regardless of how strong the training trend looks
@@ -778,7 +787,7 @@ function collectStationCandidates(key){
   STATE.races.filter(r=>divisionBase(r.division)===myDiv).forEach(r=>{ const v=r.stations&&r.stations[key]; if(v) out.push({date:r.date, value:v, source:"race"}); });
   out.sort((a,b)=>b.date.localeCompare(a.date));
   const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=STATION_STALE_DAYS;
+  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
   if(!officialFresh){
     const stMeta=STATIONS.find(s=>s.key===key);
     const officialUnit=stMeta?stMeta.unit:null;
@@ -2124,7 +2133,7 @@ function runLegCandidates(runIdx){
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.runs?.[runIdx]), source:"race" }))
     .filter(c=>c.sec!=null);
   const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=STATION_STALE_DAYS;
+  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
   if(!officialFresh){
     STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
       const r=t.runs && t.runs[runIdx];
@@ -2143,7 +2152,7 @@ function transitionCandidates(){
     .map(r=>({ date:r.date, sec:parseTimeToSec(r.transition), source:"race" }))
     .filter(c=>c.sec!=null);
   const topOfficial=out[0];
-  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=STATION_STALE_DAYS;
+  const officialFresh = topOfficial && daysBetween(topOfficial.date, todayISO())<=OFFICIAL_VS_SIMULATION_GRACE_DAYS;
   if(!officialFresh){
     STATE.simulationTests.filter(t=>divisionBase(t.division)===myDiv).forEach(t=>{
       if(!t.transition) return;
@@ -5550,6 +5559,28 @@ function toSegmentListEntry(peerSeg){
   const key = peerSeg.key==="roxzone" ? "transition" : peerSeg.key;
   return SEGMENT_LIST.find(s=>s.key===key) || null;
 }
+// doc9 §30-2/§30-7/TEST-07: DNA/Peer percentile must reflect "실제 HYROX 선수 집단에서 본인의 위치" —
+// the athlete's OWN value must come from an official race split ONLY, never Simulation or trainingLog.
+// resolveSegment() (used everywhere else — Prediction, Station Priority, Training Plan) deliberately
+// DOES fall through to Simulation/trainingLog when official data is stale or missing, because those
+// engines answer "what can this athlete do right now"; DNA answers a different question ("where do I
+// rank among real HYROX finishers"), so it needs its own, strictly official-only resolver — reading
+// directly from the specific race object computePeerAnalysis is already analyzing, with NO fallback
+// tier beyond that. A segment with no official split for this race is null (not filled from anywhere
+// else), so DNA never silently shows a Simulation-derived number as if it were a real racing result.
+function resolveOfficialSegment(seg, race){
+  if(!race) return { sec:null, basis:"benchmark-only" };
+  if(seg.type==="run"){
+    const sec = parseTimeToSec(race.runs?.[seg.runIdx]);
+    return sec!=null ? { sec, date:race.date, source:"race", basis:"actual" } : { sec:null, basis:"benchmark-only" };
+  }
+  if(seg.type==="station"){
+    const sec = parseTimeToSec(race.stations?.[seg.key]);
+    return sec!=null ? { sec, date:race.date, source:"race", basis:"actual" } : { sec:null, basis:"benchmark-only" };
+  }
+  const sec = parseTimeToSec(race.transition);
+  return sec!=null ? { sec, date:race.date, source:"race", basis:"actual" } : { sec:null, basis:"benchmark-only" };
+}
 
 // Per-division adjustment applied to the PEER_SEGMENTS base (Open Singles) table, by segment kind.
 // Doubles reuses the same run-unchanged / station-split logic as the main BENCH table above.
@@ -5598,14 +5629,13 @@ function computePeerAnalysis(){
     // derived benchmark first, same resolver Prediction uses, illustrative model only as final fallback.
     const stats = queryPeerSegmentStats(seg, groupFilters);
     const { mean:peerMean, sd:peerSd, n:peerN, isReal:peerIsReal, benchmarkSource, sampleN } = stats;
-    // spec ⑤/⑥/⑦/⑯: "내 기록" now goes through the SAME resolveSegment() hierarchy the Prediction
-    // engine uses (Race actual > Station test > Training log > benchmark-only), instead of reading only
-    // the single latest race — no duplicated logic, and DNA/Prediction can never silently disagree about
-    // what the athlete's current per-segment number even IS. personalHistory adds the Latest/Best/Median/
-    // n/recency-weighted breakdown across ALL of the athlete's races in this exact division (spec ⑥),
-    // purely for display — it does not change which value feeds the z-score below.
+    // doc9 §30-2/§30-7/TEST-07: DNA's "actual" now comes ONLY from this specific official race —
+    // resolveOfficialSegment() has no Simulation/trainingLog fallback tier, so changing Simulation data
+    // can never move a DNA percentile/Z-score. (Prediction's own segment model, below/elsewhere, keeps
+    // using the full resolveSegment() hierarchy including Simulation — that's a deliberately different,
+    // separate question: "current estimated ability" vs. DNA's "position among real HYROX finishers".)
     const slEntry = toSegmentListEntry(seg);
-    const resolved = slEntry ? resolveSegment(slEntry) : null;
+    const resolved = slEntry ? resolveOfficialSegment(slEntry, race) : null;
     const actual = resolved && resolved.sec!=null ? resolved.sec : null;
     const personalHistory = getPersonalSegmentHistory(seg);
     const basis = resolved ? resolved.basis : null;
@@ -5779,9 +5809,43 @@ function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
 }
 function computePodiumBenchmark(eventName, division, gender, ageGroup){
   const group = computePodiumComparisonGroup(eventName, division, gender, ageGroup);
-  if(group.scope==="insufficient") return { ...group, podium:null };
+  if(group.scope==="insufficient") return { ...group, podium:null, podiumRows:null };
   const sorted=[...group.rows].sort((a,b)=>a.overall_time-b.overall_time);
-  return { ...group, podium: sorted.slice(0,3).map(r=>r.overall_time) }; // [1st,2nd,3rd]
+  const top3rows = sorted.slice(0,3);
+  return { ...group, podium: top3rows.map(r=>r.overall_time), podiumRows: top3rows }; // [1st,2nd,3rd]
+}
+// doc9 §25: Podium Gap decomposition into per-segment seconds — ONLY when the specific comparison
+// record (the actual 3rd-place row from EXTERNAL_RACE_DB) has its own real segment splits, which not
+// every uploaded CSV provides. The athlete's side reuses buildRaceSegmentModel()'s real 17-segment
+// breakdown (same real actuals/benchmarks predictTime() itself is built from), scaled by the single
+// factor that reconciles its total with predictTime()'s own predictedSec — a proportional
+// redistribution of the exact same number, not an invented one. Any segment missing from the cutoff
+// record is skipped rather than guessed; if fewer than half the segments can be compared this returns
+// null so the UI falls back to the existing ranked weakness list instead of a fabricated breakdown.
+const PODIUM_GAP_SEGMENT_FIELD = { ski:"ski", sledPush:"sled_push", sledPull:"sled_pull", burpee:"burpee",
+  row:"row", carry:"carry", lunge:"lunge", wallball:"wallball" };
+function computePodiumGapDecomposition(predictedSec, cutoffRow){
+  if(!cutoffRow || predictedSec==null) return null;
+  const model = buildRaceSegmentModel();
+  if(!model.total || model.total<=0) return null;
+  const scale = predictedSec/model.total;
+  const rows=[];
+  let accountedGap=0;
+  model.segments.forEach(seg=>{
+    const baseSec = seg.sec!=null ? seg.sec : seg.benchmark;
+    if(baseSec==null) return;
+    const mySec = baseSec*scale;
+    const field = seg.type==="run" ? "run_"+seg.runIdx : (seg.type==="transition" ? "transition" : PODIUM_GAP_SEGMENT_FIELD[seg.key]);
+    const cutoffSec = field!=null ? cutoffRow[field] : null;
+    if(cutoffSec==null) return; // not in the cutoff record — skip, never guess
+    const gap = mySec-cutoffSec;
+    rows.push({ label:seg.label, key:seg.key, gapSec:gap });
+    accountedGap += gap;
+  });
+  if(rows.length < model.segments.length*0.5) return null;
+  rows.sort((a,b)=>b.gapSec-a.gapSec);
+  const totalGap = predictedSec-cutoffRow.overall_time;
+  return { rows, totalGap, accountedGap, unaccountedGap: totalGap-accountedGap, coverage: rows.length/model.segments.length };
 }
 // P(actual finish time <= cutoff), given the SAME center/range predictTime() already reports —
 // never claims literal 0%/100% off a probabilistic estimate (spec §14/§15).
@@ -5822,8 +5886,10 @@ function computePodiumAnalysis(){
     benchmark, goalDiv, eventName, weeksToRace, dRace, dnaScore, dnaConsistencyFlags, dnaWeaknessRank };
   if(benchmark.scope==="insufficient"){ result.status="insufficient"; return result; }
   const cutoff = benchmark.podium[Math.min(2, benchmark.podium.length-1)];
+  const cutoffRow = benchmark.podiumRows ? benchmark.podiumRows[Math.min(2, benchmark.podiumRows.length-1)] : null;
   result.status="ok";
   result.cutoff=cutoff;
+  result.gapDecomposition = computePodiumGapDecomposition(pred.predicted, cutoffRow);
   result.probability=computePodiumProbability(pred.predicted, pred.ciLow, pred.ciHigh, cutoff);
   result.qual=probToQualLabel(result.probability);
   result.safeTarget=computePodiumSafeTarget(pred.ciLow, pred.ciHigh, cutoff);
@@ -6792,9 +6858,18 @@ function myRecordRowHtml(bigText, dateText, subText){
 let SIM_QUICK_DRAFT=null, TENK_QUICK_DRAFT=null, SIM_EDIT_ID=null, TENK_EDIT_ID=null;
 function openSimQuickAddModal(existing=null){
   SIM_EDIT_ID = existing?.id || null;
-  SIM_QUICK_DRAFT = existing
-    ? { date:existing.date, totalTime:existing.totalTime||"", division:existing.division||STATE.profile.division, note:existing.note||"" }
-    : { date:todayISO(), totalTime:"", division:STATE.profile.division, note:"" };
+  if(existing){
+    SIM_QUICK_DRAFT = {
+      date: existing.date, type: existing.type||"full", division: existing.division||STATE.profile.division,
+      totalTime: existing.totalTime||"", note: existing.note||"",
+      runs: Object.fromEntries(RUN_KEYS.map(k=>[k, existing.runs?.[k]]).filter(([,v])=>v)),
+      stations: Object.fromEntries(STATIONS.map(s=>[s.key, existing.stations?.[s.key]]).filter(([,v])=>v)),
+      transition: existing.transition || "",
+    };
+  } else {
+    SIM_QUICK_DRAFT = { date:todayISO(), type:"full", division:STATE.profile.division, totalTime:"", note:"",
+      runs:{}, stations:{}, transition:"" };
+  }
   renderSimQuickAddModal(); openModal();
 }
 function deleteSimRecord(id){
@@ -6802,31 +6877,93 @@ function deleteSimRecord(id){
   STATE.simulationTests = STATE.simulationTests.filter(s=>s.id!==id);
   persist(); showToast("Simulation 기록을 삭제했습니다"); renderSimFullListModal();
 }
+// doc7 §2 (full spec): 기존 기록을 불러와서 날짜/유형/Division/Run 1~8/Station/Transition/Total Time을
+// 전부 수정할 수 있어야 하고, 저장 시 새 기록이 아니라 기존 record를 update해야 한다 — 데스크톱의
+// renderSimulationTab() 입력 폼과 동일한 필드 구성을 모바일 모달 레이아웃으로 재사용(계산/저장 로직 중복
+//없이 STATE.simulationTests 스키마 그대로).
 function renderSimQuickAddModal(){
   const panel=document.getElementById("modal-panel"); const d=SIM_QUICK_DRAFT; const editing=!!SIM_EDIT_ID;
+  const runRow = (k)=>{
+    const r = d.runs[k]||{};
+    return `<div class="hstack" style="gap:6px;padding:4px 0;align-items:center;">
+      <span style="width:48px;font-size:12px;color:var(--gray);flex-shrink:0;">Run ${k}</span>
+      <input id="simq-run${k}-dist" type="number" placeholder="m" style="width:60px;flex-shrink:0;" value="${r.distanceM??""}">
+      <input id="simq-run${k}-time" placeholder="mm:ss" style="flex:1;min-width:0;" value="${escapeHtml(r.time||"")}">
+    </div>`;
+  };
+  const stRow = (s)=>{
+    const r = d.stations[s.key]||{};
+    return `<div class="hstack" style="gap:6px;padding:4px 0;align-items:center;">
+      <span style="width:96px;font-size:12px;color:var(--gray);flex-shrink:0;">${escapeHtml(s.label)}</span>
+      <input id="simq-st-${s.key}-amt" placeholder="${escapeHtml(s.unit)}" style="width:60px;flex-shrink:0;" value="${escapeHtml(r.amount||"")}">
+      <input id="simq-st-${s.key}-time" placeholder="mm:ss" style="flex:1;min-width:0;" value="${escapeHtml(r.time||"")}">
+    </div>`;
+  };
   panel.innerHTML = `
     <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="simq-close">✕</span></div>
+    <p class="lead" style="margin:6px 0 12px;">실제 대회 기록과 분리된 별도 저장소입니다. 입력하지 않은 구간은 비워두면 됩니다 — 임의로 채우지 않습니다.</p>
     <div class="field"><label>날짜</label><input id="simq-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}"></div>
-    <div class="field" style="margin-top:10px;"><label>총 기록 (h:mm:ss 또는 mm:ss)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
-    <div class="field" style="margin-top:10px;"><label>Division</label><select id="simq-div">${DIVISIONS.map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select></div>
+    <div class="field" style="margin-top:10px;"><label>유형</label><select id="simq-type">
+      <option value="full" ${d.type==="full"?"selected":""}>Full Simulation</option>
+      <option value="half" ${d.type==="half"?"selected":""}>Half Simulation</option>
+      <option value="custom" ${d.type==="custom"?"selected":""}>Custom Simulation</option>
+    </select></div>
+    <div class="field" style="margin-top:10px;"><label>Division (수행 기준)</label><select id="simq-div">${DIVISIONS.map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select></div>
+    <div class="field" style="margin-top:10px;"><label>총 기록 (선택, h:mm:ss)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
     <div class="field" style="margin-top:10px;"><label>메모 (선택)</label><input id="simq-note" placeholder="선택사항" value="${escapeHtml(d.note)}"></div>
+    <div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray" style="margin-bottom:2px;">Run 1~8 (거리m + 기록)</div>
+    ${RUN_KEYS.map(runRow).join("")}
+    <div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray" style="margin-bottom:2px;">Station (수행량 + 기록)</div>
+    ${STATIONS.map(stRow).join("")}
+    <div class="field" style="margin-top:12px;"><label>Transition/Roxzone (선택, mm:ss)</label><input id="simq-transition" placeholder="mm:ss" value="${escapeHtml(d.transition||"")}"></div>
     <button class="btn" id="simq-save" style="width:100%;justify-content:center;margin-top:16px;">${editing?"수정 저장":"저장"}</button>
-    ${editing? `<p class="reason-line" style="margin-top:8px;text-align:center;">Run 1~8·Station별 상세 기록 수정은 준비 중입니다 — 날짜/총기록/Division/메모만 수정할 수 있습니다.</p>` : ""}
   `;
   panel.querySelector("#simq-close").addEventListener("click", closeModal);
   panel.querySelector("#simq-date").addEventListener("change",e=>{ d.date=e.target.value; });
-  panel.querySelector("#simq-time").addEventListener("change",e=>{ d.totalTime=e.target.value; });
+  panel.querySelector("#simq-type").addEventListener("change",e=>{
+    d.type=e.target.value;
+    const defDist=SIM_RUN_DEFAULT_DIST[d.type];
+    if(defDist!=null){
+      RUN_KEYS.forEach(k=>{ const el=panel.querySelector(`#simq-run${k}-dist`); if(el && !el.value.trim()) el.value=defDist; });
+    }
+  });
   panel.querySelector("#simq-div").addEventListener("change",e=>{ d.division=e.target.value; });
+  panel.querySelector("#simq-time").addEventListener("change",e=>{ d.totalTime=e.target.value; });
   panel.querySelector("#simq-note").addEventListener("change",e=>{ d.note=e.target.value; });
+  panel.querySelector("#simq-transition").addEventListener("change",e=>{ d.transition=e.target.value; });
   panel.querySelector("#simq-save").addEventListener("click",()=>{
     if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
-    if(!parseTimeToSec(d.totalTime)){ showToast("총 기록을 mm:ss 또는 h:mm:ss 형식으로 입력해주세요"); return; }
+    const totalTime=panel.querySelector("#simq-time").value.trim();
+    if(totalTime && !parseTimeToSec(totalTime)){ showToast("총 기록을 mm:ss 또는 h:mm:ss 형식으로 입력해주세요"); return; }
+    const runs={};
+    RUN_KEYS.forEach(k=>{
+      const timeStr=panel.querySelector(`#simq-run${k}-time`).value.trim();
+      if(!timeStr) return;
+      const distStr=panel.querySelector(`#simq-run${k}-dist`).value.trim();
+      runs[k]={ distanceM: distStr? Number(distStr): null, time: timeStr };
+    });
+    const stations={};
+    STATIONS.forEach(s=>{
+      const timeStr=panel.querySelector(`#simq-st-${s.key}-time`).value.trim();
+      if(!timeStr) return;
+      const amtStr=panel.querySelector(`#simq-st-${s.key}-amt`).value.trim();
+      stations[s.key]={ amount: amtStr||null, time: timeStr };
+    });
+    const transition=panel.querySelector("#simq-transition").value.trim();
+    if(!Object.keys(runs).length && !Object.keys(stations).length && !totalTime){
+      showToast("최소 한 구간 이상 입력해주세요"); return;
+    }
+    const type=panel.querySelector("#simq-type").value;
+    const division=panel.querySelector("#simq-div").value;
+    const note=panel.querySelector("#simq-note").value.trim();
     if(editing){
       const rec = STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
-      if(rec){ rec.date=d.date; rec.totalTime=d.totalTime; rec.division=d.division; rec.note=d.note||""; }
+      if(rec){ rec.date=d.date; rec.type=type; rec.division=division; rec.totalTime=totalTime||null; rec.note=note||""; rec.runs=runs; rec.stations=stations; rec.transition=transition||null; }
       persist(); closeModal(); showToast("Simulation 기록을 수정했습니다"); renderAll();
     } else {
-      STATE.simulationTests.push({ id:uid(), date:d.date, type:"full", division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime, note:d.note||"", source:"manual" });
+      STATE.simulationTests.push({ id:uid(), date:d.date, type, division, runs, stations, transition:transition||null, totalTime:totalTime||null, note:note||"", source:"manual" });
       persist(); closeModal(); showToast("Simulation 기록이 저장되었습니다"); renderAll();
     }
   });
@@ -6885,7 +7022,7 @@ function renderSimFullListModal(){
       ${list.length? list.map(s=>`<div class="row-between" style="padding:10px 0;border-bottom:1px solid var(--line);">
         <div>
           <div style="font-family:var(--font-mono);font-size:15px;font-weight:700;">${escapeHtml(s.totalTime||"—")}</div>
-          <div style="font-size:10.5px;color:var(--gray-dim);margin-top:1px;">${fmtDateDots(s.date)} · ${escapeHtml(s.division||"")}${s.note?` · ${escapeHtml(s.note)}`:""}</div>
+          <div style="font-size:10.5px;color:var(--gray-dim);margin-top:1px;">${fmtDateDots(s.date)} · ${escapeHtml(s.division||"")} · Run ${Object.keys(s.runs||{}).length}/8 · Station ${Object.keys(s.stations||{}).length}/8${s.note?` · ${escapeHtml(s.note)}`:""}</div>
         </div>
         <div class="hstack" style="gap:6px;">
           <span class="chip sim-edit" data-id="${s.id}" style="cursor:pointer;font-size:11px;">수정</span>
@@ -7107,6 +7244,15 @@ function renderMyGoalPodiumResult(wrap){
     </div>
 
     <div class="divider" style="margin:0;"></div>
+    ${r.gapDecomposition ? `<div style="padding:18px 20px;">
+      <div class="eyebrow gray" style="margin-bottom:10px;">GAP 구간별 분해</div>
+      <p class="reason-line" style="margin-bottom:8px;">동일 조건 3위 기록의 실제 구간 splits와 비교 (일치 구간 ${round1(r.gapDecomposition.coverage*100)}%)</p>
+      ${r.gapDecomposition.rows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
+        <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("")}
+      ${Math.abs(r.gapDecomposition.unaccountedGap)>=1 ? `<div class="row-between" style="padding:4px 0;color:var(--gray-dim);"><span style="font-size:12.5px;">기타 (측정 방식 차이 등)</span><span class="mono" style="font-size:12.5px;">${r.gapDecomposition.unaccountedGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.unaccountedGap))}</span></div>` : ""}
+      <div class="row-between" style="padding:6px 0 0;margin-top:6px;border-top:1px solid var(--line);"><span style="font-size:12.5px;font-weight:700;">Total</span><span class="mono" style="font-size:12.5px;font-weight:800;">${r.gapDecomposition.totalGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.totalGap))}</span></div>
+    </div>
+    <div class="divider" style="margin:0;"></div>` : ""}
     <div style="padding:18px 20px;">
       <div class="eyebrow gray" style="margin-bottom:10px;">🔥 PODIUM GAP을 줄이려면</div>
       ${rank.items.length ? rank.items.map((it,i)=>`
@@ -7326,6 +7472,7 @@ const SEGMENT_BASIS_META = {
   "actual-adjusted":   { label:"실측(보정)",   cls:"low" },
   "actual-stale":      { label:"실측(오래됨)", cls:"med" },
   "estimated-training-pace": { label:"훈련로그 추정", cls:"med" },
+  "estimated-10k-calibrated": { label:"10K 보정 추정", cls:"med" },
   "benchmark-only":    { label:"Reference",   cls:"crit" },
 };
 function segmentModelTable(model){
