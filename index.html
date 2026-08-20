@@ -766,8 +766,11 @@ function divisionBase(divisionStr){
   if(s.includes("Mixed")) return "Mixed";
   return s.includes("Pro") ? "Pro" : "Open";
 }
+// Optional exact-Division context used only while a Division-specific prediction is being
+// calculated. Normal app behavior remains unchanged when this is null.
+let PREDICTION_DIVISION_OVERRIDE = null;
 function currentProfileDivisionBase(){
-  return divisionBase(STATE.profile.division) || "Open";
+  return PREDICTION_DIVISION_OVERRIDE || divisionBase(STATE.profile.division) || "Open";
 }
 // spec (Simulation -> 17-segment connection): official race/manual-test data ALWAYS wins outright
 // when it's fresh (<=STATION_STALE_DAYS, same existing constant used everywhere else in this file —
@@ -6071,7 +6074,11 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
     + `\n\nSupabase raw rows fetched: ${rawFetchedCount}${usedLiveQuery?` (division="${division}" 직접 query — cross-division 혼합 없음)`:` (로컬 캐시 폴백)`}`
     + `\nhyroxDbRowToExternal() 변환 성공 rows: ${convertedCount}`);
 
-  const genderRows = sourceRows.filter(r=>r.gender===gender);
+  // Mixed Doubles is a TEAM category, not an individual-sex category.
+  // Its podium benchmark must include both male and female Mixed Doubles teams.
+  const genderRows = division==="Mixed Doubles"
+    ? sourceRows
+    : sourceRows.filter(r=>r.gender===gender);
 
   // Tier 0: 사용자가 목표로 지정한 특정 대회(eventName) 자체의 실제 3위 — 별도 통계 없이 그 대회 실제값 그대로.
   if(eventName){
@@ -6084,7 +6091,8 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
         podiumRows:[sorted[0], sorted[1], sorted[2]], method:"single-event-actual", eventCount:1, totalRiders:evRows.length,
         events:[{event:eventName, n:evRows.length, third:sorted[2].overall_time}],
         distribution:{ min:sorted[2].overall_time, p25:sorted[2].overall_time, median:sorted[2].overall_time, p75:sorted[2].overall_time, max:sorted[2].overall_time } };
-      const result = { ...built, scope:"event", n:validRows.length, division, gender, ageGroup,
+      const result = { ...built, scope:"event", n:validRows.length, division,
+        gender:division==="Mixed Doubles" ? "MIXED" : gender, ageGroup,
         sourceDivision:division, tier:"REQUESTED_EVENT_ACTUAL", ageGroupUsed:ageGroup };
       logPodiumTrace(result, validRows.length);
       return result;
@@ -6109,14 +6117,16 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
     }
   }
   if(!chosen){
-    const result = { scope:"insufficient", n:(validRowsT2||validRowsT1).length, division, gender, ageGroup,
+    const result = { scope:"insufficient", n:(validRowsT2||validRowsT1).length, division,
+      gender:division==="Mixed Doubles" ? "MIXED" : gender, ageGroup,
       podium:null, podiumRows:null, sourceDivision:division, tier:"INSUFFICIENT", ageGroupUsed:ageGroup,
       eventCount:0, totalRiders:0, events:[], distribution:null, method:null };
     logPodiumTrace(result, result.n);
     return result;
   }
   const built = buildPodiumBenchmarkFromEventPodiums(chosen.eventPodiums, "median");
-  const result = { ...built, scope:"division-gender-age", n:chosen.validRows.length, division, gender, ageGroup,
+  const result = { ...built, scope:"division-gender-age", n:chosen.validRows.length, division,
+    gender:division==="Mixed Doubles" ? "MIXED" : gender, ageGroup,
     sourceDivision:division, tier:chosen.tier, ageGroupUsed:chosen.ageGroupUsed };
   logPodiumTrace(result, chosen.validRows.length);
   return result;
@@ -6197,10 +6207,18 @@ function computePodiumSafeTarget(ciLow, ciHigh, cutoffSec){
 // STATE.profile.division is always restored by withDivisionContext().
 function predictPodiumForDivision(targetDivision, weeksToRace){
   const div = targetDivision || STATE.profile.division;
-  return withDivisionContext(div, ()=>{
-    const targetHpi = calcHPI();
-    return predictTime(targetHpi, weeksToRace);
-  });
+  const prevOverride = PREDICTION_DIVISION_OVERRIDE;
+  try{
+    // Podium prediction must use the EXACT selected Division. Open Doubles must not
+    // reuse Open Singles evidence, and Pro Doubles must not reuse Pro Singles evidence.
+    PREDICTION_DIVISION_OVERRIDE = div;
+    return withDivisionContext(div, ()=>{
+      const targetHpi = calcHPI();
+      return predictTime(targetHpi, weeksToRace);
+    });
+  } finally {
+    PREDICTION_DIVISION_OVERRIDE = prevOverride;
+  }
 }
 
 async function computePodiumAnalysis(){
@@ -7666,12 +7684,12 @@ function renderMyGoalPodiumResult(wrap){
       <div class="eyebrow gray" style="margin-bottom:10px;">포디움에 가고 싶다면!</div>
       ${podium.map((t,i)=>`<div class="row-between" style="padding:6px 0;"><span style="font-size:13.5px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
       <div class="divider" style="margin:12px 0;"></div>
-      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='female'?'Female':'Male', r.benchmark.division, r.benchmark.ageGroupUsed||r.benchmark.ageGroup].filter(Boolean).join(' · '))}${r.benchmark.ageGroupUsed==null?` <span style="color:var(--amber);">(연령대 완화됨)</span>`:""}</span></div>
+      <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='MIXED'?'Mixed':(r.benchmark.gender==='female'?'Female':'Male'), r.benchmark.division, r.benchmark.ageGroupUsed||r.benchmark.ageGroup].filter(Boolean).join(' · '))}${r.benchmark.ageGroupUsed==null?` <span style="color:var(--amber);">(연령대 완화됨)</span>`:""}</span></div>
       <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">데이터</span><span style="font-size:12.5px;font-weight:600;">${r.benchmark.scope==='event' ? `${escapeHtml(r.eventName||'해당 대회')} · ${r.benchmark.n.toLocaleString()}명` : `Asia 전체 · ${r.benchmark.n.toLocaleString()}명`}</span></div>
       <details style="margin-top:10px;">
         <summary style="cursor:pointer;font-size:11.5px;color:var(--gray-dim);">📊 산출 근거 자세히 보기 (관리자/디버그용)</summary>
         <div style="margin-top:8px;padding:10px 12px;background:var(--surface2);border-radius:8px;font-size:12px;line-height:1.7;">
-          <div>적용 Gender: <b>${r.benchmark.gender==='female'?'Female':'Male'}</b></div>
+          <div>적용 Gender: <b>${r.benchmark.gender==='MIXED'?'Mixed':(r.benchmark.gender==='female'?'Female':'Male')}</b></div>
           <div>적용 Division: <b>${escapeHtml(r.benchmark.division)}</b></div>
           <div>적용 Age Group: <b>${r.benchmark.ageGroupUsed || "(완화됨 — Gender+Division만 적용)"}</b></div>
           <div>분석 대상 대회 수: <b>${r.benchmark.eventCount ?? 0}개</b></div>
