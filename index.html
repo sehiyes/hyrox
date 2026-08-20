@@ -5997,14 +5997,38 @@ async function fetchPodiumDivisionRowsFromSupabase(division){
   const rows=[];
   let from=0;
   const pageCeiling=2000;
-  for(let page=0; page<pageCeiling; page++){
-    const to=from+EXTERNAL_RACE_DB_PAGE_SIZE-1;
-    const { data, error } = await sb.from("hyrox_results").select("*").eq("division",division).order("id",{ascending:true}).range(from,to);
-    if(error) throw error;
-    if(!data || !data.length) break;
-    rows.push(...data);
-    if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
-    from+=EXTERNAL_RACE_DB_PAGE_SIZE;
+  const exactQuery = async ()=>{
+    const out=[];
+    let start=0;
+    for(let page=0; page<pageCeiling; page++){
+      const to=start+EXTERNAL_RACE_DB_PAGE_SIZE-1;
+      const { data, error } = await sb.from("hyrox_results").select("*").eq("division",division).order("id",{ascending:true}).range(start,to);
+      if(error) throw error;
+      if(!data || !data.length) break;
+      out.push(...data);
+      if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
+      start+=EXTERNAL_RACE_DB_PAGE_SIZE;
+    }
+    return out;
+  };
+  const exact=await exactQuery();
+  rows.push(...exact);
+
+  // Mixed Doubles has historically appeared in imported datasets with small label
+  // variations. If the canonical exact query returns zero, broaden ONLY Mixed Doubles
+  // to a division-label search, then normalize back to the canonical Division.
+  // Never broaden Open/Pro/Doubles categories this way.
+  if(division==="Mixed Doubles" && rows.length===0){
+    let start=0;
+    for(let page=0; page<pageCeiling; page++){
+      const to=start+EXTERNAL_RACE_DB_PAGE_SIZE-1;
+      const { data, error } = await sb.from("hyrox_results").select("*").ilike("division","%mixed%double%").order("id",{ascending:true}).range(start,to);
+      if(error) throw error;
+      if(!data || !data.length) break;
+      rows.push(...data);
+      if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
+      start+=EXTERNAL_RACE_DB_PAGE_SIZE;
+    }
   }
   return rows;
 }
@@ -6066,7 +6090,7 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
     }
   }
   if(!sourceRows){
-    sourceRows = EXTERNAL_RACE_DB.filter(r=>r.division===division); // offline/폴백 경로
+    sourceRows = EXTERNAL_RACE_DB.filter(r=>{ const d=String(r.division||""); return division==="Mixed Doubles" ? hyroxCsvDivision(d)==="Mixed Doubles" : d===division; }); // offline/폴백 경로
     rawFetchedCount = convertedCount = sourceRows.length;
   }
   console.log(`[Podium Trace]\nrequested:\ngender = ${gender}\ndivision = ${division}\nageGroup = ${ageGroup}`
@@ -6207,18 +6231,16 @@ function computePodiumSafeTarget(ciLow, ciHigh, cutoffSec){
 // STATE.profile.division is always restored by withDivisionContext().
 function predictPodiumForDivision(targetDivision, weeksToRace){
   const div = targetDivision || STATE.profile.division;
-  const prevOverride = PREDICTION_DIVISION_OVERRIDE;
-  try{
-    // Podium prediction must use the EXACT selected Division. Open Doubles must not
-    // reuse Open Singles evidence, and Pro Doubles must not reuse Pro Singles evidence.
-    PREDICTION_DIVISION_OVERRIDE = div;
-    return withDivisionContext(div, ()=>{
-      const targetHpi = calcHPI();
-      return predictTime(targetHpi, weeksToRace);
-    });
-  } finally {
-    PREDICTION_DIVISION_OVERRIDE = prevOverride;
-  }
+  // IMPORTANT: use the SAME production prediction context as Goal Setting.
+  // Goal Setting's Division selector ultimately feeds the existing divisionBase()
+  // prediction/segment logic (Open/Open Doubles share the Open physical-load model;
+  // Pro/Pro Doubles share the Pro model). Do NOT force an exact-Division override here,
+  // because that bypasses the same race/segment candidates Goal Setting uses and was
+  // the reason Podium could differ from Goal Setting by a few seconds.
+  return withDivisionContext(div, ()=>{
+    const targetHpi = calcHPI();
+    return predictTime(targetHpi, weeksToRace);
+  });
 }
 
 async function computePodiumAnalysis(){
