@@ -503,11 +503,6 @@ function showToast(msg){
 /*        Required because sign-up here uses a username, not a real email  */
 /*        — internally mapped to a synthetic, non-deliverable address, so  */
 /*        the confirmation link could never be received.                  */
-/*     4) (optional) Google login: Authentication → Providers → Google →   */
-/*        enable it, then paste a Client ID/Secret from a Google Cloud     */
-/*        Console OAuth app. Google Cloud Console → Credentials → add the  */
-/*        callback URL Supabase shows on that same page as an authorized   */
-/*        redirect URI. Without this step the Google button will error.    */
 /* ---------------------------------------------------------------------- */
 const SUPABASE_URL = "https://ecpmlmrvlcdfjbtkgfry.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_CR2uOp08VnICCrkPnQ7MIA_E5_P6R0F";
@@ -576,11 +571,6 @@ async function sbSignIn(username, password){
   return error ? "아이디 또는 비밀번호가 올바르지 않습니다" : null;
 }
 async function sbSignOut(){ if(sb) await sb.auth.signOut(); }
-async function sbSignInGoogle(){
-  if(!sb) return "Supabase가 설정되지 않았습니다";
-  const { error } = await sb.auth.signInWithOAuth({ provider:"google", options:{ redirectTo: window.location.href } });
-  return error ? error.message : null; // on success the page redirects to Google, then back — no further action needed here
-}
 async function pullFromSupabase(){
   if(!sb || !sbUser) return;
   sbStatus="syncing";
@@ -607,7 +597,7 @@ async function pushToSupabase(){
 /* ---------------------------------------------------------------------- */
 function defaultState(){
   return {
-    profile:{ name:"", username:"", birthday:"", age:"", gender:"male", height:"", weight:"", bodyFat:"", skeletalMuscle:"", division:"Open", goalDivision:"", partnerName:"", targetDate:"", targetTime:"", targetEventName:"", availableHoursPerWeek:6,
+    profile:{ name:"", username:"", birthday:"", age:"", gender:"male", height:"", weight:"", bodyFat:"", skeletalMuscle:"", division:"Open", goalDivision:"", goalAgeGroup:"", partnerName:"", targetDate:"", targetTime:"", targetEventName:"", availableHoursPerWeek:6,
       // goalDivision: separate from `division` (the athlete's actual/base competing division, used
       // everywhere else — bench(), the 17-segment candidate functions, Division 전환 예측's default
       // "from"). "" (unset) means "goal == base division", the common case, in which the Goal page's
@@ -5181,15 +5171,46 @@ function validateRaceRecordRow(r){
   if(!r.division) return false;
   return true;
 }
+/* ----------------------------------------------------------------------
+ * RAW vs ANALYSIS-VALID separation (요청: "RAW DATA와 ANALYSIS DATA 분리")
+ * ----------------------------------------------------------------------
+ * RAW hyrox_results (Supabase) is NEVER edited or filtered here — a row like total_time="0:08:02"
+ * stays in the raw table forever exactly as-is, because it may be a genuine official result. This
+ * function only decides whether a given (already-normalized) row is fit to feed DNA/Podium/Peer/
+ * Benchmark/Race-Prediction analysis. It intentionally does NOT apply an arbitrary "total_time < XX"
+ * cutoff (explicitly requested not to) — it only flags rows that are structurally impossible to be a
+ * real HYROX finish (zero/negative/missing time), which is a data-integrity check, not a performance
+ * judgment. Anything not caught by an explicit rule below is left analysis_valid=true; a stricter,
+ * evidence-based rule (e.g. cross-checking total_time against the sum of that row's own run+station
+ * splits, when all are present) can be added here later without touching the raw table or any caller —
+ * this function is the single seam every analysis consumer (filterExternalRaceDb /
+ * computePodiumComparisonGroup / queryPeerSegmentStats) now goes through.
+ */
+function classifyAnalysisValidity(overallTimeSec, r){
+  if(overallTimeSec==null) return { valid:false, reason:"MISSING_REQUIRED_DATA" }; // total_time missing/unparseable
+  if(overallTimeSec<=0) return { valid:false, reason:"ZERO_TIME" }; // 00:00:00 등
+  // Cross-check against the row's own splits, ONLY when enough of them exist to be meaningful — this is
+  // evidence from the row itself, not an invented global threshold, so it stays inside the "no arbitrary
+  // threshold" rule while still catching cases like the observed 0:08:02 (a real official field that is
+  // far shorter than the athlete's own recorded segments could add up to).
+  const segs=[r.run_1,r.run_2,r.run_3,r.run_4,r.run_5,r.run_6,r.run_7,r.run_8,
+    r.ski,r.sled_push,r.sled_pull,r.burpee,r.row,r.carry,r.lunge,r.wallball,r.transition].filter(v=>v!=null);
+  if(segs.length>=8){ // need a reasonably complete split set before trusting a sum-comparison
+    const segSum=segs.reduce((a,b)=>a+b,0);
+    if(overallTimeSec < segSum*0.9) return { valid:false, reason:"INVALID_SEGMENT" }; // total_time contradicts its own splits
+  }
+  return { valid:true, reason:null };
+}
 function normalizeExternalRaceRow(r){
   const gender = String(r.gender||"").toLowerCase()==="female" ? "female" : "male";
   const age = r.age!=null && r.age!=="" ? Number(r.age) : null;
-  return {
+  const overall_time = numOrNull(r.overall_time);
+  const partial = {
     race_id: r.race_id || uid(), athlete_id: r.athlete_id || null, gender,
     age, age_group: normalizeAgeGroupLabel(r.age_group) || (age!=null ? getAgeGroup(age) : null),
     division: DIVISIONS.includes(r.division) ? r.division : "Open",
     event: r.event || null, country: r.country || null, date: r.date || null,
-    overall_time: numOrNull(r.overall_time),
+    overall_time,
     run_1:numOrNullAlias(r,"run_1","run1"), run_2:numOrNullAlias(r,"run_2","run2"),
     run_3:numOrNullAlias(r,"run_3","run3"), run_4:numOrNullAlias(r,"run_4","run4"),
     run_5:numOrNullAlias(r,"run_5","run5"), run_6:numOrNullAlias(r,"run_6","run6"),
@@ -5198,6 +5219,10 @@ function normalizeExternalRaceRow(r){
     row:numOrNull(r.row), carry:numOrNull(r.carry), lunge:numOrNull(r.lunge), wallball:numOrNull(r.wallball),
     transition:numOrNull(r.transition),
   };
+  const validity = classifyAnalysisValidity(overall_time, partial);
+  partial.analysis_valid = validity.valid;
+  partial.analysis_exclusion_reason = validity.reason;
+  return partial;
 }
 async function fetchSiteJson(candidates){
   for(const path of candidates){
@@ -5221,20 +5246,45 @@ async function fetchSiteJson(candidates){
 // inventing a new shared table, EXTERNAL_RACE_DB now gets its data FROM that table. The calculation
 // functions that consume EXTERNAL_RACE_DB (queryPeerSegmentStats, computePeerAnalysis, etc.) are
 // completely unchanged — only where the data comes from changed, per this pass's explicit scope.
-const EXTERNAL_RACE_DB_FETCH_LIMIT = 50000; // sane one-shot cap — see EXTERNAL_RACE_DB_TRUNCATED below
+const EXTERNAL_RACE_DB_FETCH_LIMIT = 50000; // legacy single-shot cap — kept only as a naming reference,
+                                             // NOT used as a hard truncation point anymore (see below).
+const EXTERNAL_RACE_DB_PAGE_SIZE = 1000; // Supabase/PostgREST default max rows per request
 let EXTERNAL_RACE_DB_SOURCE = "none"; // "supabase" | "local" | "none" — surfaced in the admin UI for honesty
-let EXTERNAL_RACE_DB_TRUNCATED = false; // true if hyrox_results has more rows than the fetch cap above
+let EXTERNAL_RACE_DB_TRUNCATED = false; // true only if the safety page-count ceiling below is ever hit
 let EXTERNAL_RACE_DB_SYNCED_AT = null;
+// [Podium 디버그 — 근본 원인]: 이전 코드는 `.select("*").limit(50000)`을 order() 없이 단 한 번만
+// 호출했다. hyrox_results가 50,000행을 넘어서면(현재 86,500+) PostgREST가 반환하는 앞쪽 50,000행이
+// "가장 최근에 upsert된 행"까지 포함한다는 보장이 없다 — 실제로 사용자가 새로 업로드한 2026 Chiba/
+// Chengdu/Osaka/Hangzhou 배치 전체가 조용히 잘려나갈 수 있었고, 이것이 "Women+Open Doubles+30-34 =
+// 2,863건이 Supabase엔 실존하지만 앱에는 0건"으로 보이는 근본 원인이다. 아래는 .range()로 테이블
+// 전체를 페이지 단위로 끝까지 가져와 이 truncation을 원천적으로 없앤다 — 86,500이든 500,000이든 전량.
+async function fetchAllHyroxResultsFromSupabase(){
+  const rows=[];
+  let from=0;
+  const hardPageCeiling = 2000; // safety valve only (2000*1000=2M rows) — never expected to trigger
+  for(let page=0; page<hardPageCeiling; page++){
+    const to = from + EXTERNAL_RACE_DB_PAGE_SIZE - 1;
+    const { data, error } = await sb.from("hyrox_results").select("*").order("id",{ascending:true}).range(from,to);
+    if(error) throw error;
+    if(!data || !data.length) break;
+    rows.push(...data);
+    if(data.length < EXTERNAL_RACE_DB_PAGE_SIZE) break; // last page reached
+    from += EXTERNAL_RACE_DB_PAGE_SIZE;
+  }
+  return rows;
+}
 async function syncExternalRaceDbFromSupabase(){
   if(!sbEnabled() || !window.supabase || !window.supabase.createClient) return false;
   try{
     await ensureHyroxSearchDb(); // sets up the shared `sb` client + HYROX_SEARCH_DB_COUNT (reused, not duplicated)
-    const { data, error } = await sb.from("hyrox_results").select("*").limit(EXTERNAL_RACE_DB_FETCH_LIMIT);
-    if(error) throw error;
+    const data = await fetchAllHyroxResultsFromSupabase();
+    console.log(`[Podium Pipeline Debug] 1. Supabase raw rows fetched: ${data.length}${HYROX_SEARCH_DB_COUNT!=null?` (테이블 전체 count=${HYROX_SEARCH_DB_COUNT})`:""}`);
     const mapped = (data||[]).map(hyroxDbRowToExternal).filter(Boolean);
+    console.log(`[Podium Pipeline Debug] 2. hyroxDbRowToExternal() 변환 성공 rows: ${mapped.length}`);
     EXTERNAL_RACE_DB = mapped;
+    console.log(`[Podium Pipeline Debug] 3. EXTERNAL_RACE_DB 저장 rows: ${EXTERNAL_RACE_DB.length}`);
     EXTERNAL_RACE_DB_SOURCE = "supabase";
-    EXTERNAL_RACE_DB_TRUNCATED = (HYROX_SEARCH_DB_COUNT!=null && HYROX_SEARCH_DB_COUNT > EXTERNAL_RACE_DB_FETCH_LIMIT);
+    EXTERNAL_RACE_DB_TRUNCATED = (HYROX_SEARCH_DB_COUNT!=null && HYROX_SEARCH_DB_COUNT > data.length);
     EXTERNAL_RACE_DB_SYNCED_AT = new Date().toISOString();
     // local copy kept purely as an offline/perf fallback for the NEXT load if Supabase is briefly
     // unreachable — never treated as the source of truth while Supabase is configured (see below).
@@ -5421,6 +5471,7 @@ function queryDerivedBenchmark(division, gender, ageBand, segment){
 function filterExternalRaceDb(group){
   const { gender, ageGroup, division } = group;
   return EXTERNAL_RACE_DB.filter(r=>{
+    if(r.analysis_valid===false) return false; // RAW is preserved in EXTERNAL_RACE_DB; only ANALYSIS-valid rows feed DNA/Peer/Podium
     if(gender && r.gender!==gender) return false;
     if(ageGroup && r.age_group!==ageGroup) return false;
     if(division && r.division!==division) return false;
@@ -5820,9 +5871,62 @@ function checkDnaMatrixConsistency(peer){
   });
   return flags;
 }
-function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
-  const base = EXTERNAL_RACE_DB.filter(r=>
-    r.division===division && r.gender===gender && r.age_group===ageGroup && r.overall_time!=null);
+// [Podium query 구조 변경 — 요청 §5]: 이전에는 podium 계산이 전량 EXTERNAL_RACE_DB(브라우저에 이미
+// 캐시된 전체 dump)를 클라이언트에서 필터링하는 방식이었다 — DB가 커질수록(현재 86.5k, 향후 100k/
+// 200k/500k) "이미 불러온 캐시가 최신/전체인가"에 계산 정확도가 종속된다. 아래는 division만 정확히
+// Supabase 쪽 스키마와 항상 일치한다는 점(hyroxCsvDivision()이 upload 시점에 이미 정규화해 저장)을
+// 이용해, **division 조건은 Supabase에 직접 query**로 넘기고 gender/age_group/유효성만 클라이언트에서
+// 정규화 후 필터한다 (raw gender/age_group 컬럼은 export마다 표기가 달라 정확한 서버측 등호 필터를
+// 보장할 수 없으므로 여기서만 정규화). Supabase가 연결 불가능한 경우에만 로컬 EXTERNAL_RACE_DB로 폴백.
+async function fetchPodiumDivisionRowsFromSupabase(division){
+  const rows=[];
+  let from=0;
+  const pageCeiling=2000;
+  for(let page=0; page<pageCeiling; page++){
+    const to=from+EXTERNAL_RACE_DB_PAGE_SIZE-1;
+    const { data, error } = await sb.from("hyrox_results").select("*").eq("division",division).order("id",{ascending:true}).range(from,to);
+    if(error) throw error;
+    if(!data || !data.length) break;
+    rows.push(...data);
+    if(data.length<EXTERNAL_RACE_DB_PAGE_SIZE) break;
+    from+=EXTERNAL_RACE_DB_PAGE_SIZE;
+  }
+  return rows;
+}
+async function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
+  let sourceRows = null; // will hold division-scoped, hyroxDbRowToExternal-converted rows
+  let rawFetchedCount = null, convertedCount = null, usedLiveQuery = false;
+  if(sbEnabled() && window.supabase && window.supabase.createClient){
+    try{
+      if(!sb) await ensureHyroxSearchDb();
+      const raw = await fetchPodiumDivisionRowsFromSupabase(division);
+      rawFetchedCount = raw.length;
+      sourceRows = raw.map(hyroxDbRowToExternal).filter(Boolean);
+      convertedCount = sourceRows.length;
+      usedLiveQuery = true;
+    }catch(e){
+      console.warn("[Podium Pipeline Debug] Supabase 직접 query 실패 — 로컬 EXTERNAL_RACE_DB로 폴백:", e?.message||e);
+    }
+  }
+  if(!sourceRows){
+    sourceRows = EXTERNAL_RACE_DB.filter(r=>r.division===division); // offline/폴백 경로
+    rawFetchedCount = convertedCount = sourceRows.length;
+  }
+
+  const genderRows = sourceRows.filter(r=>r.gender===gender);
+  const ageRows = genderRows.filter(r=>r.age_group===ageGroup);
+  const validTimeRows = ageRows.filter(r=>r.analysis_valid!==false && r.overall_time!=null);
+
+  console.log(`[Podium Pipeline Debug]`
+    + `\n1. Supabase raw rows fetched: ${rawFetchedCount}${usedLiveQuery?` (division="${division}" 직접 query)`:` (로컬 캐시 폴백)`}`
+    + `\n2. hyroxDbRowToExternal() 변환 성공 rows: ${convertedCount}`
+    + `\n3. EXTERNAL_RACE_DB 저장 rows(참고, division 스코프): ${sourceRows.length}`
+    + `\n4. gender=${gender} rows: ${genderRows.length}`
+    + `\n5. division=${division} rows: ${sourceRows.length}`
+    + `\n6. age_group=${ageGroup} rows: ${ageRows.length}`
+    + `\n7. 유효 total_time rows (analysis_valid && overall_time!=null): ${validTimeRows.length}`);
+
+  const base = validTimeRows;
   let result;
   if(eventName){
     const withEvent = base.filter(r=>r.event && r.event.trim().toLowerCase()===eventName.trim().toLowerCase());
@@ -5833,24 +5937,16 @@ function computePodiumComparisonGroup(eventName, division, gender, ageGroup){
       : { rows:base, scope:"insufficient", n:base.length };
   }
   result.division=division; result.gender=gender; result.ageGroup=ageGroup;
-  logPodiumDebugStats(division, gender, ageGroup, result);
+  console.log(`[Podium Pipeline Debug] 8. computePodiumComparisonGroup() 입력 rows: ${base.length}`
+    + `\n9. 최종 podium comparison rows: ${result.n} (scope=${result.scope})`);
+  if(result.rows && result.rows.length){
+    const top3 = [...result.rows].sort((a,b)=>a.overall_time-b.overall_time).slice(0,3);
+    console.log(`[Podium DB Top 3]\n${top3.map((r,i)=>`${i+1}. ${fmtTime(r.overall_time)}`).join("\n")}`);
+  }
   return result;
 }
-// doc11 §6: console-only diagnostic (never shown in the general user UI) so a mismatch between
-// "abundant real data exists" and "podium says insufficient" can be root-caused quickly — which exact
-// filter (division / gender / age_group) is silently zeroing out the group.
-function logPodiumDebugStats(division, gender, ageGroup, group){
-  try{
-    const total=EXTERNAL_RACE_DB.length;
-    const genderN=EXTERNAL_RACE_DB.filter(r=>r.gender===gender).length;
-    const divN=EXTERNAL_RACE_DB.filter(r=>r.division===division).length;
-    const ageN=EXTERNAL_RACE_DB.filter(r=>r.age_group===ageGroup).length;
-    const timeN=EXTERNAL_RACE_DB.filter(r=>r.overall_time!=null).length;
-    console.log(`[Podium Debug]\nDB total: ${total}\n${gender}: ${genderN}\n${division}: ${divN}\nAge ${ageGroup}: ${ageN}\nOverall Time: ${timeN}\nFinal group: ${group.n}\nScope: ${group.scope}`);
-  }catch(e){ /* diagnostic only — must never break the real calculation */ }
-}
-function computePodiumBenchmark(eventName, division, gender, ageGroup){
-  const group = computePodiumComparisonGroup(eventName, division, gender, ageGroup);
+async function computePodiumBenchmark(eventName, division, gender, ageGroup){
+  const group = await computePodiumComparisonGroup(eventName, division, gender, ageGroup);
   if(group.scope==="insufficient") return { ...group, podium:null, podiumRows:null };
   const sorted=[...group.rows].sort((a,b)=>a.overall_time-b.overall_time);
   const top3rows = sorted.slice(0,3);
@@ -5905,7 +6001,7 @@ function computePodiumSafeTarget(ciLow, ciHigh, cutoffSec){
   const buffer = clamp(sigma*0.6, 15, 180);
   return cutoffSec - buffer;
 }
-function computePodiumAnalysis(){
+async function computePodiumAnalysis(){
   const p=STATE.profile;
   if(!p.targetDate) return null;
   const hpiResult=calcHPI();
@@ -5920,9 +6016,9 @@ function computePodiumAnalysis(){
   const dnaWeaknessRank = getDnaWeaknessRanking(3);
   const goalDiv = p.goalDivision || p.division;
   const genderStr = p.gender==="female" ? "female":"male";
-  const ageGroup = getAgeGroup(Number(p.age));
+  const ageGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
   const eventName = (p.targetEventName||"").trim();
-  const benchmark = computePodiumBenchmark(eventName, goalDiv, genderStr, ageGroup);
+  const benchmark = await computePodiumBenchmark(eventName, goalDiv, genderStr, ageGroup);
   const predConf = calcPredictionConfidence();
   const result = { predicted:pred.predicted, ciLow:pred.ciLow, ciHigh:pred.ciHigh, predConfidence:predConf.label,
     benchmark, goalDiv, eventName, weeksToRace, dRace, dnaScore, dnaConsistencyFlags, dnaWeaknessRank };
@@ -6274,11 +6370,29 @@ function renderAll(){
     account: renderAccount,
   };
   (renderers[CURRENT_PAGE]||renderMyRecordPage)(wrap);
+  // doc12 §3: "로그인 안하면 기록이 지워진다"는 경고를 기록/DNA/목표 3개 메인 페이지에 표시 — 각 render
+  // 함수마다 중복 작성하지 않고 여기 한 곳에서만 주입해서, 페이지별로 문구가 어긋날 일이 없게 한다.
+  if(["myrecord","mydna","mygoal"].includes(CURRENT_PAGE) && !(sbEnabled() && sbStatus==="signedIn")){
+    wrap.insertAdjacentHTML("afterbegin", renderLoggedOutDataWarning());
+    wrap.querySelector("#logout-warning-goto-account")?.addEventListener("click",()=>{ CURRENT_PAGE="account"; renderAll(); });
+  }
   // bug fix: this used to scroll to top on EVERY renderAll() call, including same-page in-place
   // toggles (e.g. "전체 분석 보기") that call renderAll() just to update a bit of UI state — only
   // reset scroll when the page identity actually changed (real navigation).
   if(CURRENT_PAGE !== _lastRenderedPage) window.scrollTo(0,0);
   _lastRenderedPage = CURRENT_PAGE;
+}
+// doc12 §3: 로그인하지 않은 상태에서는 이 앱의 로컬 저장소가 브라우저/플랫폼의 임시 저장 공간이라,
+// 같은 환경에서 다시 접속해도 시간이 지나면(대략 1시간 전후) 데이터가 사라질 수 있다 — 이를 사용자에게
+// 명확히 알리고 로그인/회원가입을 유도한다. 로그인 상태에서는 아예 렌더링되지 않는다.
+function renderLoggedOutDataWarning(){
+  return `<div class="card tight" style="border:1px solid var(--amber);background:rgba(245,166,35,.08);padding:12px 14px;margin-bottom:2px;">
+    <div style="font-size:12.5px;font-weight:700;color:var(--amber);">⚠ 로그인하지 않은 상태입니다</div>
+    <div class="reason-line" style="margin-top:4px;">
+      지금 입력하는 기록은 이 기기·브라우저에만 임시로 저장됩니다. <b style="color:var(--white);">같은 환경에서 다시 접속해도 약 1시간이 지나면 데이터가 사라질 수 있습니다.</b> 기록을 안전하게 보관하려면 로그인/회원가입을 해주세요.
+    </div>
+    <span class="chip" id="logout-warning-goto-account" style="cursor:pointer;margin-top:8px;display:inline-block;font-size:11px;">로그인하러 가기 →</span>
+  </div>`;
 }
 function renderAccountBadge(){
   const el=document.getElementById("account-badge");
@@ -7191,6 +7305,7 @@ function podiumQualSentence(prob){
 function renderMyGoalPage(wrap){
   const p=STATE.profile;
   const effectiveGoalDiv = p.goalDivision || p.division;
+  const effectiveGoalAgeGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
   const canCompute = !!p.targetDate;
   const hasRace = !!(racesByDivision(STATE.profile.division)[0]);
   wrap.innerHTML = `
@@ -7208,6 +7323,8 @@ function renderMyGoalPage(wrap){
       <div class="field"><label>목표 대회명 / 지역</label><input id="mg-event" placeholder="예: HYROX Seoul" value="${escapeHtml(p.targetEventName)}"></div>
       <div class="field" style="margin-top:10px;"><label>날짜 (YYYY-MM-DD)</label><input id="mg-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" placeholder="2026-10-18" value="${escapeHtml(p.targetDate)}"></div>
       <div class="field" style="margin-top:10px;"><label>Division</label><select id="mg-div">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select></div>
+      <div class="field" style="margin-top:10px;"><label>Age Group</label><select id="mg-agegroup">${AGE_GROUPS.map(a=>`<option value="${a}" ${effectiveGoalAgeGroup===a?"selected":""}>${a}</option>`).join("")}</select></div>
+      <p class="reason-line" style="margin-top:4px;">${p.age? `선수 프로필의 나이(${p.age}세) 기준으로 자동 선택되어 있습니다 — 필요하면 직접 바꿀 수 있습니다.` : "선수 프로필에 나이를 입력하면 자동으로 선택됩니다 — 지금은 직접 선택해주세요."}</p>
       <div style="margin-top:12px;"><button class="btn sm secondary" id="mg-save">저장</button></div>
     </div>
 
@@ -7222,11 +7339,20 @@ function renderMyGoalPage(wrap){
     STATE.profile.targetDate=wrap.querySelector("#mg-date").value.trim();
     const divSel=wrap.querySelector("#mg-div").value;
     STATE.profile.goalDivision = divSel===STATE.profile.division ? "" : divSel;
+    const ageSel=wrap.querySelector("#mg-agegroup").value;
+    STATE.profile.goalAgeGroup = ageSel===getAgeGroup(Number(STATE.profile.age)) ? "" : ageSel;
     persist(); showToast("목표가 저장되었습니다"); PODIUM_SHOWN=false; renderAll();
   });
-  wrap.querySelector("#mg-podium-btn")?.addEventListener("click",()=>{
-    PODIUM_RESULT = computePodiumAnalysis();
+  wrap.querySelector("#mg-podium-btn")?.addEventListener("click",async()=>{
+    const el=wrap.querySelector("#mg-podium-result");
+    if(el) el.innerHTML=`<div class="card" style="margin-top:14px;"><p class="reason-line">실제 참가자 데이터를 조회하는 중…</p></div>`;
     PODIUM_SHOWN = true;
+    try{
+      PODIUM_RESULT = await computePodiumAnalysis();
+    }catch(e){
+      console.warn("포디움 계산 실패:", e?.message||e);
+      PODIUM_RESULT = null;
+    }
     renderMyGoalPodiumResult(wrap);
     wrap.querySelector("#mg-podium-result")?.scrollIntoView({behavior:"smooth", block:"start"});
   });
@@ -8898,6 +9024,15 @@ function hyroxSourceBadge(r){
 // confirmation-modal draft (HYROX_IMPORT_DRAFT); STATE.races is untouched until the user
 // explicitly presses "기록 추가" inside that modal (see renderHyroxImportConfirmModal below).
 let HYROX_IMPORT_DRAFT = null;
+// user request: HYROX 기록 가져오기에서 division이 "Open Doubles"로 저장돼 있어도 실제 gender가
+// "Mixed"라면 Mixed Doubles로 등록되어야 한다 — 일부 원본 데이터가 Doubles를 성별 구분 없이 뭉뚱그려
+// "Open Doubles"로만 저장해 둔 경우를 가져오기 시점에 바로잡는다. Open Doubles가 아니거나 gender가
+// Mixed가 아니면 원래 division을 그대로 유지한다.
+function reconcileDivisionWithGender(division, genderRaw){
+  const g=String(genderRaw||"").trim().toLowerCase();
+  if(division==="Open Doubles" && g.includes("mixed")) return "Mixed Doubles";
+  return division;
+}
 function importHyroxDbRecord(index){
   const item=HYROX_DB_RESULTS?.[index];
   const r=item?.r;
@@ -8909,7 +9044,7 @@ function importHyroxDbRecord(index){
   HYROX_IMPORT_DRAFT = {
     name:r.n||"",
     date:"",
-    division:r.d||DIVISIONS[0],
+    division:reconcileDivisionWithGender(r.d||DIVISIONS[0], r.g),
     officialTime:r.t||"",
     runs, stations, transition:r.z||"",
     share:{},
@@ -11195,7 +11330,7 @@ function renderModelDnaImportTab(wrap){
       <div class="row-between"><h2 class="section-title">📥 실제 HYROX 결과 DB 가져오기</h2><span class="mono" style="font-size:11px;color:var(--gray-dim);">${sourceLabel} · ${dbSize.toLocaleString()}건</span></div>
       <p class="lead" style="margin:6px 0 12px;">원본 HYROX Full Results CSV를 업로드하면 <b style="color:var(--orange);">Supabase의 공용 <code>hyrox_results</code> 테이블</b>에 누적됩니다. 이 테이블이 이름 검색과 Race DNA/동일그룹 비교(percentile·Z-score) 계산 모두의 원천 데이터입니다 — 한 명이 업로드하면 다른 모든 사용자가 다음에 앱을 열 때 동일한 데이터를 보게 됩니다(브라우저별로 따로 저장되지 않음). 기존에 저장된 개인 기록·Simulation·10K 기록 등은 변경되지 않습니다.</p>
       ${EXTERNAL_RACE_DB_SOURCE==="local" ? `<p class="reason-line" style="color:var(--amber);margin:8px 0;">⚠ 지금은 Supabase에 연결되지 않아 이 브라우저의 로컬 캐시를 보고 있습니다 — 다른 사용자와 데이터가 다를 수 있습니다.</p>` : ""}
-      ${EXTERNAL_RACE_DB_TRUNCATED ? `<p class="reason-line" style="color:var(--amber);margin:8px 0;">⚠ Supabase에 저장된 전체 기록이 현재 동기화 한도(${EXTERNAL_RACE_DB_FETCH_LIMIT.toLocaleString()}건)보다 많아 일부만 불러왔습니다 — 전체 ${(HYROX_SEARCH_DB_COUNT||0).toLocaleString()}건. DNA percentile은 이 하위 표본 기준으로 계산됩니다.</p>` : ""}
+      ${EXTERNAL_RACE_DB_TRUNCATED ? `<p class="reason-line" style="color:var(--amber);margin:8px 0;">⚠ 페이지네이션 동기화 중 일부만 불러왔습니다 — 전체 ${(HYROX_SEARCH_DB_COUNT||0).toLocaleString()}건 중 ${EXTERNAL_RACE_DB.length.toLocaleString()}건. 새로고침 후 다시 동기화해주세요.</p>` : ""}
       <p class="reason-line" style="margin:8px 0;color:var(--orange);">
         이 탭은 기존 모델 설명 접근 코드로 보호됩니다. 이미 DNA에 등록된 기록을 선수 검색 DB로 옮기거나 새 대회 검색 데이터를 추가할 때 사용합니다.
       </p>
@@ -11501,8 +11636,6 @@ function renderAccount(wrap){
           </div>
           <div style="margin-top:12px;"><button class="btn sm" id="sb-signin">로그인</button></div>
         `}
-        <div class="divider" style="margin:16px 0;"></div>
-        <button class="btn sm secondary" id="sb-google" style="width:100%;justify-content:center;">Google로 계속하기</button>
         <div id="sb-status" style="margin-top:10px;"></div>
       `}
     </div>
@@ -11529,12 +11662,6 @@ function renderAccount(wrap){
     else { showToast("가입 완료 — 자동으로 로그인되었습니다"); renderAll(); }
   });
   wrap.querySelector("#sb-signout")?.addEventListener("click",async ()=>{ await sbSignOut(); showToast("로그아웃되었습니다"); renderAll(); });
-  wrap.querySelector("#sb-google")?.addEventListener("click",async ()=>{
-    const statusEl=wrap.querySelector("#sb-status");
-    const err=await sbSignInGoogle();
-    if(err) statusEl.innerHTML=`<div class="reason-line" style="color:var(--red);">${escapeHtml(err)}</div>`;
-    // on success the browser navigates away to Google's consent screen — nothing else to do here
-  });
 }
 
 /* ---------------------------------------------------------------------- */
