@@ -6974,6 +6974,12 @@ async function fetchPodiumDivisionRowsFromSupabase(division){
  */
 function eventHasYear(name){ return /\b(19|20)\d{2}\b/.test(String(name||"")); }
 function canonicalEventKey(row){
+  // 정규화된 컬럼이 있으면 그게 항상 우선이다 — 문자열을 추측할 필요가 없다.
+  // Season 이 있으면 같은 해 같은 도시의 두 대회(예: 2025 Shanghai 2회)도 정확히 갈린다.
+  if(row && (row.season || row.event_name)){
+    const label=composeEventLabel(row.season, row.year, row.event_name || row.event);
+    if(label) return label;
+  }
   const raw=String(row&&row.event||"").trim();
   if(!raw) return "";
   if(eventHasYear(raw)) return raw;
@@ -9977,11 +9983,22 @@ function pickCsvValue(row, candidates){
   }
   return "";
 }
+// "S8 2025 Shanghai" 처럼 사람이 읽을 수 있는 단일 라벨. Season 이 없으면 자동으로 빠진다.
+function composeEventLabel(season, year, race){
+  const s=String(season||"").trim();
+  const seasonLabel = s ? (/^\d+$/.test(s) ? `S${s}` : s) : "";
+  return [seasonLabel, String(year||"").trim(), String(race||"").trim()].filter(Boolean).join(" ");
+}
 function hyroxCsvRowToDbOfficial(row){
   const name=hyroxCsvClean(row["Name"]);
+  // Season / Year / Race 를 각각 별도 컬럼으로 보존한다.
+  // 같은 도시에서 한 해에 두 번 열리는 대회(예: 2025 Shanghai 2회)는 Year 만으로는 구분되지
+  // 않는다. Season 은 연도를 걸쳐 있으므로(S7 2024-25, S8 2025-26) 두 대회를 실제로 가른다.
+  // event 는 사람이 읽는 표시용 라벨로 계속 유지 — 기존 데이터/중복판정 키와 호환된다.
+  const season=hyroxCsvClean(row["Season"]) || hyroxCsvClean(row["season"]);
   const year=hyroxCsvClean(row["Year"]);
   const race=hyroxCsvClean(row["Target Race"]) || hyroxCsvClean(row["Race"]);
-  const event=[year,race].filter(Boolean).join(" ");
+  const event=composeEventLabel(season,year,race);
   const division=hyroxCsvDivision(row["Selected Division"] || row["Division"]);
   const gender=hyroxCsvClean(row["Selected Gender"]);
   const ageGroup=hyroxCsvClean(row["Age Group"]);
@@ -9995,14 +10012,15 @@ function hyroxCsvRowToDbOfficial(row){
     `Run Split ${i}`, `Running Split ${i}`
   ])));
   const stations=["Split_1000m SkiErg","Split_50m Sled Push","Split_50m Sled Pull","Split_80m Burpee Broad Jump","Split_1000m Row","Split_200m Farmers Carry","Split_100m Sandbag Lunges","Split_Wall Balls"].map(k=>hyroxTimeValue(row[k]));
-  return {name,event,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
+  return {name,event,season:season||null,year:year||null,event_name:race||null,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
 }
 function hyroxCsvRowToDbDatabase(row){
   const name=hyroxCsvClean(row["name"]);
+  const season=hyroxCsvClean(row["season"]);
   const year=hyroxCsvClean(row["year"]);
   const city=hyroxCsvClean(row["city"]);
   const eventId=hyroxCsvClean(row["event_id"]);
-  const event=[year,city].filter(Boolean).join(" ") || eventId;
+  const event=composeEventLabel(season,year,city) || eventId;
   const division=hyroxCsvDivision(row["division"]);
   const sex=hyroxCsvClean(row["sex"]).toLowerCase();
   const gender=sex.startsWith("f") || sex.includes("female") || sex.includes("woman") ? "female" : (sex ? "male" : null);
@@ -10065,8 +10083,14 @@ function hyroxDbRowToExternal(row){
     age_group: row.age_group || null,
     division,
     event: row.event || null,
+    season: row.season || null,
+    year: row.year || null,
+    event_name: row.event_name || null,
     country: null,
-    date: null,
+    // hyrox_results 에는 현재 날짜 컬럼이 없다. 나중에 date / event_date / race_date 중
+    // 아무 이름으로든 컬럼을 추가하면, 이 한 줄 덕분에 canonicalEventKey()의 연도 복원이
+    // 코드 수정 없이 즉시 동작한다. 없으면 지금처럼 null.
+    date: row.date || row.event_date || row.race_date || null,
     overall_time: total,
     run_1: parseTimeToSec(runs[0]), run_2: parseTimeToSec(runs[1]), run_3: parseTimeToSec(runs[2]), run_4: parseTimeToSec(runs[3]),
     run_5: parseTimeToSec(runs[4]), run_6: parseTimeToSec(runs[5]), run_7: parseTimeToSec(runs[6]), run_8: parseTimeToSec(runs[7]),
@@ -10076,6 +10100,7 @@ function hyroxDbRowToExternal(row){
   };
   return validateRaceRecordRow(obj) ? normalizeExternalRaceRow(obj) : null;
 }
+let HYROX_EXTRA_COLS_SUPPORTED = null; // null=미확인, true=있음, false=없음
 async function uploadHyroxRawCsv(file,onProgress){
   if(!sb){
     if(!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase URL / anon key가 설정되지 않았습니다.");
@@ -10101,7 +10126,19 @@ async function uploadHyroxRawCsv(file,onProgress){
   const BATCH=300; let processed=0;
   for(let i=0;i<unique.length;i+=BATCH){
     const batch=unique.slice(i,i+BATCH);
-    const {error}=await sb.from("hyrox_results").upsert(batch,{onConflict:"event,name,bib,division,total_time",ignoreDuplicates:true});
+    // season / year / event_name 컬럼은 나중에 추가된 것이라, 아직 마이그레이션하지 않은
+    // 테이블에서는 "column does not exist" 로 실패한다. 그 경우 새 컬럼만 떼고 한 번 재시도해서
+    // 업로드 자체는 성공시키고, 이후 배치는 처음부터 떼고 보낸다.
+    const strip=(arr)=>arr.map(({season,year,event_name,...rest})=>rest);
+    let payload = HYROX_EXTRA_COLS_SUPPORTED===false ? strip(batch) : batch;
+    let {error}=await sb.from("hyrox_results").upsert(payload,{onConflict:"event,name,bib,division,total_time",ignoreDuplicates:true});
+    if(error && HYROX_EXTRA_COLS_SUPPORTED!==false && /column|schema cache/i.test(error.message||"")){
+      console.warn("hyrox_results 에 season/year/event_name 컬럼이 없어 해당 값 없이 업로드합니다:", error.message);
+      HYROX_EXTRA_COLS_SUPPORTED=false;
+      ({error}=await sb.from("hyrox_results").upsert(strip(batch),{onConflict:"event,name,bib,division,total_time",ignoreDuplicates:true}));
+    } else if(!error && HYROX_EXTRA_COLS_SUPPORTED===null){
+      HYROX_EXTRA_COLS_SUPPORTED=true;
+    }
     if(error) throw error;
     processed+=batch.length;
     if(onProgress) onProgress(processed,unique.length);
@@ -10247,6 +10284,7 @@ function mapHyroxDbRow(row){
     u:Array.isArray(row.runs_json) ? row.runs_json : (typeof row.runs_json==="string" ? JSON.parse(row.runs_json||"[]") : []),
     s:Array.isArray(row.stations_json) ? row.stations_json : (typeof row.stations_json==="string" ? JSON.parse(row.stations_json||"[]") : []),
     z:row.transition||"",
+    dt:row.date || row.event_date || row.race_date || "",
   };
 }
 
