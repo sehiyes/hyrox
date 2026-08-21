@@ -6212,6 +6212,10 @@ function normalizeExternalRaceRow(r){
     age, age_group: normalizeAgeGroupLabel(r.age_group) || (age!=null ? getAgeGroup(age) : null),
     division: DIVISIONS.includes(r.division) ? r.division : "Open",
     event: r.event || null, country: r.country || null, date: r.date || null,
+    // 이 세 값이 여기서 누락되면 canonicalEventKey() 가 정규화 컬럼을 못 보고
+    // 다시 event 문자열 파싱으로 되돌아간다.
+    season: r.season || null, year: r.year || null, event_name: r.event_name || null,
+    start_date: r.start_date || null, end_date: r.end_date || null,
     overall_time,
     run_1:numOrNullAlias(r,"run_1","run1"), run_2:numOrNullAlias(r,"run_2","run2"),
     run_3:numOrNullAlias(r,"run_3","run3"), run_4:numOrNullAlias(r,"run_4","run4"),
@@ -9986,6 +9990,50 @@ function pickCsvValue(row, candidates){
   return "";
 }
 // "S8 2025 Shanghai" 처럼 사람이 읽을 수 있는 단일 라벨. Season 이 없으면 자동으로 빠진다.
+// CSV의 Date 열을 YYYY-MM-DD 로 정규화한다.
+// 04/12/2025 처럼 앞 두 자리가 12 이하인 슬래시 형식은 "4월 12일"인지 "12월 4일"인지
+// 알 수 없다. 이럴 때 임의로 하나를 고르면 대회 날짜가 조용히 8개월 틀어진다 —
+// Incheon 연도 누락과 똑같은 종류의 조용한 오염이므로, 추측하지 않고 ""를 돌려
+// 업로드 전 검증에서 걸리게 한다.
+function hyroxCsvDate(v){
+  const raw=hyroxCsvClean(v);
+  if(!raw) return "";
+  const pad=(n)=>String(n).padStart(2,"0");
+  const valid=(y,m,d)=>{ y=+y; m=+m; d=+d;
+    if(!(y>=1900&&y<=2100&&m>=1&&m<=12&&d>=1&&d<=31)) return "";
+    return `${y}-${pad(m)}-${pad(d)}`; };
+  let m;
+  // 1) 연도가 앞에 오는 형식 — 모호함 없음
+  if((m=raw.match(/^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$/))) return valid(m[1],m[2],m[3]);
+  // 2) 연도가 뒤에 오는 형식 — 첫 값이 13 이상이면 "일"로 확정할 수 있다
+  if((m=raw.match(/^(\d{1,2})[-./](\d{1,2})[-./](\d{4})$/))){
+    if(+m[1]>12) return valid(m[3],m[2],m[1]);   // DD/MM/YYYY 확정
+    if(+m[2]>12) return valid(m[3],m[1],m[2]);   // MM/DD/YYYY 확정
+    return "";                                    // 모호 — 추측 금지
+  }
+  // 3) "12 Apr 2025" / "Apr 12, 2025" 같은 영문 표기
+  const t=Date.parse(raw);
+  if(!Number.isNaN(t) && /[A-Za-z]{3}/.test(raw)){
+    const d=new Date(t); return valid(d.getFullYear(), d.getMonth()+1, d.getDate());
+  }
+  return "";
+}
+/* BUG FIX — CSV 헤더 대소문자
+ * 실제 업로드 파일의 헤더는 "season"/"year"(소문자)인데 코드는 row["Year"] 만 읽고 있었다.
+ * 그러면 year 가 "" 가 되고 event 라벨에서 연도가 조용히 빠진다 — Incheon 에서 벌어진 일과
+ * 정확히 같은 증상이다. 대소문자·공백·구분자를 무시하고 찾도록 통일한다.
+ */
+function csvField(row, ...names){
+  for(const n of names){
+    if(row[n]!==undefined) return hyroxCsvClean(row[n]);
+  }
+  const norm=(k)=>String(k).toLowerCase().replace(/[\s_\-]+/g,"");
+  const want=names.map(norm);
+  for(const k of Object.keys(row)){
+    if(want.includes(norm(k))) return hyroxCsvClean(row[k]);
+  }
+  return "";
+}
 function composeEventLabel(season, year, race){
   const s=String(season||"").trim();
   const seasonLabel = s ? (/^\d+$/.test(s) ? `S${s}` : s) : "";
@@ -9997,9 +10045,15 @@ function hyroxCsvRowToDbOfficial(row){
   // 같은 도시에서 한 해에 두 번 열리는 대회(예: 2025 Shanghai 2회)는 Year 만으로는 구분되지
   // 않는다. Season 은 연도를 걸쳐 있으므로(S7 2024-25, S8 2025-26) 두 대회를 실제로 가른다.
   // event 는 사람이 읽는 표시용 라벨로 계속 유지 — 기존 데이터/중복판정 키와 호환된다.
-  const season=hyroxCsvClean(row["Season"]) || hyroxCsvClean(row["season"]);
-  const year=hyroxCsvClean(row["Year"]);
-  const race=hyroxCsvClean(row["Target Race"]) || hyroxCsvClean(row["Race"]);
+  const season=csvField(row,"Season");
+  const year=csvField(row,"Year");
+  // HYROX 대회는 이틀에 걸치는 경우가 많다 (start date / end date).
+  // 연도 판정·정렬 기준은 start date 를 쓴다.
+  const rawStart=csvField(row,"start date","start_date","Date");
+  const rawEnd  =csvField(row,"end date","end_date");
+  const startDate=hyroxCsvDate(rawStart);
+  const endDate  =hyroxCsvDate(rawEnd);
+  const race=csvField(row,"Target Race") || csvField(row,"Race");
   const event=composeEventLabel(season,year,race);
   const division=hyroxCsvDivision(row["Selected Division"] || row["Division"]);
   const gender=hyroxCsvClean(row["Selected Gender"]);
@@ -10014,12 +10068,16 @@ function hyroxCsvRowToDbOfficial(row){
     `Run Split ${i}`, `Running Split ${i}`
   ])));
   const stations=["Split_1000m SkiErg","Split_50m Sled Push","Split_50m Sled Pull","Split_80m Burpee Broad Jump","Split_1000m Row","Split_200m Farmers Carry","Split_100m Sandbag Lunges","Split_Wall Balls"].map(k=>hyroxTimeValue(row[k]));
-  return {name,event,season:season||null,year:year||null,event_name:race||null,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
+  return {name,event,season:season||null,year:year||null,event_name:race||null,start_date:startDate||null,end_date:endDate||null,_rawStart:rawStart||null,_rawEnd:rawEnd||null,division,gender:gender||null,age_group:ageGroup||null,bib:bib||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["Split_Roxzone Time"])||null,search_name:normalizeHyroxSearchText(name)};
 }
 function hyroxCsvRowToDbDatabase(row){
   const name=hyroxCsvClean(row["name"]);
   const season=hyroxCsvClean(row["season"]);
   const year=hyroxCsvClean(row["year"]);
+  const rawStart=hyroxCsvClean(row["start_date"]) || hyroxCsvClean(row["start date"]) || hyroxCsvClean(row["date"]) || hyroxCsvClean(row["event_date"]);
+  const rawEnd  =hyroxCsvClean(row["end_date"])   || hyroxCsvClean(row["end date"]);
+  const startDate=hyroxCsvDate(rawStart);
+  const endDate  =hyroxCsvDate(rawEnd);
   const city=hyroxCsvClean(row["city"]);
   const eventId=hyroxCsvClean(row["event_id"]);
   const event=composeEventLabel(season,year,city) || eventId;
@@ -10034,7 +10092,7 @@ function hyroxCsvRowToDbDatabase(row){
     `running_${i}_time`, `running${i}`
   ])));
   const stations=["ski_erg_time","sled_push_time","sled_pull_time","burpee_broad_jump_time","row_time","farmers_carry_time","sandbag_lunges_time","wall_balls_time"].map(k=>hyroxTimeValue(row[k]));
-  return {name,event,division,gender,age_group:hyroxCsvClean(row["age_group"])||null,bib:hyroxCsvClean(row["idp"])||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["roxzone_time"])||null,search_name:normalizeHyroxSearchText(name)};
+  return {name,event,season:season||null,year:year||null,event_name:city||null,start_date:startDate||null,end_date:endDate||null,_rawStart:rawStart||null,_rawEnd:rawEnd||null,division,gender,age_group:hyroxCsvClean(row["age_group"])||null,bib:hyroxCsvClean(row["idp"])||null,overall_rank:Number.isFinite(overallRank)?overallRank:null,age_group_rank:Number.isFinite(ageGroupRank)?ageGroupRank:null,total_time:totalTime||null,runs_json:runs,stations_json:stations,transition:hyroxTimeValue(row["roxzone_time"])||null,search_name:normalizeHyroxSearchText(name)};
 }
 function hyroxDetectFormat(headers){
   const h=new Set(headers.map(x=>String(x||"").replace(/^\uFEFF/,"").trim()));
@@ -10092,7 +10150,10 @@ function hyroxDbRowToExternal(row){
     // hyrox_results 에는 현재 날짜 컬럼이 없다. 나중에 date / event_date / race_date 중
     // 아무 이름으로든 컬럼을 추가하면, 이 한 줄 덕분에 canonicalEventKey()의 연도 복원이
     // 코드 수정 없이 즉시 동작한다. 없으면 지금처럼 null.
-    date: row.date || row.event_date || row.race_date || null,
+    // 연도 판정·정렬 기준은 start_date. 구 데이터 호환을 위해 예전 이름들도 함께 본다.
+    date: row.start_date || row.date || row.event_date || row.race_date || null,
+    start_date: row.start_date || null,
+    end_date: row.end_date || null,
     overall_time: total,
     run_1: parseTimeToSec(runs[0]), run_2: parseTimeToSec(runs[1]), run_3: parseTimeToSec(runs[2]), run_4: parseTimeToSec(runs[3]),
     run_5: parseTimeToSec(runs[4]), run_6: parseTimeToSec(runs[5]), run_7: parseTimeToSec(runs[6]), run_8: parseTimeToSec(runs[7]),
@@ -10124,8 +10185,65 @@ async function uploadHyroxRawCsv(file,onProgress){
   const rowsWithSeason = rows.filter(r=>r.season).length;
   const rowsWithYear   = rows.filter(r=>r.year).length;
   const eventLabels    = [...new Set(rows.map(r=>r.event))];
+
+  /* ROOT-CAUSE FIX — 연도가 조용히 누락되던 경로 차단
+   *
+   * 기존에도 event 는 [year, race].filter(Boolean).join(" ") 로 만들고 있었다. 그런데도
+   * "HYROX Incheon" 처럼 연도 없는 라벨이 DB에 들어간 이유는, filter(Boolean) 이 빈 Year 를
+   * 조용히 버리고, 아래 행 필터가 name/event/division/total_time 만 확인했기 때문이다.
+   * event="Incheon" 은 truthy 라서 검사를 통과했고, 아무도 모르게 두 해가 한 대회로 합쳐졌다.
+   *
+   * 즉 문제는 "Year 가 비었다"가 아니라 "비어도 업로드가 성공했다"는 것이다. Season 을 추가해도
+   * 같은 구조면 똑같이 조용히 빠진다. 그래서 여기서 막는다 — 데이터가 잘못된 채로 들어가는 것보다
+   * 업로드가 실패하는 편이 훨씬 낫다.
+   */
+  const missingYear = rows.filter(r=>!r.year);
+  if(missingYear.length){
+    const races=[...new Set(missingYear.map(r=>r.event_name||r.event||"(대회명 없음)"))];
+    throw new Error(
+      `Year 값이 비어 있는 행이 ${missingYear.length.toLocaleString()}건 있습니다 (전체 ${rows.length.toLocaleString()}건 중).\n` +
+      `해당 대회: ${races.slice(0,6).join(", ")}${races.length>6?` 외 ${races.length-6}개`:""}\n\n` +
+      `연도 없이 올리면 같은 도시의 다른 연도 대회와 한 덩어리로 합쳐져, 포디움 기준(대회별 3위 median)이 ` +
+      `틀리게 계산됩니다. 예전 Incheon 2024/2025가 섞인 것이 정확히 이 경우입니다.\n` +
+      `CSV의 Year 열을 채운 뒤 다시 올려주세요.`);
+  }
+  // Date 열이 있으면, 파싱된 값이 없는 행은 형식이 잘못됐거나 모호한 것이다.
+  // 특히 04/12/2025 같은 슬래시 표기는 4월 12일인지 12월 4일인지 알 수 없어 일부러 실패시킨다.
+  const hasDateCol = headers.some(h=>/^(start ?_?date|date|race date)$/i.test(h));
+  const badDates = hasDateCol ? rows.filter(r=>(r._rawStart && !r.start_date) || (r._rawEnd && !r.end_date)) : [];
+  const missingDates = hasDateCol ? rows.filter(r=>!r._rawStart) : [];
+  // 대회가 끝난 뒤에 시작할 수는 없다 — 열이 뒤바뀌었거나 값이 잘못된 경우를 잡는다.
+  const reversedDates = rows.filter(r=>r.start_date && r.end_date && r.end_date < r.start_date);
+  if(reversedDates.length){
+    const ex=reversedDates.slice(0,3).map(r=>`${r.event}: ${r.start_date} ~ ${r.end_date}`);
+    throw new Error(
+      `end date 가 start date 보다 앞선 행이 ${reversedDates.length.toLocaleString()}건 있습니다.\n` +
+      `${ex.join("\n")}\n\n두 열이 뒤바뀌지 않았는지 확인해주세요.`);
+  }
+  if(badDates.length){
+    const samples=[...new Set(badDates.flatMap(r=>[r._rawStart,r._rawEnd]).filter(v=>v))].slice(0,5);
+    throw new Error(
+      `start date / end date 값을 해석할 수 없는 행이 ${badDates.length.toLocaleString()}건 있습니다.\n` +
+      `예시: ${samples.join(", ")}\n\n` +
+      `04/12/2025 처럼 앞이 12 이하인 슬래시 표기는 4월 12일인지 12월 4일인지 구분할 수 없어 ` +
+      `임의로 정하지 않습니다. YYYY-MM-DD 형식(예: 2025-04-12)으로 바꿔서 올려주세요.`);
+  }
+  if(hasDateCol && missingDates.length && missingDates.length<rows.length){
+    throw new Error(
+      `start date 열은 있는데 값이 비어 있는 행이 ${missingDates.length.toLocaleString()}건 있습니다.\n` +
+      `전부 채우거나, 날짜 열을 통째로 비워서 올려주세요.`);
+  }
+  const rowsWithDate = rows.filter(r=>r.start_date).length;
+  // Season 은 선택 컬럼이지만, "있다가 일부만 비는" 상태가 가장 위험하다 (일부 행만 시즌이 붙어
+  // 같은 대회가 두 라벨로 쪼개진다). 열이 존재하면 전 행이 채워져 있어야 한다.
+  if(hasSeasonCol && rowsWithSeason>0 && rowsWithSeason<rows.length){
+    throw new Error(
+      `Season 열은 있는데 값이 비어 있는 행이 ${(rows.length-rowsWithSeason).toLocaleString()}건 있습니다.\n` +
+      `일부만 채워지면 같은 대회가 "S8 2025 Shanghai"와 "2025 Shanghai" 두 라벨로 쪼개집니다.\n` +
+      `전부 채우거나, Season 열을 통째로 비워서 올려주세요.`);
+  }
   const unique=[]; const seen=new Set();
-  for(const r of rows){const key=[r.event,r.name,r.bib,r.division,r.total_time].join("\u0001"); if(seen.has(key)) continue; seen.add(key); unique.push(r);}
+  for(const r of rows){const key=[r.event,r.name,r.bib,r.division,r.total_time].join("\u0001"); if(seen.has(key)) continue; seen.add(key); delete r._rawStart; delete r._rawEnd; unique.push(r);}
   // spec (doc4 §5/§6): 실제 몇 건이 "새로" 들어갔는지(중복 제외) 정확히 알기 위해 업로드 전후
   // 테이블 전체 행 수를 비교한다 — upsert(ignoreDuplicates)는 클라이언트에 어느 행이 실제로
   // insert됐는지 알려주지 않으므로, 이 방식이 name만으로 판정하지 않는 가장 정확한 delta다.
@@ -10137,7 +10255,7 @@ async function uploadHyroxRawCsv(file,onProgress){
     // season / year / event_name 컬럼은 나중에 추가된 것이라, 아직 마이그레이션하지 않은
     // 테이블에서는 "column does not exist" 로 실패한다. 그 경우 새 컬럼만 떼고 한 번 재시도해서
     // 업로드 자체는 성공시키고, 이후 배치는 처음부터 떼고 보낸다.
-    const strip=(arr)=>arr.map(({season,year,event_name,...rest})=>rest);
+    const strip=(arr)=>arr.map(({season,year,event_name,start_date,end_date,...rest})=>rest);
     let payload = HYROX_EXTRA_COLS_SUPPORTED===false ? strip(batch) : batch;
     let {error}=await sb.from("hyrox_results").upsert(payload,{onConflict:"event,name,bib,division,total_time",ignoreDuplicates:true});
     if(error && HYROX_EXTRA_COLS_SUPPORTED!==false && /column|schema cache/i.test(error.message||"")){
@@ -10183,7 +10301,7 @@ async function uploadHyroxRawCsv(file,onProgress){
   });
 
   return {imported:unique.length,totalParsed:data.length,format,duplicates:rows.length-unique.length,peerDbAdded:converted.length,runCoverage,stationCoverage,newRecords,totalAfter:postCount,
-    hasSeasonCol, rowsWithSeason, rowsWithYear, eventLabels, extraColsSupported:HYROX_EXTRA_COLS_SUPPORTED};
+    hasSeasonCol, rowsWithSeason, rowsWithYear, rowsWithDate, hasDateCol, eventLabels, extraColsSupported:HYROX_EXTRA_COLS_SUPPORTED};
 }
 // spec (doc4 §5): 누적 로그는 여러 관리자가 같은 화면에서 봐야 하므로 shared:true로 저장한다.
 // 최근 100건만 유지 — 무한정 커지지 않도록.
@@ -10294,7 +10412,8 @@ function mapHyroxDbRow(row){
     u:Array.isArray(row.runs_json) ? row.runs_json : (typeof row.runs_json==="string" ? JSON.parse(row.runs_json||"[]") : []),
     s:Array.isArray(row.stations_json) ? row.stations_json : (typeof row.stations_json==="string" ? JSON.parse(row.stations_json||"[]") : []),
     z:row.transition||"",
-    dt:row.date || row.event_date || row.race_date || "",
+    dt:row.start_date || row.date || row.event_date || row.race_date || "",
+    dt2:row.end_date || "",
   };
 }
 
@@ -12994,13 +13113,16 @@ function renderModelDnaImportTab(wrap){
       const seasonNote = res.hasSeasonCol
         ? `<br><span style="color:var(--green);">✓ Season 컬럼 인식 — ${res.rowsWithSeason.toLocaleString()}행에 시즌 반영 (대회 라벨: ${res.eventLabels.slice(0,4).map(escapeHtml).join(", ")}${res.eventLabels.length>4?` 외 ${res.eventLabels.length-4}개`:""})</span>`
         : `<br><span style="color:var(--amber);">⚠ CSV에 Season 컬럼이 없습니다. 같은 해에 같은 도시에서 두 번 열린 대회(예: 2025 Shanghai)는 하나로 합쳐져 포디움 기준이 왜곡됩니다. Season 열을 추가해 다시 올려주세요.</span>`;
+      const dateNote = res.hasDateCol
+        ? `<br><span style="color:var(--green);">✓ 대회 날짜 인식 — ${res.rowsWithDate.toLocaleString()}행에 start/end date 반영</span>` : "";
       const colNote = res.extraColsSupported===false
         ? `<br><span style="color:var(--amber);">⚠ hyrox_results에 season/year/event_name 컬럼이 없어 해당 값 없이 저장했습니다 — 마이그레이션 SQL 실행 후 다시 올려주세요.</span>` : "";
-      statusEl.innerHTML = statusEl.textContent + seasonNote + colNote;
+      statusEl.innerHTML = statusEl.textContent + seasonNote + dateNote + colNote;
       showToast("HYROX 선수 검색 DB + DNA 비교 데이터 업데이트 완료");
       renderAll();
     }catch(err){
       statusEl.style.color="var(--red)";
+      statusEl.style.whiteSpace="pre-wrap";
       statusEl.textContent=err?.message||String(err);
     }finally{ e.target.value=""; }
   });
