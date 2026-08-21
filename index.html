@@ -240,6 +240,9 @@ td.num, th.num{font-family:var(--font-mono); text-align:right;}
   .sidebar{
     position:fixed; top:0; left:0; height:100vh; width:250px; max-width:82vw;
     flex-direction:column; overflow-y:auto; z-index:1000;
+    box-sizing:border-box;
+    /* 하단 고정 대시보드가 메뉴 마지막 항목을 가리지 않도록 스크롤 여유 확보 */
+    padding-bottom:calc(112px + env(safe-area-inset-bottom));
     transform:translateX(-100%); transition:transform .25s ease;
     box-shadow:0 0 40px rgba(0,0,0,.5);
   }
@@ -10493,9 +10496,18 @@ async function uploadHyroxRawCsv(file,onProgress){
   // spec (doc4 §5/§6): 이 업로드가 실제로 무엇을 몇 건 바꿨는지 — Event/Date/Source/Raw/Valid/
   // Duplicate/New/UpdatedAt — 나중에 "어떤 대회 데이터를 추가해서 DNA 기준이 바뀌었는지" 추적 가능하게.
   const uniqueEvents = [...new Set(unique.map(r=>r.event).filter(Boolean))];
+  // 업로드 이력에 시즌 / 년도 / 지역을 명시적으로 남긴다.
+  // 지역은 Target Race(event_name)를 우선 사용하며, 기존 event 라벨은 호환성을 위해 함께 보존한다.
+  const uploadSeasons = [...new Set(unique.map(r=>String(r.season||"").trim()).filter(Boolean))];
+  const uploadYears = [...new Set(unique.map(r=>String(r.year||"").trim()).filter(Boolean))];
+  const uploadRegions = [...new Set(unique.map(r=>String(r.event_name||"").trim()).filter(Boolean))];
   await appendHyroxUploadLog({
     id: uid(), uploadedAt: new Date().toISOString(), fileName: file.name, format,
     events: uniqueEvents.slice(0,5), // 파일 하나에 여러 대회가 섞여 있을 수 있음 — 상위 5개만 기록
+    seasons: uploadSeasons,
+    years: uploadYears,
+    regions: uploadRegions,
+    importedCount: newRecords,
     hasSeasonCol, rowsWithSeason,
     rawParsed: data.length, validRows: rows.length, duplicatesInFile: rows.length-unique.length,
     uploadedRows: unique.length, newRecords, totalAfter: postCount,
@@ -13613,17 +13625,25 @@ function renderModelDnaImportTab(wrap){
     if(!Array.isArray(log)) log=[];
     logCard.innerHTML = `
       <div class="row-between"><h2 class="section-title">📜 업로드 이력</h2><span class="mono" style="font-size:11px;color:var(--gray-dim);">${log.length}건</span></div>
-      <p class="lead" style="margin:6px 0 10px;">누가 언제 어떤 대회 CSV를 추가해서 선수 검색 DB(<code>hyrox_results</code>)가 몇 건 늘었는지 기록입니다. "신규 반영"은 업로드 전후 전체 테이블 행 수 차이로 계산한 실제 순증분입니다 (파일 내 중복·기존과 겹치는 행 제외).</p>
-      ${log.length ? `<div style="overflow-x:auto;"><table><thead><tr><th>일시</th><th>대회</th><th>파일</th><th class="num">파일 내 유효행</th><th class="num">파일 내 중복</th><th class="num">신규 반영</th><th class="num">누적 전체</th></tr></thead><tbody>
-        ${log.map(e=>`<tr>
+      <p class="lead" style="margin:6px 0 10px;">누가 언제 어떤 HYROX 데이터를 추가했는지 기록합니다. <b>시즌 · 년도 · 지역 · 가져온 수</b>를 별도로 표시하며, "가져온 수"는 업로드 전후 <code>hyrox_results</code> 전체 행 수 차이로 계산한 실제 신규 반영 건수입니다 (파일 내 중복·기존과 겹치는 행 제외).</p>
+      ${log.length ? `<div style="overflow-x:auto;"><table><thead><tr><th>일시</th><th>시즌</th><th>년도</th><th>지역</th><th>대회</th><th>파일</th><th class="num">가져온 수</th><th class="num">파일 내 중복</th><th class="num">누적 전체</th></tr></thead><tbody>
+        ${log.map(e=>{
+          const seasons = Array.isArray(e.seasons) ? e.seasons : (e.season ? [e.season] : []);
+          const years = Array.isArray(e.years) ? e.years : (e.year ? [e.year] : []);
+          const regions = Array.isArray(e.regions) ? e.regions : (e.region ? [e.region] : []);
+          const imported = e.importedCount!=null ? e.importedCount : e.newRecords;
+          return `<tr>
           <td style="white-space:nowrap;">${(e.uploadedAt||"").slice(0,16).replace("T"," ")}</td>
+          <td class="mono">${escapeHtml(seasons.join(", ")||"—")}</td>
+          <td class="mono">${escapeHtml(years.join(", ")||"—")}</td>
+          <td>${escapeHtml(regions.join(", ")||"—")}</td>
           <td>${escapeHtml((e.events||[]).join(", ")||"—")}</td>
           <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--gray-dim);font-size:11px;">${escapeHtml(e.fileName||"")}</td>
-          <td class="num mono">${e.validRows?.toLocaleString()??"—"}</td>
+          <td class="num mono" style="color:var(--green);font-weight:700;">${imported!=null?"+"+Number(imported).toLocaleString():"확인불가"}</td>
           <td class="num mono">${e.duplicatesInFile?.toLocaleString()??"—"}</td>
-          <td class="num mono" style="color:var(--green);">${e.newRecords!=null?"+"+e.newRecords.toLocaleString():"확인불가"}</td>
           <td class="num mono">${e.totalAfter!=null?e.totalAfter.toLocaleString():"—"}</td>
-        </tr>`).join("")}
+        </tr>`;
+        }).join("")}
       </tbody></table></div>` : `<div class="empty-note">아직 업로드 이력이 없습니다 — 아래 "현재 DB 구성"에서 실제로 들어있는 대회는 확인할 수 있습니다.</div>`}
       ${hyroxDbEventSummaryHtml()}
     `;
