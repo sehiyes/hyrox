@@ -3402,7 +3402,7 @@ function computeGoalPlan(){
   // V3 (spec §27): even if the HPI-trend-based scenario check above looked optimistic, if the segment
   // model shows the gap exceeds the AGGRESSIVE ceiling summed across all 17 segments, the honest read
   // is "달성 가능성이 낮음" — never respond to an extreme target by silently implying more intensity fixes it.
-  if(segmentGap && !segmentGap.alreadyMet && segmentGap.feasibility==="beyond-model"){
+  if(segmentGap && !segmentGap.alreadyMet && segmentGap.feasibility==="beyond-p05"){
     feasibility="unrealistic"; probability=Math.min(probability,15);
   }
 
@@ -3490,15 +3490,25 @@ function analyzeRaceExecution(race){
   const fadePct=(fadeSec/first)*100;
   const degradation=computeStationInducedDegradation(race);
   const explainedSec=degradation.reduce((s,d)=>s+Math.max(0,d.degradationSec),0);
-  // bounded diagnostic, not a full reconciliation (Run1 has no preceding station) — only meant to
-  // show roughly how much of the overall fade lines up with measured post-station slowdowns.
-  const explainedRatio = fadeSec>0 ? clamp(explainedSec/fadeSec,0,1.5) : null;
+  // spec fix (verify math before claiming causation): fadeSec (Run1→Run8, a TWO-POINT endpoint
+  // difference) and explainedSec (a SUM of seven independent post-station-vs-race-average deviations)
+  // are not the same kind of quantity — explainedSec can legitimately exceed fadeSec (e.g. a bad
+  // mid-race station effect that the athlete partly recovers from by Run8). A raw ratio above 1 is
+  // NOT evidence that "station effects explain more than 100% of the fade"; it means the two numbers
+  // aren't directly comparable that race, so the claim must be softened rather than clamped-and-hidden.
+  const explainedRatioRaw = fadeSec>0 ? explainedSec/fadeSec : null;
+  const explainedRatio = explainedRatioRaw!=null ? clamp(explainedRatioRaw,0,1) : null; // for the "설명 비율" itself, cap at 100% — never claim >100%
   let diagnosis;
   if(fadeSec<=0){
     diagnosis={ key:"good", label:"Pacing 양호", detail:"Run1 대비 Run8이 느려지지 않았습니다." };
+  } else if(explainedRatioRaw!=null && explainedRatioRaw>1.05){
+    // sum of individual post-station slowdowns clearly exceeds the net first-to-last difference —
+    // don't claim it "explains" the fade; say what actually happened instead (localized, partly-recovered).
+    diagnosis={ key:"station-uneven", label:"Station 영향이 구간마다 회복됨",
+      detail:`개별 스테이션 직후 저하 합(${fmtTime(explainedSec)})이 Run1→Run8 순 차이(${fmtTime(fadeSec)})보다 큽니다 — 특정 스테이션 이후 크게 느려졌다가 이후 구간에서 페이스를 일부 회복했다는 뜻이며, "전체 저하의 대부분을 설명한다"고 단정할 수는 없습니다. 어떤 스테이션이 반복적으로 영향을 주는지는 여러 대회 데이터로 판단하는 것이 더 정확합니다.` };
   } else if(explainedRatio!=null && explainedRatio>=0.7){
     diagnosis={ key:"station", label:"Station-induced Fatigue가 주요 원인",
-      detail:`측정된 스테이션 이후 Run 저하분(${fmtTime(explainedSec)})이 전체 페이스 저하(${fmtTime(fadeSec)})의 대부분을 설명합니다 — 러닝 체력 부족보다 스테이션→러닝 전환 능력이 핵심일 가능성이 높습니다.` };
+      detail:`측정된 스테이션 이후 Run 저하분(${fmtTime(explainedSec)})이 전체 페이스 저하(${fmtTime(fadeSec)})의 약 ${round1(explainedRatio*100)}%를 차지합니다 — 러닝 체력 부족보다 스테이션→러닝 전환 능력이 핵심일 가능성이 있습니다 (단일 대회 관찰값이므로 여러 대회에서 반복되는지 함께 확인하세요).` };
   } else if(explainedRatio!=null && explainedRatio>=0.3){
     diagnosis={ key:"mixed", label:"Station 영향 + Pacing 혼합",
       detail:"측정된 스테이션 저하만으로는 전체 페이스 저하를 다 설명하지 못합니다 — 초반 오버페이스 가능성도 함께 점검해보세요." };
@@ -3506,7 +3516,61 @@ function analyzeRaceExecution(race){
     diagnosis={ key:"pacing", label:"Pacing 문제 가능성",
       detail:"스테이션 저하로 설명되는 부분이 적어, 초반 오버페이스 등 페이싱 전략이 원인일 가능성이 있습니다." };
   }
-  return { fadeSec, fadePct, explainedSec, explainedRatio, diagnosis, degradation };
+  return { fadeSec, fadePct, explainedSec, explainedRatio, explainedRatioRaw, diagnosis, degradation };
+}
+
+/* ---------------------------------------------------------------------- */
+/* 5a-3b. STATION → RUN FATIGUE ACROSS ALL RACES (DNA §3/§4/§5/§6)         */
+/*     Reuses computeStationInducedDegradation(race) — UNCHANGED — once     */
+/*     per registered race, then aggregates into a per-station history so    */
+/*     a single noisy race can no longer be read as "the athlete's DNA".     */
+/*     Repetition (not just the latest race) is the whole point: a pattern   */
+/*     that shows up in every race is a real characteristic; one that shows  */
+/*     up once might just be that day's bad transition.                     */
+/* ---------------------------------------------------------------------- */
+const STATION_RUN_DEGRADATION_NOISE_FLOOR_SEC = 3; // a few seconds of timing/rounding noise never counts as "an occurrence"
+function computeStationRunDegradationAllRaces(){
+  const races=[...STATE.races].filter(r=>r&&r.date).sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+  if(!races.length) return null;
+  const perRace = races.map(race=>({
+    race, label: race.name || dnaEvoDateLabel(race.date), date: race.date,
+    degradation: computeStationInducedDegradation(race), // reused verbatim, one race at a time
+    execution: analyzeRaceExecution(race), // reused verbatim — already fixed above (no overclaiming)
+  })).filter(p=>p.degradation.length>0);
+  if(!perRace.length) return null;
+
+  const stations = STATIONS.filter(s=>STATION_RUN_MAP[s.key].after!=null); // every station except Wall Ball (finishes the race)
+  const perStation = stations.map(s=>{
+    const series = perRace.map(p=>{
+      const d = p.degradation.find(x=>x.key===s.key);
+      return d ? { label:p.label, date:p.date, degradationSec:d.degradationSec, afterRunSec:d.afterRunSec, baselineSec:d.baselineSec } : null;
+    });
+    const measured = series.filter(Boolean);
+    if(!measured.length) return null;
+    const occurrences = measured.filter(m=>m.degradationSec>STATION_RUN_DEGRADATION_NOISE_FLOOR_SEC);
+    const occurrenceRatio = occurrences.length/measured.length;
+    const avgDegradationSec = mean(measured.map(m=>m.degradationSec));
+    const avgOccurrenceDegradationSec = occurrences.length? mean(occurrences.map(m=>m.degradationSec)) : 0;
+    const latest = measured[measured.length-1];
+    // pattern verdict — only meaningful with 2+ races; a single race can't show "repetition" at all.
+    let pattern;
+    if(measured.length<2) pattern={ key:"insufficient", label:"데이터 1건 — 반복 여부 판단 불가", emoji:"⚪" };
+    else if(occurrenceRatio>=0.999) pattern={ key:"repeated", label:"반복적으로 나타나는 패턴", emoji:"🔴" };
+    else if(occurrenceRatio>=0.5) pattern={ key:"frequent", label:"간헐적으로 나타나는 패턴", emoji:"🟡" };
+    else if(occurrenceRatio>0) pattern={ key:"occasional", label:"일시적인 패턴", emoji:"🟢" };
+    else pattern={ key:"none", label:"관찰되지 않음", emoji:"🟢" };
+    return {
+      key:s.key, label:s.label, series, measured, occurrences: occurrences.length, totalMeasured: measured.length,
+      occurrenceRatio, avgDegradationSec, avgOccurrenceDegradationSec, latest, pattern,
+    };
+  }).filter(Boolean).sort((a,b)=>b.latest.degradationSec-a.latest.degradationSec);
+
+  // aggregate diagnosis distribution across races (spec §6 — reuses analyzeRaceExecution() per race,
+  // no new causal model; just summarizes how often each diagnosis showed up across the athlete's races)
+  const diagnosisCounts={};
+  perRace.forEach(p=>{ if(p.execution){ const k=p.execution.diagnosis.key; diagnosisCounts[k]=(diagnosisCounts[k]||0)+1; } });
+
+  return { races: perRace, perStation, raceCount: perRace.length, diagnosisCounts };
 }
 
 
@@ -3971,9 +4035,101 @@ function buildSegmentGapAnalysis(){
   return { segments, totals, weeksToRace, hasRaceDate, currentEstimate, model };
 }
 
-// Target Gap Decomposition (spec §5): allocates the total time gap across segments weighted by
-// each segment's OWN realistic potential — a segment that's slow but not very trainable right now
-// gets a small share even if its raw gap looks large; a highly-trainable segment gets more.
+/* ---------------------------------------------------------------------- */
+/* 5a-2. TARGET GAP ALLOCATION — P05 ceiling + priority-weighted water-fill */
+/*     (fixes: proportional-by-realisticSec split let one weak segment's    */
+/*     outsized raw benchmark-gap-in-seconds dominate the ENTIRE target     */
+/*     gap allocation, e.g. "Burpee -19:57" for a 33:00 total gap). Reuses  */
+/*     every existing benchmark/fallback function wholesale — no new        */
+/*     benchmark source, no new fallback chain, no new arbitrary constants  */
+/*     beyond the standard-normal z for "top 5%" (1.645, textbook value):    */
+/*       - P05 ceiling: queryPeerSegmentStats() (the SAME ASIA/Global/      */
+/*         illustrative mean+sd resolver DNA already uses) -> top-5% time   */
+/*         = mean - 1.645*sd, exactly the same normal-approximation DNA     */
+/*         already relies on for percentile/z-score.                       */
+/*       - Priority weight: calculateSegmentPotential()'s own trainability  */
+/*         (unchanged) combined with a DIMENSIONLESS relative-gap ratio     */
+/*         (gapToBenchSec/benchmark) instead of raw seconds — this is the   */
+/*         actual fix, since a ratio is bounded/comparable across segments  */
+/*         of very different absolute length (Wall Ball vs a Run leg),      */
+/*         while raw seconds are not.                                       */
+/*     Allocation itself is a standard capped water-fill: each segment's    */
+/*     share is proportional to its priority weight, but NEVER exceeds its  */
+/*     own P05 ceiling; any excess a capped segment can't absorb is         */
+/*     redistributed to the remaining segments by the same weights, so the */
+/*     total allocated always reconciles to totalGapSec whenever that's     */
+/*     even possible (spec §1/§6), and never blows through any one         */
+/*     segment's realistic ceiling (spec §2/§3/§9).                        */
+/* ---------------------------------------------------------------------- */
+const TARGET_GAP_P05_Z = 1.645; // standard normal z for the 95th percentile ("top 5%") — textbook constant, not a new model parameter
+function segmentListKeyToPeerSegKey(key){ return key==="transition" ? "roxzone" : key; }
+// Same comparison-group shape DNA/queryPeerSegmentStats already expect (spec §2: Division/Gender/Age/Segment).
+// Matches the SAME profile-derived context buildSegmentGapAnalysis()'s segments were already computed
+// under (STATE.profile.division/age/gender, via activePredictionContext()'s default) — so the P05
+// ceiling is always measured on the SAME comparison basis as each segment's own currentSec/benchmark,
+// never a mismatched division.
+function targetGapPeerGroupFilters(){
+  const division = normalizeRaceDivision(STATE.profile.division) || (DIVISIONS.includes(STATE.profile.division) ? STATE.profile.division : "Open");
+  return {
+    gender: STATE.profile.gender==="female" ? "female" : "male",
+    ageGroup: getAgeGroup(Number(STATE.profile.age)),
+    division,
+    event: null, date: null, country: STATE.profile.country || null,
+  };
+}
+// P05 ceiling in seconds for one 17-segment-model segment — reuses queryPeerSegmentStats() (DNA's own
+// mean/sd resolver: real ASIA/Global derived benchmark first, illustrative model only as last resort)
+// wholesale. Returns null only if this key has no PEER_SEGMENTS counterpart at all (shouldn't happen —
+// PEER_SEGMENTS covers the exact same 17 segments as SEGMENT_LIST).
+function getSegmentP05Sec(segmentListKey){
+  const peerSeg = PEER_SEGMENTS.find(p=>p.key===segmentListKeyToPeerSegKey(segmentListKey));
+  if(!peerSeg) return null;
+  const stats = queryPeerSegmentStats(peerSeg, targetGapPeerGroupFilters());
+  if(!stats || stats.mean==null || stats.sd==null) return null;
+  return Math.max(0, stats.mean - TARGET_GAP_P05_Z*stats.sd);
+}
+// Priority weight (spec §4/§5/§7): weakness raises priority, strength lowers it but never to exactly
+// zero — and critically, this is built from a RATIO (gapToBenchSec/benchmark, dimensionless) and the
+// EXISTING trainability (already 0.05-1, reused verbatim per spec §6), never from raw seconds. A 0.05
+// floor (the SAME floor calculateTrainability() already clamps to — not a new constant) keeps strength
+// segments in the allocation at a low-but-nonzero weight instead of being zeroed out (spec §5).
+function targetGapPriorityWeight(seg){
+  const relativeGap = seg.benchmark>0 ? clamp(seg.gapToBenchSec/seg.benchmark, 0, 1.5) : 0;
+  return clamp(0.05+relativeGap, 0.05, 1.55) * clamp(seg.trainability, 0.05, 1);
+}
+// Standard capped water-fill: distribute `totalSec` across `items` ([{key,weight,ceiling}]) proportional
+// to weight, but never past an item's own ceiling; overflow a capped item can't take is redistributed to
+// the remaining (not-yet-capped) items by the same weights, repeating until either everything is
+// allocated or every item is at its ceiling. Returns per-item allocated seconds + any amount that
+// genuinely could not be placed anywhere (spec §8 — target Gap exceeds the sum of all P05 ceilings).
+function waterFillAllocate(items, totalSec){
+  const pool = items.map(it=>({ ...it, allocated:0, capped: it.ceiling<=0 }));
+  let remaining = totalSec;
+  for(let iter=0; iter<60 && remaining>0.05; iter++){
+    const active = pool.filter(p=>!p.capped);
+    if(!active.length) break;
+    const sumW = active.reduce((s,p)=>s+p.weight,0);
+    if(sumW<=0) break;
+    let placedThisRound=0;
+    active.forEach(p=>{
+      const share = remaining*(p.weight/sumW);
+      const room = p.ceiling-p.allocated;
+      const give = Math.min(share, room);
+      p.allocated += give;
+      placedThisRound += give;
+      if(p.ceiling-p.allocated<=0.05) p.capped=true;
+    });
+    remaining -= placedThisRound;
+    if(placedThisRound<=0.05) break; // nothing more can be placed — every remaining item is at (or essentially at) its ceiling
+  }
+  return { pool, unallocatedSec: Math.max(0, remaining) };
+}
+
+// Target Gap Decomposition (spec §5, revised): allocates the total time gap across segments by
+// PRIORITY (weakness + trainability, bounded/dimensionless — see targetGapPriorityWeight), never by
+// raw benchmark-gap seconds, and never past each segment's own P05 ceiling (see getSegmentP05Sec/
+// waterFillAllocate above). A segment being weak raises its PRIORITY, not its entitlement to the
+// benchmark-distance-in-seconds as a literal target.
 function calculateTargetGap(){
   const targetSec=parseTimeToSec(STATE.profile.targetTime);
   if(!targetSec) return null;
@@ -4002,18 +4158,40 @@ function calculateTargetGap(){
       segments:[], gapAnalysis, feasibility:"already-met", goalAwareDebug:goalAware.debug };
   }
   const {realistic:sumRealistic, aggressive:sumAggressive} = gapAnalysis.totals;
-  const segments=gapAnalysis.segments.map(s=>{
-    const weight = sumRealistic>0 ? s.realisticSec/sumRealistic : 1/gapAnalysis.segments.length;
-    return { ...s, allocatedSec: totalGapSec*weight, weight };
-  }).sort((a,b)=>b.allocatedSec-a.allocatedSec);
 
+  // P05 ceiling per segment (spec §2/§3/§9) + bounded priority weight (spec §4/§5/§6/§7) — falls back
+  // to this segment's existing aggressiveSec ceiling if no peer benchmark stats are resolvable at all
+  // (e.g. DERIVED_BENCHMARK not yet loaded and no illustrative fallback matched), so nothing here ever
+  // regresses to "no ceiling" just because a lookup came back empty.
+  const withCeiling = gapAnalysis.segments.map(s=>{
+    const p05Sec = getSegmentP05Sec(s.key);
+    const maxImprovementSec = p05Sec!=null ? Math.max(0, s.currentSec-p05Sec) : s.aggressiveSec;
+    const priorityWeight = targetGapPriorityWeight(s);
+    return { ...s, p05Sec, maxImprovementSec, priorityWeight };
+  });
+  const sumP05Ceiling = withCeiling.reduce((sum,s)=>sum+s.maxImprovementSec,0);
+
+  const { pool, unallocatedSec } = waterFillAllocate(
+    withCeiling.map(s=>({ key:s.key, weight:s.priorityWeight, ceiling:s.maxImprovementSec })),
+    totalGapSec
+  );
+  const allocatedByKey = new Map(pool.map(p=>[p.key, p.allocated]));
+  const segments = withCeiling.map(s=>({ ...s, allocatedSec: allocatedByKey.get(s.key)||0, weight: s.priorityWeight }))
+    .sort((a,b)=>b.allocatedSec-a.allocatedSec);
+
+  // feasibility: sumRealistic/sumAggressive stay as informational bands (unchanged meaning — "would a
+  // Conservative/Aggressive training push, summed across all 17 segments, cover this gap"), but the P05
+  // ceiling sum is now the AUTHORITATIVE hard limit (spec §8) — totalGapSec can never actually be placed
+  // beyond it, however generous "aggressive" looked.
   let feasibility;
   if(totalGapSec<=sumRealistic) feasibility="realistic";
   else if(totalGapSec<=sumAggressive) feasibility="aggressive";
-  else feasibility="beyond-model"; // target gap exceeds even the aggressive ceiling summed across all 17 segments
+  else if(totalGapSec<=sumP05Ceiling) feasibility="stretch-to-p05";
+  else feasibility="beyond-p05"; // target gap exceeds even the P05(top-5%)-ceiling summed across all 17 segments
 
   return { targetSec, totalGapSec, currentEstimate, alreadyMet:false,
-    segments, sumRealistic, sumAggressive, feasibility, weeksToRace:gapAnalysis.weeksToRace, hasRaceDate:gapAnalysis.hasRaceDate,
+    segments, sumRealistic, sumAggressive, sumP05Ceiling, unallocatedSec, feasibility,
+    weeksToRace:gapAnalysis.weeksToRace, hasRaceDate:gapAnalysis.hasRaceDate,
     goalAwareDebug:goalAware.debug };
 }
 
@@ -5407,16 +5585,27 @@ function generateSessionPrescription(type, ctx, stationFocusOverride){
   const volumeNote = fatigueHigh ? "최근 fatigue가 높아 volume을 약 20% 줄였습니다" : null;
 
   if(type==="interval"){
-    const pace=personalPace("threshold");
+    const thresholdPace=personalPace("threshold");
     const ivPace=personalPace("interval");
     const reps=Math.max(3,Math.round(4*volFactor));
     const repM=Number(STATE.running.intervalRepM)||null;
-    const mainBlock = repM
-      ? `${reps} × ${repM}m @ Interval Pace ${fmtTime(ivPace.sec*(repM/1000))} (동일 거리 조깅 회복) — ${ivPace.source}${ivPace.basis?` · ${ivPace.basis}`:""}`
-      : `${reps} × 8분 @ Threshold (2분 Easy 회복)`;
+    // spec fix (Target Pace/Repetition Distance/Repetition Time consistency): the main block's rep time
+    // and the card's headline "Pace: X/km" must come from the SAME pace, or they contradict each other
+    // (e.g. "4×400m @ 1:36" implies ~4:00/km, but the header used to show Threshold pace like 5:47/km
+    // instead — two different sources shown as if they agreed). Whichever pace actually produced the
+    // rep time above is now also the one shown as "Pace:".
+    let mainBlock, displayPace;
+    if(repM){
+      const repTimeSec = ivPace.sec*(repM/1000);
+      mainBlock = `${reps} × ${repM}m @ ${fmtTime(repTimeSec)} (동일 거리 조깅 회복) — ${ivPace.source}${ivPace.basis?` · ${ivPace.basis}`:""}`;
+      displayPace = ivPace; // same basis as the rep time above — never a different pace field
+    } else {
+      mainBlock = `${reps} × 8분 @ Threshold (2분 Easy 회복)`;
+      displayPace = thresholdPace; // no rep-distance set -> the block is genuinely Threshold-paced, so Threshold pace is correct here
+    }
     return { title:"Threshold Run", purpose:"Running Gap 감소",
       blocks:["15분 Easy 웜업", mainBlock, "10분 쿨다운"],
-      targetRpe:"7-8", pace:`${fmtTime(pace.sec)}/km (${pace.source})`, volumeNote };
+      targetRpe:"7-8", pace:`${fmtTime(displayPace.sec)}/km (${displayPace.source})`, volumeNote };
   }
   if(type==="brick"){
     const stKey = stationFocusOverride || pickFeaturedStationKey();
@@ -8952,19 +9141,21 @@ function segmentTargetGapTable(segmentGap){
       <td style="padding:6px 8px;font-size:12.5px;color:var(--white);">${s.label}</td>
       <td style="padding:6px 8px;"><span class="badge ${conf.cls}" title="${conf.label}">${s.confidence.toUpperCase()}</span></td>
       <td style="padding:6px 8px;font-family:var(--font-mono);font-size:12px;color:var(--red);text-align:right;">-${fmtTime(s.allocatedSec)}</td>
+      <td style="padding:6px 8px;font-family:var(--font-mono);font-size:11px;color:var(--gray-dim);text-align:right;" title="이 구간에서 배분 가능한 최대치 — 동일 조건(Division·Gender·Age) 상위 5% 수준">P05 ceiling -${fmtTime(s.maxImprovementSec)}</td>
       <td style="padding:6px 8px;font-family:var(--font-mono);font-size:11px;color:var(--gray-dim);text-align:right;">Cons -${fmtTime(s.conservativeSec)}</td>
       <td style="padding:6px 8px;font-family:var(--font-mono);font-size:11px;color:var(--gray-dim);text-align:right;">Aggr -${fmtTime(s.aggressiveSec)}</td>
     </tr>`;
   }).join("");
-  const warn = segmentGap.feasibility==="beyond-model"
-    ? `<p class="reason-line" style="color:var(--red);margin-top:8px;">이 목표 Gap(${fmtTime(segmentGap.totalGapSec)})은 17개 구간의 Aggressive 개선 합(${fmtTime(segmentGap.sumAggressive)})조차 초과합니다 — 현재 데이터 기준으로는 훈련 강도를 높이는 것만으로 도달하기 어렵습니다. 목표 기록 또는 대회까지 남은 기간 조정을 검토해보세요.</p>`
-    : `<p class="reason-line" style="margin-top:8px;color:var(--gray-dim);">Realistic 개선 합: -${fmtTime(segmentGap.sumRealistic)} · Aggressive 개선 합: -${fmtTime(segmentGap.sumAggressive)} ${!segmentGap.hasRaceDate?"· 대회 날짜 미설정 → 8주 기준으로 가정":""}</p>`;
+  const warn = segmentGap.feasibility==="beyond-p05"
+    ? `<p class="reason-line" style="color:var(--red);margin-top:8px;">현재 비교 데이터의 상위 5%(P05) 수준까지 모든 구간을 개선한다고 가정해도 목표 기록에 ${fmtTime(segmentGap.unallocatedSec||0)}이(가) 부족합니다 (P05 ceiling 합 -${fmtTime(segmentGap.sumP05Ceiling)} &lt; 필요 개선 ${fmtTime(segmentGap.totalGapSec)}). 목표 기록 또는 대회까지 남은 기간 조정을 검토해보세요.</p>`
+    : `<p class="reason-line" style="margin-top:8px;color:var(--gray-dim);">Realistic 개선 합: -${fmtTime(segmentGap.sumRealistic)} · Aggressive 개선 합: -${fmtTime(segmentGap.sumAggressive)} · P05 ceiling 합: -${fmtTime(segmentGap.sumP05Ceiling)} ${!segmentGap.hasRaceDate?"· 대회 날짜 미설정 → 8주 기준으로 가정":""}</p>`;
   return `<div style="overflow-x:auto;">
     <table style="width:100%;border-collapse:collapse;">
       <thead><tr style="border-bottom:1px solid var(--line);">
         <th style="padding:6px 8px;text-align:left;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">구간</th>
         <th style="padding:6px 8px;text-align:left;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">신뢰도</th>
-        <th style="padding:6px 8px;text-align:right;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">현실적 단축 목표</th>
+        <th style="padding:6px 8px;text-align:right;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">단축목표(배분)</th>
+        <th style="padding:6px 8px;text-align:right;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">P05 Ceiling</th>
         <th style="padding:6px 8px;text-align:right;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">Conservative</th>
         <th style="padding:6px 8px;text-align:right;font-size:10.5px;color:var(--gray-dim);text-transform:uppercase;">Aggressive</th>
       </tr></thead>
@@ -11776,7 +11967,7 @@ function buildGoalFeasibilityReasons(plan){
       const potLabel = s.trainability>=0.6?"높음":s.trainability>=0.35?"중간":"낮음";
       reasons.push(`${s.label} 개선 가능성 ${potLabel}`);
     });
-    if(plan.segmentGap.feasibility==="beyond-model") reasons.push("17개 구간 Aggressive 개선 합으로도 Gap을 다 설명하지 못함");
+    if(plan.segmentGap.feasibility==="beyond-p05") reasons.push(`P05(상위 5%) 수준까지 개선해도 ${fmtTime(plan.segmentGap.unallocatedSec||0)} 부족`);
   }
   const growth=hpiTrendPerWeek();
   reasons.push(growth!=null ? `최근 8주 HPI 추세 ${growth>=0?"+":""}${round1(growth)}/주` : "HPI 추세 데이터 부족 (스냅샷 2회 이상 필요)");
@@ -12301,26 +12492,23 @@ function peerSourceBadgeCompact(isReal, n){
     ? `<span class="badge elite" style="font-size:10px;">🟢 REAL · n=${n}</span>`
     : `<span class="badge med" style="font-size:10px;">🟡 ESTIMATE</span>`;
 }
-/* 기록 예측 페이지에 있던 "개선 분석" 5개 블록을 Race DNA 페이지로 옮긴 것.
-   원래 renderPrediction()의 지역변수에 의존하고 있어서, 필요한 값을 여기서 직접 계산한다. */
-function improvementAnalysisHtml(){
+/* 기록 예측 페이지에 있던 "개선 분석" 블록 중 능력 요약/훈련 우선순위(상세) — 이제 주간 훈련계획
+   페이지로 이동 (spec: DNA=진단, Weekly Plan=처방). Station-induced degradation/개선 필요 구간 상세/
+   개선 가능성이 큰 구간은 각각 새 다중대회 Station→Run Fatigue 섹션으로 대체되었거나(전자), DNA의
+   "가장 개선하면 좋은 영역"·"개선 필요 구간 상세"와 중복되어(후자 둘) 제거됨 — 아래 두 섹션만 남는다. */
+function trainingPriorityAndAbilitySummaryHtml(){
   const hpiResult=calcHPI();
-  const predDiv = normalizeRaceDivision(STATE.profile.division) || "Open";
-  const p0=withPredictionContext({mode:"race", division:predDiv}, ()=>predictTime(hpiResult,0));
-  const bottleneck=analyzeBottleneck(hpiResult);
   const priority=computeTrainingPriority();
   const ruleResultForOverride=evaluateRules();
   const overrideRuleLabel = ruleResultForOverride.fired.find(r=>["TAP-1","TAP-2","RACE-1"].includes(r.id));
   const narrativeParts=[...buildLimitingFactorNarrative(priority,true), ...fitnessProfileNarrative(true)];
-  const race=latestRace();
-  const degradation=computeStationInducedDegradation(race);
   const acwr=calcACWR();
-  const p=STATE.profile;
+  const dLeft=daysToRace(); // bug fix: this was referenced below but never defined in the original DNA-page version
   return `
     <div class="card">
       <div class="row-between"><h2 class="section-title">능력 요약 — 무엇이 강하고 무엇을 개선해야 할까요?</h2></div>
       ${overrideRuleLabel ? `<div class="reason-line" style="background:rgba(255,176,32,.10);border:1px solid var(--amber);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--amber);">⚠ <b>대회까지 ${dLeft}일 — ${overrideRuleLabel.id==="TAP-2"?"Race Week":"Taper"} 안전 우선 구간입니다.</b> 아래 순위는 평소처럼 "체력상 무엇이 부족한가"를 계산한 결과이며, 실제 이번 주 훈련은 이 순위와 무관하게 부상 방지·회복을 최우선으로 가볍게(Shakeout/Easy 위주) 구성됩니다. 예를 들어 지금 Running이 1순위로 나와도 실제 계획에 Threshold/Interval이 배정되지 않는 게 정상입니다.</div>` : ""}
-      <p class="lead" style="margin:6px 0 12px;">아래 점수는 <b style="color:var(--orange);">이 시스템이 계산한 능력 점수(0~100)</b>이며, 다른 선수와 비교한 percentile/순위가 아닙니다. 점수가 높을수록 해당 능력이 좋습니다. 실제 선수 DB와 비교한 percentile은 "동일 그룹 비교" 페이지에서 별도로 확인할 수 있습니다.</p>
+      <p class="lead" style="margin:6px 0 12px;">아래 점수는 <b style="color:var(--orange);">이 시스템이 계산한 능력 점수(0~100)</b>이며, 다른 선수와 비교한 percentile/순위가 아닙니다. 점수가 높을수록 해당 능력이 좋습니다. 실제 선수 DB와 비교한 percentile은 "Race DNA" 페이지에서 별도로 확인할 수 있습니다.</p>
       <div style="display:flex;flex-direction:column;gap:10px;">
         ${priority.map((p,i)=>{
           const meta=INDEX_META[p.key], band=indexStatusBand(p.score), infl=indexInfluenceLabel(i);
@@ -12364,41 +12552,93 @@ function improvementAnalysisHtml(){
       </tbody></table>
       <p class="lead" style="margin-top:10px;">"8주 추세"는 최근 컨디션(ACWR ${acwr!=null?round1(acwr):"N/A"})과는 별개로, 지난 8주간 이 지표가 실제로 향상됐는지를 봅니다 — "최근에 잘했다"와 "실력이 늘었다"는 다르게 판단합니다. Specificity는 목표 기록을 입력한 경우 실제 Target Gap 중 이 영역이 차지하는 비중을, 목표가 없으면 전체 레이스 비중을 사용합니다.</p>
     </div>
-
-    ${degradation.length? `<div class="card">
-      <h2 class="section-title">Station-induced Run Degradation</h2>
-      <p class="lead" style="margin:6px 0 10px;">최근 대회에서 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지 (해당 스테이션의 피로가 다음 Run으로 넘어간 정도).</p>
-      <table><thead><tr><th>스테이션</th><th class="num">직후 Run</th><th class="num">평균 Run</th><th class="num">저하</th></tr></thead><tbody>
-        ${degradation.map(d=>`<tr><td>${d.label}</td><td class="num mono">${fmtTime(d.afterRunSec)}</td><td class="num mono" style="color:var(--gray-dim);">${fmtTime(d.baselineSec)}</td><td class="num mono" style="color:${d.degradationSec>0?'var(--red)':'var(--green)'}">${d.degradationSec>=0?"+":""}${fmtTime(Math.abs(d.degradationSec))}</td></tr>`).join("")}
-      </tbody></table>
-      ${(() => { const rex=analyzeRaceExecution(race); if(!rex) return "";
-        const dCls={good:"elite",station:"crit",mixed:"med",pacing:"low"}[rex.diagnosis.key];
-        return `<div class="divider" style="margin:10px 0;"></div>
-        <div class="row-between"><span class="eyebrow gray">Run1→Run8 진단</span><span class="badge ${dCls}">${escapeHtml(rex.diagnosis.label)}</span></div>
-        <p class="reason-line" style="margin-top:6px;">Run1 ${fmtTime(parseTimeToSec(race.runs?.[1]))} → Run8 ${fmtTime(parseTimeToSec(race.runs?.[8]))} (${rex.fadeSec>=0?"+":""}${fmtTime(Math.abs(rex.fadeSec))}, ${round1(rex.fadePct)}%). ${escapeHtml(rex.diagnosis.detail)}</p>`; })()}
-    </div>` : ""}
-
-    <div class="card">
-      <h2 class="section-title">개선 필요 구간 상세</h2>
-      ${(() => { const peer=computePeerAnalysis();
-        if(peer){
-          const items=peer.impactList.filter(c=>c.timeLoss>0).map(c=>({label:c.label, gapPct:c.impactPct}));
-          return `<p class="lead" style="margin-bottom:6px;">DNA · 동일 그룹 비교 영향도(%) 기준</p>${svgBottleneckBars(items)}`;
-        }
-        return `${svgBottleneckBars(bottleneck.items)}
-        ${bottleneck.worstIndex? `<p class="lead" style="margin-top:10px;">가장 낮은 능력 점수: <b style="color:var(--orange)" title="${INDEX_META[bottleneck.worstIndex.key].label}">${INDEX_META[bottleneck.worstIndex.key].emoji} ${INDEX_META[bottleneck.worstIndex.key].friendly}</b> (${round1(bottleneck.worstIndex.score)}점) — 개선 시 HPI 기여도가 가장 큽니다.</p>`:""}`; })()}
-    </div>
-
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">개선 가능성이 큰 구간</h2></div>
-      ${(() => { const rank=getDnaWeaknessRanking(3);
-        return `<p class="lead" style="margin-bottom:10px;">예상 기록 ${fmtTime(p0.predicted)}에 가장 큰 영향을 주는 구간 (${rank.source==="dna"?"DNA 기준":"훈련 우선순위 기준"})</p>
-        <div class="hstack" style="gap:8px;flex-wrap:wrap;">
-          ${rank.items.length? rank.items.map(it=>`<span class="badge crit">${escapeHtml(it.label)}</span>`).join("") : `<span class="empty-note">데이터가 더 쌓이면 표시됩니다</span>`}
-        </div>`; })()}
-    </div>
-
     `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* DNA §3/§4/§5/§6 — Station → Run Fatigue UI (모든 등록 대회 기준)          */
+/*     "가장 최근 대회 1개"가 아니라 등록된 모든 대회를 computeStationInduced-*/
+/*     Degradation()으로 각각 분석한 뒤, 반복성(몇 개 대회 중 몇 번 나타났는가)*/
+/*     을 함께 보여준다 — 단발성 이상값을 곧바로 "이 선수의 특성"으로 단정    */
+/*     하지 않기 위함(spec §5).                                             */
+/* ---------------------------------------------------------------------- */
+// 심각도 색상 — buildImprovementTop3()가 이미 쓰는 "8% 이상이면 유의미"(computeStationInducedDegradation
+// 기반) 관행을 그대로 재사용한 임계값(8%/15%), 새로 지어낸 기준이 아님.
+function stationRunSeverity(degradationSec, baselineSec){
+  const pct = baselineSec>0 ? (degradationSec/baselineSec)*100 : 0;
+  if(degradationSec<=0) return { emoji:"🟢", color:"var(--green)" };
+  if(pct>=15) return { emoji:"🔴", color:"var(--red)" };
+  if(pct>=8) return { emoji:"🟠", color:"var(--orange)" };
+  return { emoji:"🟡", color:"var(--amber)" };
+}
+function stationRunFatigueSectionHtml(){
+  const agg = computeStationRunDegradationAllRaces();
+  if(!agg){
+    return `<div class="divider" style="margin:16px 0;"></div><div class="eyebrow gray">🏃 Station → Run Fatigue</div><div class="empty-note" style="margin-top:8px;">대회 기록(러닝 8구간 포함)을 등록하면 스테이션 직후 Run 저하 분석이 표시됩니다.</div>`;
+  }
+  const { perStation, raceCount, races, diagnosisCounts } = agg;
+  const COMPACT_THRESHOLD = 5; // spec §4: 대회가 많아지면 전체 컬럼 대신 최근/평균/반복/추세 요약으로 전환
+  const compact = raceCount > COMPACT_THRESHOLD;
+
+  const tableHtml = compact
+    ? `<table><thead><tr><th>스테이션</th><th class="num">최근</th><th class="num">평균</th><th>반복</th><th>추세</th></tr></thead><tbody>
+        ${perStation.map(s=>{
+          const sev=stationRunSeverity(s.latest.degradationSec, s.latest.baselineSec);
+          const half=Math.floor(s.measured.length/2);
+          const firstHalfAvg = half? mean(s.measured.slice(0,half).map(m=>m.degradationSec)) : null;
+          const secondHalfAvg = half? mean(s.measured.slice(-half).map(m=>m.degradationSec)) : null;
+          const trend = (firstHalfAvg!=null && secondHalfAvg!=null) ? (secondHalfAvg-firstHalfAvg) : null;
+          const trendArrow = trend==null? "—" : trend>2? "▲ 악화" : trend<-2? "▼ 개선" : "→ 유지";
+          return `<tr>
+            <td>${escapeHtml(s.label)}</td>
+            <td class="num mono" style="color:${sev.color};">${sev.emoji} ${s.latest.degradationSec>=0?"+":""}${fmtTime(Math.abs(s.latest.degradationSec))}</td>
+            <td class="num mono" style="color:var(--gray-dim);">${s.avgDegradationSec>=0?"+":""}${fmtTime(Math.abs(s.avgDegradationSec))}</td>
+            <td class="mono">${s.occurrences}/${s.totalMeasured}</td>
+            <td class="mono" style="font-size:11px;color:var(--gray-dim);">${trendArrow}</td>
+          </tr>`;
+        }).join("")}
+      </tbody></table>`
+    : `<div style="overflow-x:auto;"><table><thead><tr><th>스테이션</th>${races.map(r=>`<th class="num">${escapeHtml(r.label)}</th>`).join("")}<th class="num">최근</th></tr></thead><tbody>
+        ${perStation.map(s=>{
+          const sev=stationRunSeverity(s.latest.degradationSec, s.latest.baselineSec);
+          return `<tr>
+            <td>${escapeHtml(s.label)}</td>
+            ${races.map(r=>{ const m=s.series.find(x=>x&&x.date===r.date); return `<td class="num mono" style="color:${m?(m.degradationSec>0?'var(--red)':'var(--green)'):'var(--gray-dim)'};">${m?`${m.degradationSec>=0?"+":""}${fmtTime(Math.abs(m.degradationSec))}`:"—"}</td>`; }).join("")}
+            <td class="num mono" style="color:${sev.color};font-weight:700;">${sev.emoji} ${s.latest.degradationSec>=0?"+":""}${fmtTime(Math.abs(s.latest.degradationSec))}</td>
+          </tr>`;
+        }).join("")}
+      </tbody></table></div>`;
+
+  // 반복성 콜아웃 (spec §5) — 반복적(모든 대회에서 발생) 패턴을 먼저, 일시적 패턴은 짧게 뒤에.
+  const repeated = perStation.filter(s=>s.pattern.key==="repeated").sort((a,b)=>b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec);
+  const occasional = perStation.filter(s=>s.pattern.key==="occasional"||s.pattern.key==="frequent");
+  const patternHtml = raceCount>=2 ? `
+    <div class="divider" style="margin:14px 0;"></div>
+    <div class="eyebrow gray" style="margin-bottom:8px;">반복성 — 여러 대회에서 일관되게 나타나는가?</div>
+    ${repeated.length ? repeated.map(s=>`
+      <div style="margin-bottom:10px;padding:10px 12px;background:rgba(255,77,77,.08);border:1px solid var(--red);border-radius:8px;">
+        <div style="font-weight:700;font-size:13px;color:var(--red);">🔴 반복적으로 나타나는 패턴 — ${escapeHtml(s.label)} → Run</div>
+        <div class="reason-line" style="margin-top:4px;">${s.totalMeasured}개 대회 중 ${s.occurrences}회 발생 · 평균 저하 +${fmtTime(s.avgOccurrenceDegradationSec)}</div>
+        <p class="reason-line" style="margin-top:4px;color:var(--white);">여러 대회에서 반복적으로 ${escapeHtml(s.label)} 이후 Run이 느려지는 패턴이 관찰됩니다.</p>
+      </div>`).join("") : `<div class="empty-note" style="margin-bottom:10px;">모든 대회에서 반복되는 스테이션은 아직 없습니다.</div>`}
+    ${occasional.length ? `<div style="display:flex;flex-direction:column;gap:6px;">
+      ${occasional.map(s=>`<div class="reason-line">🟢 일시적인 패턴 — ${escapeHtml(s.label)} → Run: ${s.totalMeasured}개 대회 중 ${s.occurrences}회 발생. 현재 데이터만으로 반복적인 문제라고 판단하기 어렵습니다.</div>`).join("")}
+    </div>` : ""}
+  ` : `<p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">대회가 2개 이상 등록되면 반복성(여러 대회에서 일관되게 나타나는 패턴인지)을 함께 보여드립니다. 현재 ${raceCount}개 대회만 분석되었습니다.</p>`;
+
+  // 대회 전반의 Run1→Run8 진단 분포 (spec §6 — 단일 대회의 인과 단정 대신, 여러 대회에서 어떤 진단이
+  // 몇 번 나왔는지 그대로 집계해서 보여준다. analyzeRaceExecution()의 기존 로직/문구를 재사용하며
+  // 새 인과모델을 만들지 않는다.)
+  const dLabels = { good:"Pacing 양호", station:"Station-induced Fatigue 주요 원인", "station-uneven":"Station 영향이 구간마다 회복됨", mixed:"Station+Pacing 혼합", pacing:"Pacing 문제 가능성" };
+  const diagLines = Object.entries(diagnosisCounts).sort((a,b)=>b[1]-a[1])
+    .map(([k,n])=>`${dLabels[k]||k} ${n}/${raceCount}`).join(" · ");
+
+  return `<div class="divider" style="margin:16px 0;"></div>
+    <div class="eyebrow gray">🏃 Station → Run Fatigue</div>
+    <p class="lead" style="margin:6px 0 10px;">등록된 ${raceCount}개 대회 전체를 각각 분석합니다 — 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지(해당 스테이션의 피로가 다음 Run으로 넘어간 정도)를 대회별로 비교합니다.</p>
+    ${tableHtml}
+    ${patternHtml}
+    ${diagLines ? `<div class="divider" style="margin:14px 0;"></div><div class="reason-line">대회별 Run1→Run8 진단 분포: ${escapeHtml(diagLines)} <span style="color:var(--gray-dim);">(단일 대회의 관찰값이며, 여러 대회에 걸친 인과관계 증명이 아닙니다 — 위 반복성 지표를 함께 참고하세요.)</span></div>` : ""}`;
 }
 function renderPeer(wrap){
   const analysis=computePeerAnalysis();
@@ -12507,9 +12747,7 @@ function renderPeer(wrap){
     <div class="card">
       <div class="hstack" style="gap:8px;flex-wrap:wrap;">
         <div class="qbtn" id="peer-detail-toggle" style="flex:1;min-width:150px;">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기"}</div>
-        <div class="qbtn" id="peer-improve-toggle" style="flex:1;min-width:150px;">${PEER_IMPROVE_OPEN?"− 개선 분석 접기":"+ 개선 분석"}</div>
       </div>
-      ${PEER_IMPROVE_OPEN ? `<div style="margin-top:16px;">${improvementAnalysisHtml()}</div>` : ""}
       ${PEER_DETAIL_OPEN ? `
       <div style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
@@ -12566,12 +12804,13 @@ function renderPeer(wrap){
           ${rowsHtml(otherSegsForTable)}
         </tbody></table></div>`;
       })()}
+      </div>
+      ${stationRunFatigueSectionHtml()}
       ${dnaEvolutionSectionHtml()}
       ` : ""}
     </div>
   `;
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
-  wrap.querySelector("#peer-improve-toggle")?.addEventListener("click",()=>{ PEER_IMPROVE_OPEN=!PEER_IMPROVE_OPEN; renderAll(); });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
   wrap.querySelectorAll("[data-dna-evo-tab]").forEach(el=>el.addEventListener("click",()=>{ DNA_EVO_TAB=el.dataset.dnaEvoTab; renderAll(); }));
   wrap.querySelector("#dna-evo-show-all")?.addEventListener("click",()=>{ DNA_EVO_SHOW_ALL=!DNA_EVO_SHOW_ALL; renderAll(); });
@@ -12768,17 +13007,19 @@ function dnaEvoChangeBadge(delta){
   if(delta>-5) return "🟡";
   return "🔴";
 }
+// spec: y축 그리드/라벨(100/75/50/25/0) + "DNA Score (0-100)" 제목을 항상 함께 그린다. DNA Score는
+// 0~100 고정 스케일(퍼센타일 기반)이므로 opts.minY/maxY로 넘어와도 라벨은 이 고정 척도를 기준으로 표시.
 function svgMultiLineTrend(series, w=680, h=200, opts={}){
   const usable = series.filter(s=>s.points && s.points.length);
   if(!usable.length) return `<div class="empty-note">데이터가 쌓이면 추이가 표시됩니다</div>`;
-  const pad=28;
+  const padL=40, padR=16, padT=18, padB=28;
   const allPts = usable.flatMap(s=>s.points);
   const xs=allPts.map(p=>p.x);
   const minX=Math.min(...xs), maxX=Math.max(...xs)||1;
   const minY = opts.minY!=null? opts.minY : 0;
   const maxY = opts.maxY!=null? opts.maxY : 100;
-  const sx=(x)=> pad + (maxX===minX?(w-pad*2)/2:(x-minX)/(maxX-minX))*(w-pad*2);
-  const sy=(y)=> h-pad - (maxY===minY?0:(clamp(y,minY,maxY)-minY)/(maxY-minY))*(h-pad*2);
+  const sx=(x)=> padL + (maxX===minX?(w-padL-padR)/2:(x-minX)/(maxX-minX))*(w-padL-padR);
+  const sy=(y)=> h-padB - (maxY===minY?0:(clamp(y,minY,maxY)-minY)/(maxY-minY))*(h-padT-padB);
   const lines = usable.map(s=>{
     const pts=s.points;
     const path = pts.length===1
@@ -12790,9 +13031,17 @@ function svgMultiLineTrend(series, w=680, h=200, opts={}){
     }).join("");
     return `<path d="${path}" fill="none" stroke="${s.color}" stroke-width="2"/>${dots}`;
   }).join("");
+  // 고정 0-100 스케일의 y축 라벨/그리드 (spec §4)
+  const axisTicks = opts.showAxis===false ? [] : [0,25,50,75,100];
+  const axisLines = axisTicks.map(v=>`
+    <line x1="${padL}" y1="${sy(v)}" x2="${w-padR}" y2="${sy(v)}" stroke="#28282C" stroke-dasharray="${v===50?"3,4":"0"}"/>
+    <text x="${padL-8}" y="${sy(v)+3.5}" text-anchor="end" font-family="JetBrains Mono" font-size="9.5" fill="#8A8A92">${v}</text>
+  `).join("");
+  const axisTitle = opts.showAxis===false ? "" : `<text x="${padL}" y="12" font-family="Inter" font-size="9.5" fill="#8A8A92">DNA Score (0-100)</text>`;
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
-    <line x1="${pad}" y1="${h-pad}" x2="${w-pad}" y2="${h-pad}" stroke="#28282C"/>
-    <line x1="${pad}" y1="${sy(50)}" x2="${w-pad}" y2="${sy(50)}" stroke="#28282C" stroke-dasharray="3,4"/>
+    ${axisTitle}
+    ${axisLines}
+    <line x1="${padL}" y1="${h-padB}" x2="${w-padR}" y2="${h-padB}" stroke="#28282C"/>
     ${lines}
   </svg>`;
 }
@@ -12800,7 +13049,8 @@ function dnaEvolutionSectionHtml(){
   const evo = computeDnaEvolution();
   const head = `<div class="divider" style="margin:16px 0;"></div>
     <div class="eyebrow gray">📈 DNA Evolution · 경기력 변화</div>
-    <p class="lead" style="margin:6px 0 12px;">대회별 기록을 동일 기준의 DNA Score로 환산해 나의 경기력이 어떻게 변화했는지 보여줍니다. (DNA 자체의 전체 데이터 기준은 그대로이며, 이 그래프는 그 위에서 대회별 변화만 보여주는 뷰입니다.)</p>`;
+    <p class="lead" style="margin:6px 0 4px;">대회별 기록을 동일 기준의 DNA Score로 환산해 나의 경기력이 어떻게 변화했는지 보여줍니다. (DNA 자체의 전체 데이터 기준은 그대로이며, 이 그래프는 그 위에서 대회별 변화만 보여주는 뷰입니다.)</p>
+    <p class="lead" style="margin:0 0 12px;">점수가 높을수록 동일 조건 참가자 대비 해당 구간 수행력이 좋습니다.</p>`;
   if(!evo || evo.points.length<2){
     return `${head}<div class="empty-note">아직 경기력 변화 데이터를 표시하기에 충분한 대회 기록이 없습니다${evo&&evo.points.length===1?` (현재 1건 — 2건 이상부터 변화 추이가 표시됩니다)`:""}.</div>`;
   }
@@ -12842,21 +13092,26 @@ function dnaEvolutionSectionHtml(){
     }
   }
 
-  // 변화량 요약 (spec §9) — 최근 두 대회 비교, 전 항목(run+8개 station) 통합 랭킹
+  // 변화량 요약 (spec §9) — 최근 두 대회 비교, 전 항목(run+8개 station) 통합 랭킹. changes는 이미
+  // |delta| 내림차순 정렬이므로, best/worst는 그 순서 그대로 첫 번째 매칭 항목을 쓴다 — reverse()는
+  // 절대 쓰지 않는다 (버그 재발 방지: reverse는 오름차순이 되어 "가장 작은" 음수 변화를 worst로 잘못
+  // 골랐었다, 예: Farmers Carry -3.5가 Burpee -95.8 대신 뽑힘).
   const changes = computeDnaEvoChanges(allPoints);
   let changeSummaryHtml = "";
   if(changes.length){
     const best = changes.find(c=>c.delta>0);
-    const worst = [...changes].reverse().find(c=>c.delta<0);
+    const worst = changes.find(c=>c.delta<0);
+    const fmtDelta = (c)=> `${c.delta>=0?"▲":"▼"} ${round1(Math.abs(c.delta))}점`;
     changeSummaryHtml = `<div style="margin-top:14px;">
-      <div class="eyebrow gray" style="margin-bottom:6px;">최근 경기력 변화 (직전 대회 대비)</div>
+      <div class="eyebrow gray" style="margin-bottom:2px;">최근 경기력 변화 (직전 대회 대비)</div>
+      <div class="reason-line" style="margin-bottom:6px;">DNA Score 변화량 · 0~100점 기준</div>
       <div style="display:flex;flex-direction:column;gap:5px;">
         ${changes.slice(0,6).map(c=>`<div class="row-between" style="font-size:12.5px;">
           <span>${dnaEvoChangeBadge(c.delta)} ${escapeHtml(c.label)}</span>
-          <span class="mono" style="font-weight:700;color:${c.delta>=0?"var(--green)":"var(--red)"};">${c.delta>=0?"+":""}${round1(c.delta)}</span>
+          <span class="mono" style="font-weight:700;color:${c.delta>=0?"var(--green)":"var(--red)"};">${fmtDelta(c)}</span>
         </div>`).join("")}
       </div>
-      ${best||worst ? `<p class="reason-line" style="margin-top:8px;">${best?`<b style="color:var(--green);">가장 크게 향상:</b> ${escapeHtml(best.label)} +${round1(best.delta)}`:""}${best&&worst?" · ":""}${worst?`<b style="color:var(--red);">개선이 필요한 변화:</b> ${escapeHtml(worst.label)} ${round1(worst.delta)}`:""}</p>` : ""}
+      ${best||worst ? `<p class="reason-line" style="margin-top:8px;">${best?`<b style="color:var(--green);">가장 크게 향상:</b> 🟢 ${escapeHtml(best.label)} +${round1(best.delta)}점`:""}${best&&worst?" · ":""}${worst?`<b style="color:var(--red);">개선이 필요한 변화:</b> ${escapeHtml(worst.label)} ▼${round1(Math.abs(worst.delta))}점`:""}</p>` : ""}
     </div>`;
   }
 
@@ -12904,12 +13159,44 @@ function renderRules(wrap){
 /* ---------------------------------------------------------------------- */
 /* 22. PAGE: WEEKLY PLAN                                                   */
 /* ---------------------------------------------------------------------- */
+// spec §11/§12 — "이번 주 훈련 목표": Race DNA 진단(훈련 우선순위 + Station→Run Fatigue 반복 패턴)을
+// 그대로 재사용해 이번 주 핵심 초점을 요약한다. 새로운 우선순위 계산을 만들지 않고 기존
+// computeTrainingPriority()/computeStationRunDegradationAllRaces()를 그대로 씀.
+function weeklyGoalSummaryHtml(){
+  const priority = computeTrainingPriority();
+  const top3 = priority.slice(0,3);
+  const stationAgg = computeStationRunDegradationAllRaces();
+  const repeatedPattern = stationAgg ? stationAgg.perStation.filter(s=>s.pattern.key==="repeated").sort((a,b)=>b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec)[0] : null;
+
+  const rows = top3.map((p,i)=>{
+    const meta = INDEX_META[p.key];
+    const stationKeys = INDEX_STATION_GROUPS[p.key] || [];
+    const stationLabels = [...new Set(stationKeys)].map(k=>STATIONS.find(s=>s.key===k)?.label).filter(Boolean);
+    return `<div class="card tight" style="background:var(--surface2);">
+      <div class="eyebrow" style="color:var(--orange);">${i+1}순위 — ${escapeHtml(meta.friendly)}</div>
+      ${stationLabels.length? `<div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(stationLabels.join(" · "))}</div>` : `<div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(INDEX_STATIC_TRAINING_HINT[p.key]||"")}</div>`}
+    </div>`;
+  }).join("");
+
+  const patternNote = repeatedPattern
+    ? `<p class="reason-line" style="margin-top:10px;"><b style="color:var(--red);">반복 패턴 반영:</b> Race DNA에서 ${escapeHtml(repeatedPattern.label)} → Run degradation이 ${repeatedPattern.totalMeasured}개 대회 중 ${repeatedPattern.occurrences}회 반복 관찰되어, 이번 주 계획에 ${escapeHtml(repeatedPattern.label)} → Run Brick을 우선 반영합니다.</p>`
+    : "";
+
+  return `<div class="card" style="border-left:3px solid var(--orange);">
+    <h2 class="section-title">🎯 이번 주 훈련 목표</h2>
+    <p class="lead" style="margin:6px 0 10px;">Race DNA 분석(훈련 우선순위 + Station → Run Fatigue 반복 패턴)을 바탕으로 이번 주 핵심 훈련 목표를 정합니다. 자세한 진단 근거는 <b style="color:var(--orange)">Race DNA</b> 페이지에서 확인할 수 있습니다.</p>
+    <div class="grid grid-3" style="margin-top:4px;">${rows}</div>
+    ${patternNote}
+  </div>`;
+}
 function renderPlan(wrap){
   const ruleResult=evaluateRules();
   const plan=applyManualOverrides(generateWeeklyPlan(ruleResult));
   const ratio=PHASE_RATIO[ruleResult.ctx.phase];
   wrap.innerHTML = `
     <div><div class="eyebrow">ENGINE OUTPUT · WEEKLY PLANNER</div><h1 class="page-title">이번 주 훈련 계획</h1></div>
+
+    ${weeklyGoalSummaryHtml()}
 
     ${(() => { const avoidList=buildAvoidList(ruleResult, getPainRestrictions()); if(!avoidList.length) return "";
       return `<div class="card" style="border-left:3px solid var(--red);">
@@ -12965,6 +13252,9 @@ function renderPlan(wrap){
           <div class="d-meta">HR ${d.hr}<br>RPE ${d.rpe}</div>
         </div>`).join("")}
     </div>
+
+    <div class="divider" style="margin:4px 0;"></div>
+    ${trainingPriorityAndAbilitySummaryHtml()}
 
     <div class="card">
       <div class="row-between"><h2 class="section-title">직접 수정</h2></div>
