@@ -240,9 +240,6 @@ td.num, th.num{font-family:var(--font-mono); text-align:right;}
   .sidebar{
     position:fixed; top:0; left:0; height:100vh; width:250px; max-width:82vw;
     flex-direction:column; overflow-y:auto; z-index:1000;
-    box-sizing:border-box;
-    /* 하단 고정 대시보드가 메뉴 마지막 항목을 가리지 않도록 스크롤 여유 확보 */
-    padding-bottom:calc(112px + env(safe-area-inset-bottom));
     transform:translateX(-100%); transition:transform .25s ease;
     box-shadow:0 0 40px rgba(0,0,0,.5);
   }
@@ -384,10 +381,10 @@ function indexStatusBand(score){
 
 const PHASES = ["Base","Build","Peak","Taper"];
 const PHASE_RATIO = {
-  Base:  { run:40, strength:30, wod:15, recovery:15, goal:"유산소 기반 + 기초근력 구축" },
-  Build: { run:35, strength:25, wod:25, recovery:15, goal:"러닝 역치 향상 + HYROX 특이성 도입" },
-  Peak:  { run:25, strength:20, wod:35, recovery:20, goal:"경기 강도 시뮬레이션 + 페이싱 정교화" },
-  Taper: { run:15, strength:10, wod:10, recovery:65, goal:"피로 해소 + 신경계 각성 유지" },
+  Base:  { run:40, strength:30, wod:15, recovery:15, goal:"Aerobic base + Strength + 낮은 피로도의 HYROX exposure 유지" },
+  Build: { run:35, strength:25, wod:25, recovery:15, goal:"Threshold 향상 + HYROX 특이성 도입 + Brick 비중 증가" },
+  Peak:  { run:25, strength:20, wod:35, recovery:20, goal:"Race-pace Brick + Simulation + 페이싱 정교화" },
+  Taper: { run:15, strength:10, wod:10, recovery:65, goal:"Volume 감소 + 짧은 race-specific 자극 유지" },
 };
 
 /* ---------------------------------------------------------------------- */
@@ -2140,7 +2137,7 @@ function calcACWR(){
 /*     available as a secondary signal (calcACWR() itself is left untouched */
 /*     since several already-tuned thresholds elsewhere depend on it).      */
 /* ---------------------------------------------------------------------- */
-const LOAD_TYPE_MULTIPLIER = { run:1.0, long:1.0, interval:1.15, strength:1.1, wod:1.3, station:1.15, brick:1.3, sim:1.4, recovery:0.3, rest:0, shakeout:0.2 };
+const LOAD_TYPE_MULTIPLIER = { run:1.0, long:1.0, interval:1.15, strength:1.1, strengthB:1.1, wod:1.3, station:1.15, brick:1.3, sim:1.4, recovery:0.3, rest:0, shakeout:0.2 };
 function computeTrainingLoadByType(days=7){
   const logs=recentTraining(days);
   const out={ running:0, strength:0, hyrox:0, highIntensity:0, total:0 };
@@ -2725,6 +2722,29 @@ function currentPhase(){
   if(wksLeft<=4) return "Peak";
   if(wksLeft<=8) return "Build";
   return "Base";
+}
+// spec §18: "같은 Base 단계라도 Week 1~4의 내용이 실제로 달라져야 한다" — a 4-week microcycle
+// (Adaptation → Volume → Specificity → Deload/Consolidation) inside whichever phase is active.
+// Deliberately STATELESS (no stored "phase start date") so it fits this app's existing philosophy —
+// currentPhase() itself is purely a function of today vs targetDate, never a stored value — by
+// anchoring the count to the FIXED phase-boundary wksLeft thresholds already used in currentPhase()
+// above (8/4/1.5). Direction matters: Build/Peak/Taper each have a fixed UPPER wksLeft boundary that
+// marks their start, so elapsed = (that boundary − current wksLeft) grows as wksLeft counts down
+// toward race day. Base has no upper bound at all, so it's anchored the other way — elapsed =
+// (current wksLeft − the Build boundary) — so elapsed still shrinks toward 0 as wksLeft counts down
+// toward Build, and the microcycle still cycles forward in real time (mod 4) for however long Base lasts.
+const WEEK_IN_PHASE_ANCHOR_WKSLEFT = { Base:8, Build:8, Peak:4, Taper:1.5 };
+const WEEK_IN_PHASE_CYCLE_LABEL = { 1:"Adaptation", 2:"Volume", 3:"Specificity", 4:"Deload / Consolidation" };
+function computeWeekInPhase(){
+  const phase = currentPhase();
+  const dRace = daysToRace();
+  if(dRace==null) return { phase, weekInPhase:1, cycleLabel:WEEK_IN_PHASE_CYCLE_LABEL[1], weeksToRace:null };
+  const wksLeft = Math.max(0, dRace/7);
+  const anchorWksLeft = WEEK_IN_PHASE_ANCHOR_WKSLEFT[phase] ?? 8;
+  const rawElapsed = phase==="Base" ? (wksLeft-anchorWksLeft) : (anchorWksLeft-wksLeft);
+  const weeksElapsedInPhase = Math.max(0, Math.floor(rawElapsed));
+  const weekInPhase = (weeksElapsedInPhase % 4) + 1; // 1..4, repeating
+  return { phase, weekInPhase, cycleLabel: WEEK_IN_PHASE_CYCLE_LABEL[weekInPhase], weeksToRace: wksLeft };
 }
 function daysToRace(){
   if(!STATE.profile.targetDate) return null;
@@ -3532,6 +3552,31 @@ function analyzeRaceExecution(race){
 /*     up once might just be that day's bad transition.                     */
 /* ---------------------------------------------------------------------- */
 const STATION_RUN_DEGRADATION_NOISE_FLOOR_SEC = 3; // a few seconds of timing/rounding noise never counts as "an occurrence"
+// 반복성 판정 기준 (요청 사양):
+//   발생비율 <40%        → ⚪ 일시적          (우연/개별 대회 가능성)
+//   발생비율 40~59%      → 🟡 관찰            (반복 가능성 있음)
+//   발생비율 ≥60%        → 🟢 반복 패턴       (여러 대회에서 반복적으로 나타남)
+//   발생비율 ≥80%        → 🔴 강한 반복 패턴  (매우 일관되게 나타남)
+// 표본이 4개 미만일 때는 "강한 반복"을 비율만으로 인정하지 않는다 — 실제 발생 횟수가 3회 이상일
+// 때만 강한 반복으로 인정한다 (예: 2/2=100%이어도 관측이 2번뿐이면 "매우 일관"이라고 부르기엔
+// 근거가 약하므로 한 단계 아래(반복 패턴)로 유지).
+function classifyStationRunPattern(occurrences, totalMeasured){
+  if(totalMeasured<2) return { key:"insufficient", label:"데이터 1건 — 반복 여부 판단 불가", emoji:"⚪", shortLabel:"—", circle:"⚪", meaning:"" };
+  const ratio = occurrences/totalMeasured;
+  let key;
+  if(ratio>=0.8-1e-9) key="strong";
+  else if(ratio>=0.6-1e-9) key="repeated";
+  else if(ratio>=0.4-1e-9) key="frequent";
+  else key="occasional";
+  if(key==="strong" && totalMeasured<4 && occurrences<3) key="repeated"; // 표본<4는 실발생 3회 이상이어야 강한 반복
+  const META = {
+    occasional: { label:"일시적인 패턴", shortLabel:"일시적", emoji:"⚪", circle:"⚪", meaning:"우연/개별 대회 가능성" },
+    frequent:   { label:"관찰이 필요한 패턴", shortLabel:"관찰", emoji:"🟡", circle:"🟡", meaning:"반복 가능성 있음" },
+    repeated:   { label:"반복적으로 나타나는 패턴", shortLabel:"반복 패턴", emoji:"🟢", circle:"🟢", meaning:"여러 대회에서 반복적으로 나타남" },
+    strong:     { label:"매우 일관되게 나타나는 패턴", shortLabel:"강한 반복 패턴", emoji:"🔴", circle:"🔴", meaning:"매우 일관되게 나타남" },
+  };
+  return { key, ...META[key] };
+}
 function computeStationRunDegradationAllRaces(){
   const races=[...STATE.races].filter(r=>r&&r.date).sort((a,b)=>String(a.date).localeCompare(String(b.date)));
   if(!races.length) return null;
@@ -3555,13 +3600,7 @@ function computeStationRunDegradationAllRaces(){
     const avgDegradationSec = mean(measured.map(m=>m.degradationSec));
     const avgOccurrenceDegradationSec = occurrences.length? mean(occurrences.map(m=>m.degradationSec)) : 0;
     const latest = measured[measured.length-1];
-    // pattern verdict — only meaningful with 2+ races; a single race can't show "repetition" at all.
-    let pattern;
-    if(measured.length<2) pattern={ key:"insufficient", label:"데이터 1건 — 반복 여부 판단 불가", emoji:"⚪" };
-    else if(occurrenceRatio>=0.999) pattern={ key:"repeated", label:"반복적으로 나타나는 패턴", emoji:"🔴" };
-    else if(occurrenceRatio>=0.5) pattern={ key:"frequent", label:"간헐적으로 나타나는 패턴", emoji:"🟡" };
-    else if(occurrenceRatio>0) pattern={ key:"occasional", label:"일시적인 패턴", emoji:"🟢" };
-    else pattern={ key:"none", label:"관찰되지 않음", emoji:"🟢" };
+    const pattern = classifyStationRunPattern(occurrences.length, measured.length);
     return {
       key:s.key, label:s.label, series, measured, occurrences: occurrences.length, totalMeasured: measured.length,
       occurrenceRatio, avgDegradationSec, avgOccurrenceDegradationSec, latest, pattern,
@@ -5581,11 +5620,22 @@ function pickFeaturedStationKey(){
   return top ? groupMap[top.key][0] : "sledPush";
 }
 
+// spec §18: same 4-week microcycle (Adaptation/Volume/Specificity/Deload) applied as a volume
+// multiplier, combined with (not replacing) the existing fatigue-based volFactor below — modest,
+// bounded adjustments consistent with the existing 0.8x fatigue-reduction convention, never a new
+// large swing.
+const WEEK_IN_PHASE_VOLUME_FACTOR = { 1:0.85, 2:1.0, 3:1.05, 4:0.75 };
 function generateSessionPrescription(type, ctx, stationFocusOverride){
   ctx = ctx || buildRuleContext();
   const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const volFactor = fatigueHigh ? 0.8 : 1;
-  const volumeNote = fatigueHigh ? "최근 fatigue가 높아 volume을 약 20% 줄였습니다" : null;
+  const wip = computeWeekInPhase();
+  const phaseWeekFactor = WEEK_IN_PHASE_VOLUME_FACTOR[wip.weekInPhase] ?? 1;
+  const volFactor = (fatigueHigh ? 0.8 : 1) * phaseWeekFactor;
+  const volumeNoteParts = [];
+  if(fatigueHigh) volumeNoteParts.push("최근 fatigue가 높아 volume을 약 20% 줄였습니다");
+  if(wip.weekInPhase===4) volumeNoteParts.push(`${wip.phase} Week 4 (Deload/Consolidation) — volume을 계획적으로 줄였습니다`);
+  else if(wip.weekInPhase===3) volumeNoteParts.push(`${wip.phase} Week 3 (Specificity) — volume을 소폭 늘렸습니다`);
+  const volumeNote = volumeNoteParts.length ? volumeNoteParts.join(" · ") : null;
 
   if(type==="interval"){
     const thresholdPace=personalPace("threshold");
@@ -5653,8 +5703,23 @@ function generateSessionPrescription(type, ctx, stationFocusOverride){
   if(type==="strength"){
     const s=STATE.strength;
     const loadNote = (s.squat||s.deadlift) ? `최근 기록 기준 (Squat ${s.squat||"—"}kg / Deadlift ${s.deadlift||"—"}kg)` : "체중 기준 강도 조절 (기록 입력 시 개인화)";
-    return { title:"Strength Session", purpose:"Squat/Deadlift 위주 근력-지구력",
-      blocks:["Warm-up 10분", `Squat·Deadlift 4x5 (${loadNote})`, "보조 근력 3세트"],
+    return { title:"Strength A", purpose:"Squat/Deadlift/Posterior Chain 위주 근력-지구력",
+      blocks:["Warm-up 10분", `Squat·Deadlift 4x5 (${loadNote})`, "보조 근력(Posterior Chain) 3세트"],
+      targetRpe:"6-7", pace:null, volumeNote };
+  }
+  if(type==="strengthB"){
+    // spec §14: Strength B는 Strength A(Squat/Deadlift)와 목적을 분리 — Unilateral/Upper/Core/Grip
+    // 위주이며, DNA에서 실측 약점으로 확인된 HYROX-specific 동작(Sled Push/Pull/Lunge/Carry)이 있으면
+    // 그것을 우선 포함한다 (새 벤치마크 아님 — computeStationPriority()의 기존 gapPct 그대로 재사용).
+    const hyroxSpecificKeys=["sledPush","sledPull","lunge","carry"];
+    let featured=null;
+    try{
+      const sp=computeStationPriority().filter(x=>hyroxSpecificKeys.includes(x.key) && x.gapPct>0.05).sort((a,b)=>b.gapPct-a.gapPct)[0];
+      if(sp) featured=STATIONS.find(s2=>s2.key===sp.key);
+    }catch(e){ /* no station data yet */ }
+    const hyroxBlock = featured ? `${featured.label} 보강 3x8 (DNA 실측 약점 반영)` : "Sled Pull/Push 또는 Sandbag Lunge 보강 3x8";
+    return { title:"Strength B", purpose:"Unilateral Strength / Upper Body / Core / Grip — Strength A와 다른 패턴을 자극합니다",
+      blocks:["Warm-up 10분", "Unilateral Lower(Split Squat/Lunge) 3x8/side", "Upper Body Pull/Push 3x8", hyroxBlock, "Core/Grip 3세트"],
       targetRpe:"6-7", pace:null, volumeNote };
   }
   if(type==="recovery"){
@@ -5675,7 +5740,8 @@ const SESSION_LIBRARY = {
   run:      { label:"Easy Run",        desc:"Zone2 유산소 러닝, 대화 가능한 강도", hr:"Zone 2 (60-70%)", rpe:"4-5" },
   interval: { label:"Threshold/Interval", desc:"역치 페이스 인터벌 러닝",         hr:"Zone 4 (85-92%)", rpe:"7-8" },
   long:     { label:"Long Run",        desc:"거리 위주 저강도 지속주",           hr:"Zone 2 (60-70%)", rpe:"5" },
-  strength: { label:"Strength Session",desc:"Squat/Deadlift 위주 근력 세션",     hr:"Zone 1-2",         rpe:"6-7" },
+  strength: { label:"Strength A",desc:"Squat/Deadlift/Posterior Chain 위주 근력 세션",     hr:"Zone 1-2",         rpe:"6-7" },
+  strengthB:{ label:"Strength B",desc:"Unilateral/Upper/Core/Grip + HYROX-specific(Sled/Lunge/Carry) 근력 세션", hr:"Zone 1-2", rpe:"6-7" },
   wod:      { label:"HYROX WOD",       desc:"스테이션 조합 컴파운드 세션",       hr:"Zone 3-4 (75-90%)", rpe:"7-8" },
   station:  { label:"Station Focus",   desc:"약점 스테이션 집중 반복",           hr:"Zone 3-4",         rpe:"6-7" },
   brick:    { label:"Race-pace Brick", desc:"Run+Station 연속 전환 훈련",        hr:"Zone 3-4",         rpe:"7-8" },
@@ -5716,22 +5782,58 @@ const STATION_BRICK_REPS = {
 // under running fatigue", the actual race skill) rather than an isolated station-only rep scheme.
 // Round count scales down near race day / when fatigue is high (spec §10), same volFactor convention
 // used everywhere else in this file.
+// shared volume factor (fatigue × week-in-phase microcycle) — same combination generateSessionPrescription()
+// itself uses, factored out so every add-on builder below applies the SAME phase-week progression
+// instead of only reacting to fatigue.
+function sessionVolFactor(ctx){
+  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
+  const wip = computeWeekInPhase();
+  const phaseWeekFactor = WEEK_IN_PHASE_VOLUME_FACTOR[wip.weekInPhase] ?? 1;
+  return { factor: (fatigueHigh?0.8:1)*phaseWeekFactor, fatigueHigh, wip };
+}
+// spec §13: "왜 이 훈련인가" — reuses computeStationRunDegradationAllRaces() (repeated-pattern
+// detection, already real data) first, falls back to computeStationPriority()'s real benchmark-gap
+// signal when no multi-race degradation pattern exists yet. Never fabricates a reason with no backing
+// data; returns null fields when nothing supports it.
+function buildStationWhyReasoning(stationKey){
+  const parentIndex = STATION_PARENT_INDEX[stationKey];
+  const station = STATIONS.find(s=>s.key===stationKey);
+  let reason=null, impact="보통";
+  try{
+    const agg = computeStationRunDegradationAllRaces();
+    const s = agg && agg.perStation.find(x=>x.key===stationKey);
+    if(s && (s.pattern.key==="repeated"||s.pattern.key==="strong")){
+      reason = `최근 ${s.totalMeasured}개 대회에서 ${s.label} 이후 Run degradation이 ${s.occurrences}회 반복 관찰됨 (평균 +${fmtTime(s.avgOccurrenceDegradationSec)})`;
+      impact = s.pattern.key==="strong" ? "매우 높음" : "높음";
+    } else if(s && (s.pattern.key==="frequent"||s.pattern.key==="occasional") && s.occurrences>0){
+      reason = `${s.label} 이후 Run degradation이 ${s.totalMeasured}개 대회 중 ${s.occurrences}회 관찰됨 (아직 반복 패턴으로 단정하기는 이름)`;
+    }
+  }catch(e){ /* no race data yet — fall through to station-priority gap below */ }
+  if(!reason){
+    try{
+      const sp = computeStationPriority().find(x=>x.key===stationKey);
+      if(sp && sp.gapPct>0){ reason = `${station.label}이(가) 현재 벤치마크 대비 +${round1(sp.gapPct*100)}% 느려 주요 약점으로 확인됨`; impact = sp.gapPct>=0.15?"높음":"보통"; }
+    }catch(e){ /* no station data at all */ }
+  }
+  return { reason, improvementGoal: `${INDEX_META[parentIndex]?.friendly||"Strength Endurance"} + Station → Run transition`, impact };
+}
 function buildStationAddOnSession(stationKey, ctx){
   const station = STATIONS.find(s=>s.key===stationKey);
-  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const volFactor = fatigueHigh ? 0.8 : 1;
+  const { factor:volFactor, fatigueHigh, wip } = sessionVolFactor(ctx);
   const dRace=daysToRace();
   const weeksToRace = dRace!=null ? clamp(dRace/7,0.5,52) : 8;
   const baseRounds = weeksToRace<2 ? 2 : weeksToRace<4 ? 3 : 4; // fewer rounds close to race day
   const rounds = Math.max(2, Math.round(baseRounds*volFactor));
   const rep = STATION_BRICK_REPS[stationKey] || `${station.label} 반복`;
   const parentIndex = STATION_PARENT_INDEX[stationKey];
+  const why = buildStationWhyReasoning(stationKey);
   return {
     title: `🔥 HYROX ${INDEX_META[parentIndex]?.friendly || "Strength Endurance"}`,
     purpose: `${station.label} 자체의 힘보다 "${station.label} 이후 다시 달리는 능력"을 개선하기 위한 세션입니다.`,
     blocks: [`Warm-up 10분`, `500m Run → ${rep} → 500m Run → ${rep} × ${rounds} rounds`],
     targetRpe:"7-8", pace:null,
-    volumeNote: fatigueHigh? "최근 fatigue가 높아 라운드 수를 줄였습니다" : null,
+    volumeNote: fatigueHigh? "최근 fatigue가 높아 라운드 수를 줄였습니다" : (wip.weekInPhase===4? `${wip.phase} Week 4(Deload) — 라운드 수를 계획적으로 줄였습니다` : null),
+    why,
   };
 }
 // spec: "매번 Run+Station brick도 안 된다" — 같은 Station이 이번 주 다시 뽑히더라도 매번 똑같은
@@ -5739,22 +5841,23 @@ function buildStationAddOnSession(stationKey, ctx){
 // 세션을 별도로 마련해서 boxAddOnRecommendation에서 첫 번째/두 번째 노출마다 다른 유형을 고른다.
 function buildStationVolumeSession(stationKey, ctx){
   const station = STATIONS.find(s=>s.key===stationKey);
-  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const sets = Math.max(3, Math.round(5*(fatigueHigh?0.8:1)));
+  const { factor, fatigueHigh } = sessionVolFactor(ctx);
+  const sets = Math.max(3, Math.round(5*factor));
   return {
     title: `💪 ${station.label} 근지구력`,
     purpose: `${station.label} 자체의 반복 수행력(근지구력)을 직접 향상시키기 위한 세션입니다.`,
     blocks: [`Warm-up 8분`, `${station.label} ${sets}세트 (레이스 페이스보다 약간 낮은 강도, 세트 간 90초 휴식)`, "쿨다운 5분"],
     targetRpe:"6-7", pace:null,
     volumeNote: fatigueHigh? "최근 fatigue가 높아 세트 수를 줄였습니다" : null,
+    why: buildStationWhyReasoning(stationKey),
   };
 }
 // spec §1/§9: Station 저조가 "기술/리듬" 문제일 가능성 — 짧은 세트를 자주, 짧은 휴식으로 EMOM 형태로
 // 수행 리듬과 페이싱을 다듬는 세션. 세 번째 대안으로 순환에 포함해 매번 같은 패턴이 반복되지 않게 한다.
 function buildStationTechniqueSession(stationKey, ctx){
   const station = STATIONS.find(s=>s.key===stationKey);
-  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const rounds = Math.max(6, Math.round(8*(fatigueHigh?0.8:1)));
+  const { factor, fatigueHigh } = sessionVolFactor(ctx);
+  const rounds = Math.max(6, Math.round(8*factor));
   const rep = STATION_BRICK_REPS[stationKey] || `${station.label} 반복`;
   return {
     title: `🎯 ${station.label} 기술/리듬`,
@@ -5762,17 +5865,20 @@ function buildStationTechniqueSession(stationKey, ctx){
     blocks: [`Warm-up 8분`, `EMOM ${rounds}분: 매분 시작마다 ${rep} (남은 시간 휴식)`, "쿨다운 5분"],
     targetRpe:"5-6", pace:null,
     volumeNote: fatigueHigh? "최근 fatigue가 높아 EMOM 길이를 줄였습니다" : null,
+    why: buildStationWhyReasoning(stationKey),
   };
 }
 // spec §7: box Station 후반 Running degradation이 특히 큰 경우 — Station → Run 반복(전환 자체를
 // 훈련), buildStationAddOnSession과 형태는 비슷하지만 목적이 "전환 속도"로 다르게 표시된다.
 function buildTransitionAddOnSession(stationKey, ctx){
-  const station = STATIONS.find(s=>s.key===stationKey);  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const rounds = Math.max(3, Math.round(4*(fatigueHigh?0.8:1)));
+  const station = STATIONS.find(s=>s.key===stationKey);
+  const { factor, fatigueHigh } = sessionVolFactor(ctx);
+  const rounds = Math.max(3, Math.round(4*factor));
   return {
     title:"⚡ Transition Training", purpose:`${station.label} 이후 Running 페이스 저하를 줄이기 위한 전환 훈련입니다.`,
     blocks:[`Warm-up 10분`, `${station.label} → 500m Run × ${rounds}`],
     targetRpe:"7-8", pace:null, volumeNote: fatigueHigh? "최근 fatigue가 높아 세트 수를 줄였습니다" : null,
+    why: buildStationWhyReasoning(stationKey),
   };
 }
 // spec §7: Engine/Aerobic 부족 -> Run+Ski/Row/Burpee 복합 컨디셔닝. featuredKey는 실제로 가장 약한
@@ -5780,8 +5886,8 @@ function buildTransitionAddOnSession(stationKey, ctx){
 // 항상 SkiErg+Row로 고정되어 있던 불일치 버그 수정.
 const ENGINE_STATION_UNIT = { ski:"SkiErg 300m", row:"Row 300m", burpee:"Burpee Broad Jump 10~20회" };
 function buildEngineAddOnSession(ctx, featuredKey){
-  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const rounds = Math.max(3, Math.round(4*(fatigueHigh?0.8:1)));
+  const { factor, fatigueHigh } = sessionVolFactor(ctx);
+  const rounds = Math.max(3, Math.round(4*factor));
   const engineKeys = ["ski","row","burpee"];
   const primary = (featuredKey && ENGINE_STATION_UNIT[featuredKey]) ? featuredKey : "ski";
   const secondary = engineKeys.find(k=>k!==primary) || "row";
@@ -5791,6 +5897,7 @@ function buildEngineAddOnSession(ctx, featuredKey){
     purpose: featuredKey ? `${station.label}을 포함해 심폐 부담이 큰 구간에서의 지속 강도를 향상시키기 위한 세션입니다.` : "SkiErg/Row 등 심폐 부담이 큰 구간에서의 지속 강도를 향상시키기 위한 세션입니다.",
     blocks:[`Run 400m → ${ENGINE_STATION_UNIT[primary]} → Run 400m → ${ENGINE_STATION_UNIT[secondary]} × ${rounds} rounds`],
     targetRpe:"7", pace:null, volumeNote: fatigueHigh? "최근 fatigue가 높아 라운드 수를 줄였습니다" : null,
+    why: featuredKey ? buildStationWhyReasoning(featuredKey) : { reason:"Engine(심폐) Index가 현재 훈련 우선순위 상위권", improvementGoal:"Engine", impact:"보통" },
   };
 }
 // spec: session TYPE comes from Training Priority FIRST (computeTrainingPriority()'s existing
@@ -5800,8 +5907,8 @@ function buildEngineAddOnSession(ctx, featuredKey){
 // (e.g. Sled Push/Pull) could dominate every add-on regardless of what the athlete's overall training
 // priority actually was (e.g. Running).
 function buildGenericHyroxCircuit(ctx){
-  const fatigueHigh = ctx.hpiResult.fatigue>65 || shouldDeloadNow().needed;
-  const rounds = Math.max(2, Math.round(3*(fatigueHigh?0.8:1)));
+  const { factor, fatigueHigh } = sessionVolFactor(ctx);
+  const rounds = Math.max(2, Math.round(3*factor));
   return {
     title:"🎯 HYROX Specific Circuit", purpose:"여러 Station을 연결한 복합 훈련으로 HYROX 실전 적응력을 높이기 위한 세션입니다.",
     blocks:[`Warm-up 10분`, `500m Run → Sled Push 25m → 500m Run → Sandbag Lunge 20~30m → 500m Run → Burpee Broad Jump 10~20회 × ${rounds}`],
@@ -5893,14 +6000,34 @@ function boxAddOnRecommendation(box, weekCtx, addOnState){
     // circuit/no-op path instead of forcing a marginal station in.
     const MIN_GAP_TO_FEATURE = 0.05;
     const allowedStations = sessionType==="racePaceBrick" ? null : (INDEX_STATION_GROUPS[idxKey] || []);
+    const notOverExposed = (key)=>{
+      if(boxStations.includes(key)) return false;
+      const exposureSoFar=(addOnState.stationExposure[key]||0)+(weekCtx.boxStationCounts[key]||0);
+      return exposureSoFar<stationWeeklyCap(key);
+    };
+    // spec §20: Station rotation = Rotation + DNA weakness + degradation frequency, in THAT priority
+    // order — a station repeatedly showing post-station Run degradation across multiple races (real,
+    // multi-race evidence) outranks a single-race benchmark-gap number, which itself outranks a plain
+    // weekly rotation pick when neither signal is available.
+    const repeatedCandidate = (weekCtx.repeatedDegradationKeys||[])
+      .find(key=>(!allowedStations || allowedStations.includes(key)) && notOverExposed(key));
     const relevantStations = stationPriority.filter(sp=>{
       if(sp.gapPct < MIN_GAP_TO_FEATURE) return false;
-      if(boxStations.includes(sp.key)) return false;
-      const exposureSoFar=(addOnState.stationExposure[sp.key]||0)+(weekCtx.boxStationCounts[sp.key]||0);
-      if(exposureSoFar>=stationWeeklyCap(sp.key)) return false;
+      if(!notOverExposed(sp.key)) return false;
       return allowedStations ? allowedStations.includes(sp.key) : true;
     });
-    const featured = relevantStations[0];
+    let featured = repeatedCandidate ? { key:repeatedCandidate, label:STATIONS.find(s=>s.key===repeatedCandidate)?.label, gapPct:0, benchSource:null, benchSampleN:null } : relevantStations[0];
+    // no repeated-pattern AND no real benchmark-gap candidate -> rotate through the Index's own
+    // station group by week number instead of defaulting to a fixed group[0] every single week
+    // (spec §20 "모든 주에 동일 Station만 반복하지 말고 rotation").
+    if(!featured && allowedStations && allowedStations.length){
+      const rotationPool = allowedStations.filter(notOverExposed);
+      if(rotationPool.length){
+        const rotIdx = (weekCtx.rotationWeekIndex ?? 0) % rotationPool.length;
+        const key = rotationPool[rotIdx];
+        featured = { key, label:STATIONS.find(s=>s.key===key)?.label, gapPct:0, benchSource:null, benchSampleN:null };
+      }
+    }
 
     if(sessionType==="engineCircuit"){
       addOnState.indexExposure.engine=used+1;
@@ -6032,7 +6159,10 @@ function generateWeeklyPlan(ruleResult){
   // allow; alternate hard/easy
   let ratioSlots=[];
   for(let i=0;i<counts.run;i++) ratioSlots.push(i===0 && counts.run>1 ? "long":"run");
-  for(let i=0;i<counts.strength;i++) ratioSlots.push("strength");
+  // spec §14: 2회 이상의 Strength가 매주 동일한 형태(Squat/Deadlift)로 반복되지 않도록 목적을 분리한다.
+  // Strength A = Squat/Deadlift/Posterior Chain(기존 내용), Strength B = Unilateral/Upper/Core/Grip/
+  // Carry/Lunge — DNA 실측 약점(Sled Pull/Push/Lunge/Carry)이 있으면 그 HYROX-specific 동작을 반영.
+  for(let i=0;i<counts.strength;i++) ratioSlots.push(i===0 ? "strength" : "strengthB");
   for(let i=0;i<counts.wod;i++) ratioSlots.push(i===0 && hasSevereStationGap ? "station":"wod");
   for(let i=0;i<counts.recovery;i++) ratioSlots.push(i===0?"rest":"recovery");
   let slots=[...reservedMandatory, ...ratioSlots];
@@ -6084,7 +6214,22 @@ function generateWeeklyPlan(ruleResult){
     boxSessionStations(STATE.boxSchedule[dayIdx]||{}).forEach(k=>{ boxStationCounts[k]=(boxStationCounts[k]||0)+1; });
   });
   const weekCtx = { top3, hasInterval, stationPriority: weeklyStationPriority, boxStationCounts, ctx, recoveryDayOverride,
-    indexSequence: buildIndexAddOnSequence(trainingPriority, fixedBoxDays.size) };
+    indexSequence: buildIndexAddOnSequence(trainingPriority, fixedBoxDays.size),
+    // spec §20: repeated Station→Run degradation (multi-race real evidence) gets first priority in
+    // station selection, ahead of a single-race benchmark gap — see boxAddOnRecommendation above.
+    repeatedDegradationKeys: (()=>{
+      try{
+        const agg = computeStationRunDegradationAllRaces();
+        if(!agg) return [];
+        return agg.perStation.filter(s=>s.pattern.key==="repeated"||s.pattern.key==="strong")
+          .sort((a,b)=>(b.pattern.key==="strong")-(a.pattern.key==="strong") || b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec).map(s=>s.key);
+      }catch(e){ return []; }
+    })(),
+    // deterministic, stateless week-to-week rotation index (spec §20 "모든 주에 동일 Station만
+    // 반복하지 말고 rotation") — an absolute week number, so it advances every real week without
+    // needing any stored "last used station" state, consistent with this app's stateless-recompute philosophy.
+    rotationWeekIndex: Math.floor(daysBetween("1970-01-01", todayISO())/7),
+  };
   const addOnState = { stationExposure:{}, lastStationKey:null, indexExposure:{}, sequencePos:0, usedGenericCircuit:false, totalHardSessions:0 };
   const boxSlot=(i)=>{
     const box=STATE.boxSchedule[i];
@@ -6094,6 +6239,51 @@ function generateWeeklyPlan(ruleResult){
   };
 
   const days = finalSlots.map((type,i)=> type==="__box__" ? boxSlot(i) : sessionSlot(type||"recovery", WEEKDAYS[i], ctx, painR));
+
+  // spec §17: Standalone Run(이지런/롱런/인터벌)만으로 주간 러닝을 구성하지 않고, "Station 수행 후
+  // Run" 능력도 별도로 훈련한다 — 반복적으로 확인된 Station→Run degradation이 있으면(실제 다중대회
+  // 데이터, weekCtx.repeatedDegradationKeys) 이번 주의 일반 Run 한 세션에 Brick add-on을 덧붙인다.
+  // 회복 우선(REC-1)이거나 실제 피로 기반 Deload(shouldDeloadNow)면 부담을 늘리지 않는다. 단, 단순히
+  // "이번 주가 Deload 마이크로사이클(week 4)"인 것만으로는 제외하지 않는다 — spec §15/§18은 Deload
+  // 주에도 "낮은 피로도의 HYROX exposure 유지"를 요구하므로, week 4에는 sessionVolFactor의 0.75배
+  // 감량이 이미 자동 적용된 채로 낮은 볼륨의 Brick을 유지한다(완전 제거가 아님).
+  const wipForRunBrick = computeWeekInPhase();
+  if(!recoveryDayOverride && !deloadNow.needed
+     && weekCtx.repeatedDegradationKeys.length && (addOnState.totalHardSessions||0) < MAX_WEEKLY_HARD_ADDONS){
+    const runDayIdx = days.findIndex(d=>d.type==="run"); // plain Easy Run only — never double up on the mandatory Interval/Long day
+    if(runDayIdx>=0){
+      const stKey = weekCtx.repeatedDegradationKeys[0];
+      const already = (addOnState.stationExposure[stKey]||0)+(weekCtx.boxStationCounts[stKey]||0);
+      if(already<stationWeeklyCap(stKey)){
+        addOnState.stationExposure[stKey]=already+1;
+        addOnState.totalHardSessions=(addOnState.totalHardSessions||0)+1;
+        const p = buildTransitionAddOnSession(stKey, ctx);
+        days[runDayIdx] = { ...days[runDayIdx], label:`${days[runDayIdx].label} + ${STATIONS.find(s=>s.key===stKey)?.label} Brick`,
+          addOn:`${STATIONS.find(s=>s.key===stKey)?.label} → Run 반복 저하가 여러 대회에서 확인되어 이번 Run 세션에 전환 훈련을 추가했습니다`,
+          addOnPrescription:p };
+      }
+    }
+  }
+
+  // spec §15: "정상적인 컨디션에서는 최소 HYROX-specific session ≥ 1회/week를 기본 보장" — a safety
+  // net checked LAST, after every other mechanism above (box days, mandatory sim/brick, station-focus
+  // substitution, the repeated-degradation Run brick just above) has already had its chance. Only steps
+  // in when the week would otherwise end up with ZERO genuinely HYROX-specific exposure at all, and
+  // never during an actual safety override or real fatigue-triggered deload (those take priority).
+  const HYROX_SESSION_TYPES = new Set(["wod","station","brick","sim"]);
+  const hasHyroxExposure = days.some(d=> HYROX_SESSION_TYPES.has(d.type) || (d.type==="box" && boxCategoryFor(STATE.boxSchedule[WEEKDAYS.indexOf(d.day)]?.type)==="wod") || !!d.addOnPrescription);
+  if(!hasHyroxExposure && !recoveryDayOverride && !deloadNow.needed){
+    // convert the lowest-disruption day (a plain 'recovery' slot if one exists, else the plain 'run')
+    // into a light Station Focus session — never touches 'rest' (a genuine full-rest day stays rest).
+    const targetIdx = days.findIndex(d=>d.type==="recovery") >=0 ? days.findIndex(d=>d.type==="recovery") : days.findIndex(d=>d.type==="run");
+    if(targetIdx>=0){
+      const stKey = weekCtx.repeatedDegradationKeys[0] || weeklyStationPriority[0]?.key || "ski";
+      const lib = SESSION_LIBRARY.station;
+      const p = generateSessionPrescription("station", ctx, stKey);
+      days[targetIdx] = { ...days[targetIdx], type:"station", label:lib.label, desc:lib.desc, hr:lib.hr, rpe:lib.rpe, prescription:p,
+        addOn: "이번 주 계획에 HYROX 특이 세션이 없어 낮은 피로도의 Station Focus를 기본 보장으로 추가했습니다" };
+    }
+  }
   if(planWarnings.length) days.planWarnings=planWarnings; // attached for the UI to surface (spec §8), non-breaking for existing array consumers
   return days;
 }
@@ -6917,19 +7107,70 @@ function computeDnaSegmentsForRace(race){
 function computePeerAnalysis(){
   return memoPure("peer:"+pureCacheProfileKey(), ()=>computePeerAnalysisUncached());
 }
+// spec (DNA Division fallback): the race actually chosen for DNA computation is deliberately
+// SEPARATE from the athlete's configured Division (STATE.profile.division, which this never mutates
+// and which prediction/goal continue to use exactly as before — no change to BASE DIVISION / EXACT
+// RACE DIVISION separation elsewhere in this file). "기록이 있는가?"가 먼저, "목표 Division과 같은가?"
+// 는 그 다음이라는 원칙 그대로: real race data always wins over a Division match.
+//
+// Priority (spec): ① exact Division match → ② same Doubles family (Open/Pro Doubles only — Mixed
+// Doubles never counts as "the same family" as Open/Pro, and vice versa) → ③ same base Division
+// (Open/Pro/Mixed via divisionBase()) → ④ any other real race. Within each tier, prefers whichever
+// race has the MOST complete Run+Station+Transition data (so a real but sparse "exact division" match
+// never wins over a fuller-data race in a lower tier purely on Division label) — this is exactly what
+// fixes "Engine/Strength/Skill 축이 실제 데이터가 있는데도 —로 표시되는" bug: previously the selection
+// was just "exact division, else literally the single most-recent race regardless of division or
+// completeness", which could pick a sparse race over a complete one sitting right there in the
+// athlete's own race history.
+function raceDataCompleteness(race){
+  let n=0;
+  RUN_KEYS.forEach(k=>{ if(parseTimeToSec(race.runs?.[k])!=null) n++; });
+  STATIONS.forEach(s=>{ if(parseTimeToSec(race.stations?.[s.key])!=null) n++; });
+  if(parseTimeToSec(race.transition)!=null) n++;
+  return n; // 0..17
+}
+function pickDnaRace(){
+  const races = STATE.races.filter(r=>r && r.date);
+  if(!races.length) return { race:null, exactMatch:false };
+  const goalDiv = normalizeRaceDivision(STATE.profile.division) || STATE.profile.division;
+  const goalIsMixed = String(goalDiv||"").includes("Mixed");
+  const isMixedRace = r=>String(normalizeRaceDivision(r.division)||r.division||"").includes("Mixed");
+  const goalBase = divisionBase(goalDiv);
+
+  const tierA = races.filter(r=>normalizeRaceDivision(r.division)===goalDiv);
+  // ② same Doubles family — Open Doubles <-> Pro Doubles ONLY, never with Mixed Doubles either
+  // direction (spec: "Mixed Doubles는 Open/Pro 계열과 섞지 않는다").
+  const tierB = goalIsMixed ? [] : races.filter(r=>{
+    const d=normalizeRaceDivision(r.division)||r.division;
+    return (d==="Open Doubles"||d==="Pro Doubles") && !isMixedRace(r);
+  });
+  // ③ same base Division (Open/Pro/Mixed) — for a Mixed goal this only ever matches other Mixed
+  // races (divisionBase("Mixed Doubles")==="Mixed"), so it can never pull in Open/Pro data either.
+  const tierC = races.filter(r=>divisionBase(r.division)===goalBase);
+  // ④ any other real race at all — still the athlete's own real HYROX data, just a different
+  // Division than the goal; computeDnaSegmentsForRace() below resolves its comparison group from
+  // the RACE's own division (not the goal), so this never mislabels e.g. an Open Doubles result as
+  // if it were a Mixed Doubles benchmark comparison.
+  const tierD = races;
+
+  const pickBest = (candidates)=> candidates.length
+    ? [...candidates].sort((a,b)=> raceDataCompleteness(b)-raceDataCompleteness(a) || String(b.date).localeCompare(String(a.date)))[0]
+    : null;
+
+  const chosen = pickBest(tierA) || pickBest(tierB) || pickBest(tierC) || pickBest(tierD);
+  return { race: chosen, exactMatch: !!(chosen && normalizeRaceDivision(chosen.division)===goalDiv) };
+}
 function computePeerAnalysisUncached(){
-  // spec ⑤: EXACT current division only (racesByDivision, not latestRace()'s coarser divisionBase
-  // match) — Open and Open Doubles, or Pro and Pro Doubles, must never be pooled as "the same" race history.
-  // BUG FIX: 이전에는 프로필 Division과 정확히 같은 Division의 기록만 봤다. 그래서 예를 들어
-  // 프로필이 "Pro Doubles"인데 방금 등록한 대회가 "Open Doubles"면 DNA가 아예 null이 되어
-  // "기록을 등록해도 DNA가 반영 못 하는" 현상이 발생했다. 이제 정확 일치 기록이 없으면 가장
-  // 최근 기록(Division 무관)으로 폴백하고, 비교 그룹도 프로필이 아니라 "실제로 뛴 그 경기의
-  // Division"으로 맞춘다 — 그래야 같은 조건의 선수들과 비교된다.
-  const exactRace = racesByDivision(STATE.profile.division)[0] || null;
-  const fallbackRace = exactRace || [...STATE.races].sort((a,b)=>String(b.date).localeCompare(String(a.date)))[0] || null;
-  const race = fallbackRace;
+  // spec (DNA Division fallback pass): race SELECTION now follows the explicit priority chain above
+  // (exact Division → same Doubles family → same base Division → any real race), preferring whichever
+  // candidate has the most complete Run+Station+Transition data within each tier — replacing the old
+  // "exact Division, else just the single most-recent race regardless of anything else" fallback.
+  // STATE.profile.division (the athlete's configured/goal Division) is READ ONLY here, never mutated —
+  // the goal Division always stays exactly what the athlete set; only DNA's OWN internal data source
+  // changes when there's no real record in that exact Division yet.
+  const { race, exactMatch } = pickDnaRace();
   if(!race) return null;
-  const raceDivisionMismatch = !exactRace;
+  const raceDivisionMismatch = !exactMatch;
   const core = computeDnaSegmentsForRace(race);
   if(!core) return null;
   const { group } = core;
@@ -8871,7 +9112,6 @@ function renderMyGoalPodiumResult(wrap){
       ${podium.map((t,i)=>`<div class="row-between" style="padding:6px 0;"><span style="font-size:13.5px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
       <div class="divider" style="margin:12px 0;"></div>
       <div class="row-between" style="padding:2px 0;"><span style="font-size:11px;color:var(--gray-dim);">기준</span><span style="font-size:12.5px;font-weight:600;">${escapeHtml([r.benchmark.gender==='MIXED'?'Mixed':(r.benchmark.gender==='female'?'Female':'Male'), r.benchmark.division, r.benchmark.ageGroupUsed||r.benchmark.ageGroup].filter(Boolean).join(' · '))}${r.benchmark.ageGroupUsed==null?` <span style="color:var(--amber);">(연령대 완화됨)</span>`:""}</div>
-      <p class="reason-line" style="margin-top:8px;color:var(--gray-dim);">산출에 쓰인 데이터·대회 목록·분포는 <b>모델 설명 &gt; 포디움 산출근거</b> 탭에서 확인할 수 있습니다.</p>
     </div>
     <div class="divider" style="margin:0;"></div>
     ${r.gapDecomposition ? `<div style="padding:18px 20px;">
@@ -9138,7 +9378,23 @@ function segmentModelTable(model){
 // (trainability, data confidence) instead of just a number.
 const SEGMENT_CONF_META = { high:{label:"데이터 신뢰도 높음",cls:"elite"}, medium:{label:"데이터 신뢰도 보통",cls:"low"}, low:{label:"데이터 신뢰도 낮음",cls:"crit"} };
 function segmentTargetGapTable(segmentGap){
-  const rows = segmentGap.segments.map(s=>{
+  // spec: Run 1~8을 개별 행으로 나열하지 않는다 — 이미 위쪽 "Running (8구간 합)" 막대에서 총합으로
+  //보여주고 있으므로, 여기 상세 표에서는 8개 Run을 하나의 "Running (8구간 합)" 행으로 합산하고
+  // 그 아래에 Station/Roxzone만 개별 표시한다 (중복 제거).
+  const runSegs = segmentGap.segments.filter(s=>s.type==="run");
+  const nonRunSegs = segmentGap.segments.filter(s=>s.type!=="run");
+  const confRank = { low:0, medium:1, high:2 };
+  const runRow = runSegs.length ? (()=>{
+    const sum=(key)=>runSegs.reduce((s,x)=>s+x[key],0);
+    // 8개 구간 중 가장 낮은 신뢰도를 대표값으로 표시 — 일부만 실측이어도 "충분히 신뢰도 높음"처럼
+    // 보이지 않도록 보수적으로 선택.
+    const worstConf = runSegs.reduce((worst,x)=> confRank[x.confidence]<confRank[worst] ? x.confidence : worst, runSegs[0].confidence);
+    return { label:"Running (8구간 합)", confidence:worstConf,
+      allocatedSec:sum("allocatedSec"), maxImprovementSec:sum("maxImprovementSec"),
+      conservativeSec:sum("conservativeSec"), aggressiveSec:sum("aggressiveSec") };
+  })() : null;
+  const displaySegs = runRow ? [runRow, ...nonRunSegs] : nonRunSegs;
+  const rows = displaySegs.map(s=>{
     const conf=SEGMENT_CONF_META[s.confidence];
     return `<tr>
       <td style="padding:6px 8px;font-size:12.5px;color:var(--white);">${s.label}</td>
@@ -10496,18 +10752,9 @@ async function uploadHyroxRawCsv(file,onProgress){
   // spec (doc4 §5/§6): 이 업로드가 실제로 무엇을 몇 건 바꿨는지 — Event/Date/Source/Raw/Valid/
   // Duplicate/New/UpdatedAt — 나중에 "어떤 대회 데이터를 추가해서 DNA 기준이 바뀌었는지" 추적 가능하게.
   const uniqueEvents = [...new Set(unique.map(r=>r.event).filter(Boolean))];
-  // 업로드 이력에 시즌 / 년도 / 지역을 명시적으로 남긴다.
-  // 지역은 Target Race(event_name)를 우선 사용하며, 기존 event 라벨은 호환성을 위해 함께 보존한다.
-  const uploadSeasons = [...new Set(unique.map(r=>String(r.season||"").trim()).filter(Boolean))];
-  const uploadYears = [...new Set(unique.map(r=>String(r.year||"").trim()).filter(Boolean))];
-  const uploadRegions = [...new Set(unique.map(r=>String(r.event_name||"").trim()).filter(Boolean))];
   await appendHyroxUploadLog({
     id: uid(), uploadedAt: new Date().toISOString(), fileName: file.name, format,
     events: uniqueEvents.slice(0,5), // 파일 하나에 여러 대회가 섞여 있을 수 있음 — 상위 5개만 기록
-    seasons: uploadSeasons,
-    years: uploadYears,
-    regions: uploadRegions,
-    importedCount: newRecords,
     hasSeasonCol, rowsWithSeason,
     rawParsed: data.length, validRows: rows.length, duplicatesInFile: rows.length-unique.length,
     uploadedRows: unique.length, newRecords, totalAfter: postCount,
@@ -10518,51 +10765,6 @@ async function uploadHyroxRawCsv(file,onProgress){
 }
 // spec (doc4 §5): 누적 로그는 여러 관리자가 같은 화면에서 봐야 하므로 shared:true로 저장한다.
 // 최근 100건만 유지 — 무한정 커지지 않도록.
-async function saveHyroxUploadLogToSupabase(entry){
-  if(!sbEnabled() || !window.supabase || !window.supabase.createClient) return false;
-  try{
-    if(!sb) await ensureHyroxSearchDb();
-    const payload={
-      id:String(entry.id||uid()), uploaded_at:entry.uploadedAt||new Date().toISOString(),
-      file_name:entry.fileName||null, format:entry.format||null,
-      events:Array.isArray(entry.events)?entry.events:[],
-      seasons:Array.isArray(entry.seasons)?entry.seasons:[],
-      years:Array.isArray(entry.years)?entry.years:[],
-      regions:Array.isArray(entry.regions)?entry.regions:[],
-      imported_count:entry.importedCount!=null?entry.importedCount:(entry.newRecords??null),
-      raw_parsed:entry.rawParsed??null, valid_rows:entry.validRows??null,
-      duplicates_in_file:entry.duplicatesInFile??null, uploaded_rows:entry.uploadedRows??null,
-      new_records:entry.newRecords??null, total_after:entry.totalAfter??null,
-      has_season_col:entry.hasSeasonCol??null, rows_with_season:entry.rowsWithSeason??null
-    };
-    const {error}=await sb.from("hyrox_upload_log").upsert(payload,{onConflict:"id"});
-    if(error) throw error;
-    return true;
-  }catch(e){
-    console.warn("Supabase 업로드 이력 저장 실패 — 로컬 이력은 유지됩니다:",e?.message||e);
-    return false;
-  }
-}
-async function loadHyroxUploadLogFromSupabase(){
-  if(!sbEnabled() || !window.supabase || !window.supabase.createClient) return [];
-  try{
-    if(!sb) await ensureHyroxSearchDb();
-    const {data,error}=await sb.from("hyrox_upload_log").select("*").order("uploaded_at",{ascending:false}).limit(100);
-    if(error) throw error;
-    return (data||[]).map(e=>({
-      id:e.id, uploadedAt:e.uploaded_at, fileName:e.file_name, format:e.format,
-      events:e.events||[], seasons:e.seasons||[], years:e.years||[], regions:e.regions||[],
-      importedCount:e.imported_count, rawParsed:e.raw_parsed, validRows:e.valid_rows,
-      duplicatesInFile:e.duplicates_in_file, uploadedRows:e.uploaded_rows,
-      newRecords:e.new_records, totalAfter:e.total_after,
-      hasSeasonCol:e.has_season_col, rowsWithSeason:e.rows_with_season
-    }));
-  }catch(e){
-    console.warn("Supabase 업로드 이력 조회 실패:",e?.message||e);
-    return [];
-  }
-}
-
 async function appendHyroxUploadLog(entry){
   try{
     let log = await StorageService.get("hps:hyroxUploadLog:v1", []);
@@ -10573,13 +10775,9 @@ async function appendHyroxUploadLog(entry){
     // StorageService 를 통해 localStorage 로 내려가 최소한 이 브라우저에서는 이력이 남는다.
     if(window.storage && window.storage.set) await window.storage.set("hps:hyroxUploadLog:v1", JSON.stringify(log), true);
     await StorageService.set("hps:hyroxUploadLog:v1", log);
-    // PC에서 업로드하고 모바일에서도 동일한 이력을 보려면 Supabase 공용 로그를 사용한다.
-    await saveHyroxUploadLogToSupabase(entry);
   }catch(e){ console.warn("upload log 저장 실패(업로드 자체는 정상 처리됨):", e?.message||e); }
 }
 async function loadHyroxUploadLog(){
-  // Supabase 공용 로그를 최우선으로 읽는다. local/window.storage는 오프라인 fallback.
-  const cloud = await loadHyroxUploadLogFromSupabase();
   let shared=null;
   try{
     if(window.storage && window.storage.get){
@@ -10589,7 +10787,7 @@ async function loadHyroxUploadLog(){
   }catch(e){ /* 키 없음 — 정상 */ }
   const local = await StorageService.get("hps:hyroxUploadLog:v1", []);
   // 공유 이력과 로컬 이력을 id 기준으로 합쳐서 최신순으로. 둘 중 하나만 있어도 정상 동작한다.
-  const merged = [...(Array.isArray(cloud)?cloud:[]), ...(Array.isArray(shared)?shared:[]), ...(Array.isArray(local)?local:[])];
+  const merged = [...(Array.isArray(shared)?shared:[]), ...(Array.isArray(local)?local:[])];
   const seen=new Set(), out=[];
   merged.forEach(e=>{ const k=e&&(e.id||`${e.uploadedAt}|${e.fileName}`); if(!k||seen.has(k)) return; seen.add(k); out.push(e); });
   out.sort((a,b)=>String(b.uploadedAt||"").localeCompare(String(a.uploadedAt||"")));
@@ -12670,21 +12868,23 @@ function stationRunFatigueSectionHtml(){
         }).join("")}
       </tbody></table></div>`;
 
-  // 반복성 콜아웃 (spec §5) — 반복적(모든 대회에서 발생) 패턴을 먼저, 일시적 패턴은 짧게 뒤에.
-  const repeated = perStation.filter(s=>s.pattern.key==="repeated").sort((a,b)=>b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec);
-  const occasional = perStation.filter(s=>s.pattern.key==="occasional"||s.pattern.key==="frequent");
+  // 반복성 표 ("Station → Run | 발생 | 판단") — 판정 기준: <40% ⚪ 일시적 · 40~59% 🟡 관찰 ·
+  // ≥60% 🟢 반복 패턴 · ≥80%(표본<4면 실발생 3회 이상) 🔴 강한 반복 패턴.
+  const repetitionRows = perStation.filter(s=>s.totalMeasured>=2)
+    .sort((a,b)=> b.occurrenceRatio-a.occurrenceRatio || b.occurrences-a.occurrences);
   const patternHtml = raceCount>=2 ? `
     <div class="divider" style="margin:14px 0;"></div>
     <div class="eyebrow gray" style="margin-bottom:8px;">반복성 — 여러 대회에서 일관되게 나타나는가?</div>
-    ${repeated.length ? repeated.map(s=>`
-      <div style="margin-bottom:10px;padding:10px 12px;background:rgba(255,77,77,.08);border:1px solid var(--red);border-radius:8px;">
-        <div style="font-weight:700;font-size:13px;color:var(--red);">🔴 반복적으로 나타나는 패턴 — ${escapeHtml(s.label)} → Run</div>
-        <div class="reason-line" style="margin-top:4px;">${s.totalMeasured}개 대회 중 ${s.occurrences}회 발생 · 평균 저하 +${fmtTime(s.avgOccurrenceDegradationSec)}</div>
-        <p class="reason-line" style="margin-top:4px;color:var(--white);">여러 대회에서 반복적으로 ${escapeHtml(s.label)} 이후 Run이 느려지는 패턴이 관찰됩니다.</p>
-      </div>`).join("") : `<div class="empty-note" style="margin-bottom:10px;">모든 대회에서 반복되는 스테이션은 아직 없습니다.</div>`}
-    ${occasional.length ? `<div style="display:flex;flex-direction:column;gap:6px;">
-      ${occasional.map(s=>`<div class="reason-line">🟢 일시적인 패턴 — ${escapeHtml(s.label)} → Run: ${s.totalMeasured}개 대회 중 ${s.occurrences}회 발생. 현재 데이터만으로 반복적인 문제라고 판단하기 어렵습니다.</div>`).join("")}
-    </div>` : ""}
+    ${repetitionRows.length ? `<div style="overflow-x:auto;"><table><thead><tr><th>Station → Run</th><th class="num">발생</th><th>판단</th></tr></thead><tbody>
+      ${repetitionRows.map(s=>`<tr>
+        <td>${escapeHtml(s.label)} → Run</td>
+        <td class="num mono">${s.occurrences}/${s.totalMeasured}</td>
+        <td>${s.pattern.circle} ${escapeHtml(s.pattern.shortLabel)}</td>
+      </tr>`).join("")}
+    </tbody></table></div>
+    <p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">⚪ 일시적(&lt;40%) · 🟡 관찰(40~59%) · 🟢 반복 패턴(≥60%) · 🔴 강한 반복 패턴(≥80%, 표본 4개 미만이면 실발생 3회 이상)</p>
+    ${repetitionRows.some(s=>s.pattern.key==="strong"||s.pattern.key==="repeated") ? "" : `<div class="empty-note" style="margin-top:10px;">여러 대회에서 반복되는 것으로 확인된 스테이션은 아직 없습니다.</div>`}
+    ` : `<div class="empty-note">측정된 Station → Run 저하가 없습니다.</div>`}
   ` : `<p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">대회가 2개 이상 등록되면 반복성(여러 대회에서 일관되게 나타나는 패턴인지)을 함께 보여드립니다. 현재 ${raceCount}개 대회만 분석되었습니다.</p>`;
 
   // 대회 전반의 Run1→Run8 진단 분포 (spec §6 — 단일 대회의 인과 단정 대신, 여러 대회에서 어떤 진단이
@@ -12745,6 +12945,7 @@ function renderPeer(wrap){
         : dataSource.realSegmentCount>0
           ? `⚠ 일부 구간(${dataSource.realSegmentCount}/${dataSource.totalSegmentCount})만 실제 결과 DB 기준(${MIN_REAL_SAMPLE}건 이상)이고, 나머지는 예시 추정치입니다.`
           : `⚠ 아래 분석은 실제 전체 참가자 결과 DB가 아닌 예시 추정치 기반입니다. 실제 참가자 상위 %는 동일 조건 실제 기록이 ${MIN_REAL_SAMPLE}건 이상 쌓인 후에만 표시됩니다.`}</p>
+    ${analysis.raceDivisionMismatch ? `<p class="lead" style="color:var(--amber);">⚠ 현재 설정된 Division(${escapeHtml(STATE.profile.division)})에는 아직 실제 경기 기록이 없어, 실제로 뛴 <b style="color:var(--white);">${escapeHtml(group.division)}</b> 경기 기록(${escapeHtml(race.name||race.date)})으로 DNA를 계산했습니다 — 목표 Division 설정 자체는 그대로이며, 예측/목표 페이지는 계속 ${escapeHtml(STATE.profile.division)} 기준으로 계산됩니다.</p>` : ""}
 
     <div class="card" style="border-left:3px solid var(--orange);">
       <div class="row-between"><div class="eyebrow gray">🧬 나의 Race DNA</div>${peerSourceStatusBlock(raceDnaFullyReal, raceDnaMinN, group)}</div>
@@ -13227,7 +13428,8 @@ function weeklyGoalSummaryHtml(){
   const priority = computeTrainingPriority();
   const top3 = priority.slice(0,3);
   const stationAgg = computeStationRunDegradationAllRaces();
-  const repeatedPattern = stationAgg ? stationAgg.perStation.filter(s=>s.pattern.key==="repeated").sort((a,b)=>b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec)[0] : null;
+  const repeatedPattern = stationAgg ? stationAgg.perStation.filter(s=>s.pattern.key==="repeated"||s.pattern.key==="strong")
+    .sort((a,b)=>(b.pattern.key==="strong")-(a.pattern.key==="strong") || b.avgOccurrenceDegradationSec-a.avgOccurrenceDegradationSec)[0] : null;
 
   const rows = top3.map((p,i)=>{
     const meta = INDEX_META[p.key];
@@ -13281,7 +13483,9 @@ function renderPlan(wrap){
     </div>` : ""}
 
     <div class="card">
-      <div class="row-between"><h2 class="section-title">이번 주 배분 (${ruleResult.ctx.phase} 단계 기준)</h2></div>
+      <div class="row-between"><h2 class="section-title">이번 주 배분 (${ruleResult.ctx.phase} 단계 기준)</h2>
+        ${(()=>{ const wip=computeWeekInPhase(); return `<span class="chip">${wip.phase} Week ${wip.weekInPhase} · ${wip.cycleLabel}</span>`; })()}
+      </div>
       <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
         <ratiorow></ratiorow>
         ${Object.entries({Run:ratio.run,Strength:ratio.strength,WOD:ratio.wod,Recovery:ratio.recovery}).map(([k,v])=>`
@@ -13301,6 +13505,9 @@ function renderPlan(wrap){
             <div style="font-weight:700;color:var(--white);">${escapeHtml(d.addOnPrescription.title)}</div>
             ${d.addOnPrescription.blocks.map(b=>`<div>· ${escapeHtml(b)}</div>`).join("")}
             ${d.addOnPrescription.purpose? `<div style="color:var(--gray-dim);margin-top:2px;font-style:italic;">목적: ${escapeHtml(d.addOnPrescription.purpose)}</div>`:""}
+            ${d.addOnPrescription.why?.reason? `<div style="color:var(--low);margin-top:4px;">🎯 이유: ${escapeHtml(d.addOnPrescription.why.reason)}</div>
+              <div style="color:var(--gray-dim);">🧬 개선 목표: ${escapeHtml(d.addOnPrescription.why.improvementGoal)}</div>
+              <div style="color:var(--gray-dim);">🏆 목표 기록 영향: ${escapeHtml(d.addOnPrescription.why.impact)}</div>` : ""}
             ${d.addOnPrescription.targetRpe? `<div style="color:var(--orange);margin-top:2px;">Target RPE: ${escapeHtml(d.addOnPrescription.targetRpe)}</div>`:""}
             ${d.addOnPrescription.volumeNote? `<div style="color:var(--amber);margin-top:2px;">⚠ ${escapeHtml(d.addOnPrescription.volumeNote)}</div>`:""}
           </div>` : ""}
@@ -13313,9 +13520,6 @@ function renderPlan(wrap){
           <div class="d-meta">HR ${d.hr}<br>RPE ${d.rpe}</div>
         </div>`).join("")}
     </div>
-
-    <div class="divider" style="margin:4px 0;"></div>
-    ${trainingPriorityAndAbilitySummaryHtml()}
 
     <div class="card">
       <div class="row-between"><h2 class="section-title">직접 수정</h2></div>
@@ -13337,7 +13541,7 @@ function renderPlan(wrap){
 }
 function sessionColor(type){
   return { interval:"var(--red)", sim:"var(--red)", wod:"var(--orange)", brick:"var(--orange)", station:"var(--orange)",
-    strength:"var(--white)", run:"var(--white)", long:"var(--white)", recovery:"var(--green)", rest:"var(--gray-dim)", shakeout:"var(--green)",
+    strength:"var(--white)", strengthB:"var(--white)", run:"var(--white)", long:"var(--white)", recovery:"var(--green)", rest:"var(--gray-dim)", shakeout:"var(--green)",
     box:"var(--low)" }[type] || "var(--white)";
 }
 
@@ -13412,6 +13616,7 @@ function renderModel(wrap){
       <div class="tab ${MODEL_TAB==="dna"?"active":""}" data-model-tab="dna">DNA 데이터</div>
       <div class="tab ${MODEL_TAB==="podium"?"active":""}" data-model-tab="podium">포디움 산출근거</div>
       <div class="tab ${MODEL_TAB==="prediction"?"active":""}" data-model-tab="prediction">기록 예측</div>
+      <div class="tab ${MODEL_TAB==="archive"?"active":""}" data-model-tab="archive">아카이브</div>
     </div>
     <div id="model-tab-body"></div>
   `;
@@ -13422,7 +13627,13 @@ function renderModel(wrap){
   else if(MODEL_TAB==="dna") renderModelDnaImportTab(body);
   else if(MODEL_TAB==="podium") renderModelPodiumBasisTab(body);
   else if(MODEL_TAB==="prediction") renderModelPredictionBasisTab(body);
+  else if(MODEL_TAB==="archive") renderModelArchiveTab(body);
   else renderModelExplainTab(body);
+}
+// "아카이브" 탭 — 주간 훈련계획 페이지에 있던 "능력 요약"/"훈련 우선순위(상세)"를 그대로 옮긴 것.
+// 주간 훈련계획은 실제 이번 주 세션만 보여주는 데 집중하고, 이 상세 진단은 참고용 아카이브로 이동.
+function renderModelArchiveTab(wrap){
+  wrap.innerHTML = `<p class="lead" style="margin:0 0 14px;">주간 훈련계획 페이지에 있던 "능력 요약"과 "훈련 우선순위(상세)"를 이곳으로 옮겼습니다 — 계산 로직은 변경되지 않았습니다.</p>${trainingPriorityAndAbilitySummaryHtml()}`;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -13577,7 +13788,7 @@ function hyroxDbEventSummaryHtml(){
   const rows=Object.values(agg).sort((a,b)=>b.n-a.n);
   if(!rows.length) return `<div class="divider" style="margin:14px 0;"></div>
     <div class="eyebrow gray">📦 현재 DB 구성</div>
-    <div class="empty-note">Supabase 공용 DB 동기화 전이거나 조회에 실패했습니다. 잠시 후 다시 열어주세요.</div>`;
+    <div class="empty-note">${renderModelDnaImportTab._autoSyncing ? "Supabase에서 자동으로 다시 불러오는 중입니다... (완료되면 자동으로 갱신됩니다)" : "동기화된 DNA 비교 데이터가 없습니다 — 위 \"Supabase에서 다시 동기화\" 버튼을 눌러보세요."}</div>`;
   return `<div class="divider" style="margin:14px 0;"></div>
     <div class="row-between"><div class="eyebrow gray">📦 현재 DB 구성 (대회별)</div>
       <span class="mono" style="font-size:11px;color:var(--gray-dim);">${rows.length}개 대회 · ${(EXTERNAL_RACE_DB||[]).length.toLocaleString()}건</span></div>
@@ -13594,12 +13805,17 @@ function hyroxDbEventSummaryHtml(){
     ${rows.length>60? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">상위 60개 대회만 표시</p>`:""}`;
 }
 function renderModelDnaImportTab(wrap){
-  // 탭을 처음 열 때 백그라운드 동기화가 아직 끝나지 않았거나 실패한 경우에도
-  // Supabase 공용 DB를 즉시 재동기화한다. PC 업로드 → 모바일 확인 시 특히 중요하다.
-  if(sbEnabled() && (!Array.isArray(EXTERNAL_RACE_DB) || EXTERNAL_RACE_DB.length===0)){
+  // spec (mobile bug fix): PC에서 CSV를 업로드하면 Supabase 공용 hyrox_results 테이블에는 바로
+  // 반영되지만, 모바일 브라우저의 EXTERNAL_RACE_DB(이 세션 안의 로컬 상태)는 그 사실을 모른 채
+  // 비어있는 상태로 남아 "현재 DB 구성"이 계속 빈 것처럼 보였다 — 사용자가 "Supabase에서 다시
+  // 동기화" 버튼을 직접 눌러야만 해결됐던 문제. 이 탭을 열 때 데이터가 비어있으면 자동으로 한 번
+  // Supabase에서 재동기화를 시도하고, 성공하면 화면을 자동으로 갱신한다(수동 버튼은 그대로 남겨둠).
+  if(sbEnabled() && EXTERNAL_RACE_DB.length===0 && !renderModelDnaImportTab._autoSyncing){
+    renderModelDnaImportTab._autoSyncing = true;
     syncExternalRaceDbFromSupabase().then(()=>{
-      if(EXTERNAL_RACE_DB.length) renderAll();
-    }).catch(e=>console.warn("모델설명 탭 재동기화 실패:",e));
+      renderModelDnaImportTab._autoSyncing = false;
+      if(EXTERNAL_RACE_DB.length>0) renderAll(); // 성공적으로 채워졌을 때만 다시 그림 — 무한 루프 방지
+    }).catch(e=>{ renderModelDnaImportTab._autoSyncing = false; console.warn("모델설명 탭 자동 재동기화 실패:", e); });
   }
   const dbSize = EXTERNAL_RACE_DB.length;
   const sourceLabel = { supabase:"🟢 Supabase 공용 데이터셋", local:"🟡 로컬 캐시(오프라인)", none:"⚪ 데이터 없음" }[EXTERNAL_RACE_DB_SOURCE] || "⚪ 데이터 없음";
@@ -13681,25 +13897,17 @@ function renderModelDnaImportTab(wrap){
     if(!Array.isArray(log)) log=[];
     logCard.innerHTML = `
       <div class="row-between"><h2 class="section-title">📜 업로드 이력</h2><span class="mono" style="font-size:11px;color:var(--gray-dim);">${log.length}건</span></div>
-      <p class="lead" style="margin:6px 0 10px;">누가 언제 어떤 HYROX 데이터를 추가했는지 기록합니다. <b>시즌 · 년도 · 지역 · 가져온 수</b>를 별도로 표시하며, "가져온 수"는 업로드 전후 <code>hyrox_results</code> 전체 행 수 차이로 계산한 실제 신규 반영 건수입니다 (파일 내 중복·기존과 겹치는 행 제외).</p>
-      ${log.length ? `<div style="overflow-x:auto;"><table><thead><tr><th>일시</th><th>시즌</th><th>년도</th><th>지역</th><th>대회</th><th>파일</th><th class="num">가져온 수</th><th class="num">파일 내 중복</th><th class="num">누적 전체</th></tr></thead><tbody>
-        ${log.map(e=>{
-          const seasons = Array.isArray(e.seasons) ? e.seasons : (e.season ? [e.season] : []);
-          const years = Array.isArray(e.years) ? e.years : (e.year ? [e.year] : []);
-          const regions = Array.isArray(e.regions) ? e.regions : (e.region ? [e.region] : []);
-          const imported = e.importedCount!=null ? e.importedCount : e.newRecords;
-          return `<tr>
+      <p class="lead" style="margin:6px 0 10px;">누가 언제 어떤 대회 CSV를 추가해서 선수 검색 DB(<code>hyrox_results</code>)가 몇 건 늘었는지 기록입니다. "신규 반영"은 업로드 전후 전체 테이블 행 수 차이로 계산한 실제 순증분입니다 (파일 내 중복·기존과 겹치는 행 제외).</p>
+      ${log.length ? `<div style="overflow-x:auto;"><table><thead><tr><th>일시</th><th>대회</th><th>파일</th><th class="num">파일 내 유효행</th><th class="num">파일 내 중복</th><th class="num">신규 반영</th><th class="num">누적 전체</th></tr></thead><tbody>
+        ${log.map(e=>`<tr>
           <td style="white-space:nowrap;">${(e.uploadedAt||"").slice(0,16).replace("T"," ")}</td>
-          <td class="mono">${escapeHtml(seasons.join(", ")||"—")}</td>
-          <td class="mono">${escapeHtml(years.join(", ")||"—")}</td>
-          <td>${escapeHtml(regions.join(", ")||"—")}</td>
           <td>${escapeHtml((e.events||[]).join(", ")||"—")}</td>
           <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--gray-dim);font-size:11px;">${escapeHtml(e.fileName||"")}</td>
-          <td class="num mono" style="color:var(--green);font-weight:700;">${imported!=null?"+"+Number(imported).toLocaleString():"확인불가"}</td>
+          <td class="num mono">${e.validRows?.toLocaleString()??"—"}</td>
           <td class="num mono">${e.duplicatesInFile?.toLocaleString()??"—"}</td>
+          <td class="num mono" style="color:var(--green);">${e.newRecords!=null?"+"+e.newRecords.toLocaleString():"확인불가"}</td>
           <td class="num mono">${e.totalAfter!=null?e.totalAfter.toLocaleString():"—"}</td>
-        </tr>`;
-        }).join("")}
+        </tr>`).join("")}
       </tbody></table></div>` : `<div class="empty-note">아직 업로드 이력이 없습니다 — 아래 "현재 DB 구성"에서 실제로 들어있는 대회는 확인할 수 있습니다.</div>`}
       ${hyroxDbEventSummaryHtml()}
     `;
