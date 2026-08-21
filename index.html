@@ -10518,6 +10518,51 @@ async function uploadHyroxRawCsv(file,onProgress){
 }
 // spec (doc4 §5): 누적 로그는 여러 관리자가 같은 화면에서 봐야 하므로 shared:true로 저장한다.
 // 최근 100건만 유지 — 무한정 커지지 않도록.
+async function saveHyroxUploadLogToSupabase(entry){
+  if(!sbEnabled() || !window.supabase || !window.supabase.createClient) return false;
+  try{
+    if(!sb) await ensureHyroxSearchDb();
+    const payload={
+      id:String(entry.id||uid()), uploaded_at:entry.uploadedAt||new Date().toISOString(),
+      file_name:entry.fileName||null, format:entry.format||null,
+      events:Array.isArray(entry.events)?entry.events:[],
+      seasons:Array.isArray(entry.seasons)?entry.seasons:[],
+      years:Array.isArray(entry.years)?entry.years:[],
+      regions:Array.isArray(entry.regions)?entry.regions:[],
+      imported_count:entry.importedCount!=null?entry.importedCount:(entry.newRecords??null),
+      raw_parsed:entry.rawParsed??null, valid_rows:entry.validRows??null,
+      duplicates_in_file:entry.duplicatesInFile??null, uploaded_rows:entry.uploadedRows??null,
+      new_records:entry.newRecords??null, total_after:entry.totalAfter??null,
+      has_season_col:entry.hasSeasonCol??null, rows_with_season:entry.rowsWithSeason??null
+    };
+    const {error}=await sb.from("hyrox_upload_log").upsert(payload,{onConflict:"id"});
+    if(error) throw error;
+    return true;
+  }catch(e){
+    console.warn("Supabase 업로드 이력 저장 실패 — 로컬 이력은 유지됩니다:",e?.message||e);
+    return false;
+  }
+}
+async function loadHyroxUploadLogFromSupabase(){
+  if(!sbEnabled() || !window.supabase || !window.supabase.createClient) return [];
+  try{
+    if(!sb) await ensureHyroxSearchDb();
+    const {data,error}=await sb.from("hyrox_upload_log").select("*").order("uploaded_at",{ascending:false}).limit(100);
+    if(error) throw error;
+    return (data||[]).map(e=>({
+      id:e.id, uploadedAt:e.uploaded_at, fileName:e.file_name, format:e.format,
+      events:e.events||[], seasons:e.seasons||[], years:e.years||[], regions:e.regions||[],
+      importedCount:e.imported_count, rawParsed:e.raw_parsed, validRows:e.valid_rows,
+      duplicatesInFile:e.duplicates_in_file, uploadedRows:e.uploaded_rows,
+      newRecords:e.new_records, totalAfter:e.total_after,
+      hasSeasonCol:e.has_season_col, rowsWithSeason:e.rows_with_season
+    }));
+  }catch(e){
+    console.warn("Supabase 업로드 이력 조회 실패:",e?.message||e);
+    return [];
+  }
+}
+
 async function appendHyroxUploadLog(entry){
   try{
     let log = await StorageService.get("hps:hyroxUploadLog:v1", []);
@@ -10528,9 +10573,13 @@ async function appendHyroxUploadLog(entry){
     // StorageService 를 통해 localStorage 로 내려가 최소한 이 브라우저에서는 이력이 남는다.
     if(window.storage && window.storage.set) await window.storage.set("hps:hyroxUploadLog:v1", JSON.stringify(log), true);
     await StorageService.set("hps:hyroxUploadLog:v1", log);
+    // PC에서 업로드하고 모바일에서도 동일한 이력을 보려면 Supabase 공용 로그를 사용한다.
+    await saveHyroxUploadLogToSupabase(entry);
   }catch(e){ console.warn("upload log 저장 실패(업로드 자체는 정상 처리됨):", e?.message||e); }
 }
 async function loadHyroxUploadLog(){
+  // Supabase 공용 로그를 최우선으로 읽는다. local/window.storage는 오프라인 fallback.
+  const cloud = await loadHyroxUploadLogFromSupabase();
   let shared=null;
   try{
     if(window.storage && window.storage.get){
@@ -10540,7 +10589,7 @@ async function loadHyroxUploadLog(){
   }catch(e){ /* 키 없음 — 정상 */ }
   const local = await StorageService.get("hps:hyroxUploadLog:v1", []);
   // 공유 이력과 로컬 이력을 id 기준으로 합쳐서 최신순으로. 둘 중 하나만 있어도 정상 동작한다.
-  const merged = [...(Array.isArray(shared)?shared:[]), ...(Array.isArray(local)?local:[])];
+  const merged = [...(Array.isArray(cloud)?cloud:[]), ...(Array.isArray(shared)?shared:[]), ...(Array.isArray(local)?local:[])];
   const seen=new Set(), out=[];
   merged.forEach(e=>{ const k=e&&(e.id||`${e.uploadedAt}|${e.fileName}`); if(!k||seen.has(k)) return; seen.add(k); out.push(e); });
   out.sort((a,b)=>String(b.uploadedAt||"").localeCompare(String(a.uploadedAt||"")));
@@ -13528,7 +13577,7 @@ function hyroxDbEventSummaryHtml(){
   const rows=Object.values(agg).sort((a,b)=>b.n-a.n);
   if(!rows.length) return `<div class="divider" style="margin:14px 0;"></div>
     <div class="eyebrow gray">📦 현재 DB 구성</div>
-    <div class="empty-note">동기화된 DNA 비교 데이터가 없습니다.</div>`;
+    <div class="empty-note">Supabase 공용 DB 동기화 전이거나 조회에 실패했습니다. 잠시 후 다시 열어주세요.</div>`;
   return `<div class="divider" style="margin:14px 0;"></div>
     <div class="row-between"><div class="eyebrow gray">📦 현재 DB 구성 (대회별)</div>
       <span class="mono" style="font-size:11px;color:var(--gray-dim);">${rows.length}개 대회 · ${(EXTERNAL_RACE_DB||[]).length.toLocaleString()}건</span></div>
@@ -13545,6 +13594,13 @@ function hyroxDbEventSummaryHtml(){
     ${rows.length>60? `<p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">상위 60개 대회만 표시</p>`:""}`;
 }
 function renderModelDnaImportTab(wrap){
+  // 탭을 처음 열 때 백그라운드 동기화가 아직 끝나지 않았거나 실패한 경우에도
+  // Supabase 공용 DB를 즉시 재동기화한다. PC 업로드 → 모바일 확인 시 특히 중요하다.
+  if(sbEnabled() && (!Array.isArray(EXTERNAL_RACE_DB) || EXTERNAL_RACE_DB.length===0)){
+    syncExternalRaceDbFromSupabase().then(()=>{
+      if(EXTERNAL_RACE_DB.length) renderAll();
+    }).catch(e=>console.warn("모델설명 탭 재동기화 실패:",e));
+  }
   const dbSize = EXTERNAL_RACE_DB.length;
   const sourceLabel = { supabase:"🟢 Supabase 공용 데이터셋", local:"🟡 로컬 캐시(오프라인)", none:"⚪ 데이터 없음" }[EXTERNAL_RACE_DB_SOURCE] || "⚪ 데이터 없음";
   wrap.innerHTML = `
