@@ -11811,7 +11811,6 @@ function renderGoal(wrap){
       </div>
       <div class="grid grid-3" style="margin-top:14px;">
         ${field("목표 대회 날짜 (YYYY-MM-DD)", `<input id="goal-date" type="text" inputmode="numeric" placeholder="2026-10-04" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(p.targetDate)}">`)}
-        <div id="goal-partner-wrap" style="${p.division.includes("Doubles")?"":"display:none;"}">${field("파트너 이름 (선택)", `<input id="goal-partner" value="${escapeHtml(p.partnerName)}" placeholder="Doubles 팀 파트너">`)}</div>
       </div>
       ${divisionBase(effectiveGoalDiv)!==divisionBase(p.division) ? `<div class="reason-line" style="margin-top:10px;color:var(--orange);">🟠 목표 Division이 현재 수행 Division과 다릅니다.<br>현재 기록은 목표 Division(${effectiveGoalDiv})의 workload 기준으로 환산한 뒤 목표 기록과 비교합니다 — Division 전환 예측(${p.division} → ${effectiveGoalDiv}) 결과를 사용하며, ${p.division} 기록을 그대로 목표 계산에 쓰지 않습니다.<br><span style="color:var(--gray-dim);">현재 예상 기록 = Division 전환 후 현재 능력 추정 (오류가 아니라 Cross-Division 예측입니다)</span></div>` : ""}
       <div style="margin-top:12px;"><button class="btn sm" id="goal-save">저장</button></div>
@@ -11943,8 +11942,6 @@ function renderGoal(wrap){
     STATE.profile.goalDivision = goalDivSelected===STATE.profile.division ? "" : goalDivSelected;
     STATE.profile.targetTime=wrap.querySelector("#goal-time").value.trim();
     STATE.profile.targetDate=wrap.querySelector("#goal-date").value.trim();
-    const partnerInput=wrap.querySelector("#goal-partner");
-    if(partnerInput) STATE.profile.partnerName=partnerInput.value.trim();
     persist(); showToast("목표가 저장되었습니다"); renderAll();
   });
   wrap.querySelectorAll("[data-goal-gap-toggle]").forEach(el=>el.addEventListener("click",()=>{
@@ -12385,12 +12382,6 @@ function renderDivision(wrap){
       <div class="kv"><span class="k">기타 보정(잔차)</span><span class="v mono">${result.residual>=0?"+":""}${fmtTime(Math.abs(result.residual))}</span></div>
     </div>
 
-    <div class="card">
-      <h2 class="section-title">가장 큰 손실 3개 · 우선 훈련</h2>
-      <div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">
-        ${result.topStations.map((b,i)=>`<div class="hstack"><span class="badge high">${i+1}</span><span style="flex:1;font-size:13px;font-weight:600;">${b.label}</span><span class="mono" style="color:var(--red);">${fmtTime(Math.abs(b.direct+b.secondary))}</span></div>`).join("")}
-      </div>
-    </div>
     `}
   `;
   wrap.querySelector("#dt-from")?.addEventListener("change",(e)=>{ DIVISION_UI.from=e.target.value; renderAll(); });
@@ -12475,30 +12466,6 @@ function renderPeer(wrap){
       <div style="font-family:var(--font-display);font-size:24px;font-weight:800;margin-top:8px;">${typeLabel}</div>
       ${typeOneLiner ? `<p class="reason-line" style="font-family:var(--font-body);color:var(--white);font-size:13px;line-height:1.7;margin-top:6px;">${escapeHtml(typeOneLiner)}</p>` : ""}
     </div>
-
-    ${(() => { const dna=buildRaceDnaHistoricalCurrentProjected();
-      const labelMap={running:"러닝",engine:"심폐 지구력",strengthEnd:"힘 지속력",skill:"기술·효율",recovery:"회복",raceExec:"레이스 운영"};
-      return `<div class="card">
-        <div class="eyebrow gray">📈 능력 변화 추적 — Historical → Current → Projected</div>
-        <p class="lead" style="margin:6px 0 12px;">Historical은 실제 대회/PB 기록만 반영한 값, Current는 최근 Garmin/훈련 추세를 더한 값, Projected는 대회까지 남은 ${dna.weeksToRace}주간 현재 추세(주당 ${dna.growthPerWeek>=0?"+":""}${dna.growthPerWeek}pt)가 이어진다고 가정했을 때의 예상치입니다. Garmin 데이터가 좋아졌다고 Historical 자체가 바뀌진 않습니다 — Current만 제한적으로 움직입니다.</p>
-        <div style="display:flex;flex-direction:column;gap:10px;">
-          ${Object.entries(dna.axes).map(([key,a])=>`
-            <div style="padding:10px 0;border-bottom:1px solid var(--line);">
-              <div class="row-between"><span style="font-size:13px;font-weight:700;">${labelMap[key]}</span>
-                <span class="mono" style="font-size:10.5px;color:${a.confidence?.label==="HIGH"?"var(--green)":a.confidence?.label==="MEDIUM"?"var(--amber)":"var(--red)"};">${a.confidence?.label||"LOW"}</span></div>
-              <div class="hstack" style="gap:10px;margin-top:6px;flex-wrap:wrap;font-size:12px;">
-                ${a.hasHistoricalConcept ? `<div><span style="color:var(--gray-dim);">Historical</span> <b class="mono">${a.historical!=null?round1(a.historical):"—"}</b></div>
-                <div style="color:var(--gray-dim);">→</div>
-                <div><span style="color:var(--gray-dim);">Adj</span> <b class="mono" style="color:${a.adjustment>0?'var(--green)':a.adjustment<0?'var(--red)':'var(--gray-dim)'};">${a.adjustment!=null?(a.adjustment>=0?"+":"")+a.adjustment:"—"}</b></div>
-                <div style="color:var(--gray-dim);">→</div>` : `<div style="color:var(--gray-dim);font-style:italic;">Historical 개념 없음(훈련 추세 신호)</div><div style="color:var(--gray-dim);">→</div>`}
-                <div><span style="color:var(--gray-dim);">Current</span> <b class="mono" style="color:var(--orange);">${a.current!=null?round1(a.current):"—"}</b></div>
-                <div style="color:var(--gray-dim);">→</div>
-                <div><span style="color:var(--gray-dim);">Projected</span> <b class="mono">${a.projected!=null?round1(a.projected):"—"}</b></div>
-              </div>
-              ${!a.hasRealTierSplit && a.hasHistoricalConcept ? `<div class="reason-line" style="margin-top:4px;color:var(--gray-dim);font-size:10.5px;">※ 이 Index는 Historical/Current 구분 로직이 아직 없어 Adjustment가 항상 0으로 표시됩니다.</div>` : ""}
-            </div>`).join("")}
-        </div>
-      </div>`; })()}
 
     <div class="card">
       <h2 class="section-title">🏆 나의 강점</h2>
@@ -12590,22 +12557,22 @@ function renderPeer(wrap){
           <td class="num mono">${s.peerIsReal?`상위 ${round1(100-s.percentile)}%`:`<span class="badge ${starBadgeClass(s.star.stars)}">${"★".repeat(s.star.stars)}${"☆".repeat(5-s.star.stars)} ${s.star.label}</span>`}</td>
           <td>${peerSourceBadgeCompact(s.peerIsReal, s.peerN)}</td>
         </tr>`).join("");
-        return `<div style="overflow-x:auto;"><table style="margin-top:8px;min-width:640px;"><thead><tr><th>구간</th><th class="num">내 기록</th><th class="num">그룹 평균</th><th class="num">Z-score</th><th class="num">퍼센타일/등급</th><th>데이터 근거</th></tr></thead><tbody>
+        return `<div style="overflow-x:auto;"><table style="margin-top:8px;min-width:640px;"><thead><tr><th>구간</th><th class="num">내 기록</th><th class="num">그룹 평균</th><th class="num">퍼센타일/등급</th><th class="num">Z-score</th><th>데이터 근거</th></tr></thead><tbody>
           ${runSegsForTable.length ? `
           <tr id="peer-running-toggle-row" style="cursor:pointer;background:var(--surface2);">
             <td><b>🏃 Running</b> <span style="color:var(--gray-dim);font-size:10.5px;">(Run 1~8 평균 ${PEER_RUN_DETAIL_OPEN?"▲":"▼"})</span></td>
             <td class="num mono" style="color:var(--gray-dim);">—</td>
             <td class="num mono" style="color:var(--gray-dim);">—</td>
-            <td class="num mono">${runAvgZ!=null?(runAvgZ>=0?"+":"")+round1(runAvgZ):"—"}</td>
             <td class="num mono">${runAllReal?`상위 ${round1(100-runAvgPct)}%`:runStar?`<span class="badge ${starBadgeClass(runStar.stars)}">${"★".repeat(runStar.stars)}${"☆".repeat(5-runStar.stars)} ${runStar.label}</span>`:"—"}</td>
+            <td class="num mono">${runAvgZ!=null?(runAvgZ>=0?"+":"")+round1(runAvgZ):"—"}</td>
             <td>${peerSourceBadgeCompact(runAllReal, runMinN)}</td>
           </tr>
           ${PEER_RUN_DETAIL_OPEN ? runSegsForTable.map(s=>`<tr>
             <td style="padding-left:22px;color:var(--gray);">↳ ${s.label}</td>
             <td class="num mono">${fmtTime(s.actual)}</td>
             <td class="num mono" style="color:var(--gray-dim);">${fmtTime(s.peerMean)}</td>
-            <td class="num mono">${s.z>=0?"+":""}${round1(s.z)}</td>
             <td class="num mono">${s.peerIsReal?`상위 ${round1(100-s.percentile)}%`:`<span class="badge ${starBadgeClass(s.star.stars)}">${"★".repeat(s.star.stars)}${"☆".repeat(5-s.star.stars)} ${s.star.label}</span>`}</td>
+            <td class="num mono">${s.z>=0?"+":""}${round1(s.z)}</td>
             <td>${peerSourceBadgeCompact(s.peerIsReal, s.peerN)}</td>
           </tr>`).join("") : ""}` : ""}
           ${rowsHtml(otherSegsForTable)}
