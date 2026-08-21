@@ -11996,7 +11996,6 @@ function renderPrediction(wrap){
   const p0=inRaceCtx(()=>predictTime(hpiResult,0)), p4=inRaceCtx(()=>predictTime(hpiResult,4)),
         p8=inRaceCtx(()=>predictTime(hpiResult,8)), p12=inRaceCtx(()=>predictTime(hpiResult,12));
   const bottleneck=analyzeBottleneck(hpiResult);
-  const hist=[...STATE.hpiHistory].sort((a,b)=>a.date.localeCompare(b.date));
   const priority=computeTrainingPriority();
   // spec ①: Training Priority (Impact×Gap×...) is a pure fitness-need ranking and stays that way —
   // but near race day the ACTUAL weekly plan is safety-overridden (Taper/Race Urgency), which used to
@@ -12014,8 +12013,6 @@ function renderPrediction(wrap){
   const dLeft=daysToRace();
   const potentialWeeks = dLeft!=null ? clamp(Math.round(dLeft/7),1,20) : 12;
   const potential = inRaceCtx(()=>predictTime(hpiResult, potentialWeeks));
-  const confBadgeCls = p0.confidenceLabel==="HIGH"?"elite":p0.confidenceLabel==="MEDIUM"?"med":"crit";
-  const confColor = p0.confidenceLabel==="HIGH"?"var(--green)":p0.confidenceLabel==="MEDIUM"?"var(--amber)":"var(--red)";
   const predAcc = computePredictionAccuracy();
   const calibMult = getRangeCalibrationMultiplier();
   wrap.innerHTML = `
@@ -12033,22 +12030,7 @@ function renderPrediction(wrap){
       ${horizonCard("8주 후", p8)}
       ${horizonCard("12주 후", p12)}
     </div>
-
-    ${predictionSourceCardHtml(predDiv, p0)}
-
-    <div class="card" style="border-left:3px solid ${confColor};">
-      <div class="row-between">
-        <h2 class="section-title">데이터 신뢰도</h2>
-        <span class="badge ${confBadgeCls}">${p0.confidenceLabel} · ${round1(p0.confidence*100)}%</span>
-      </div>
-      <p class="lead" style="margin:8px 0;">예측은 현재 실제 기록(Anchor)과 모델 계산값을 이 신뢰도 비율로 블렌딩합니다 — <b style="color:var(--orange);">Predicted = Anchor×(1−신뢰도) + Model×신뢰도</b>. 데이터가 부족할수록 예측이 실제 기록에서 크게 벗어나지 않고, 데이터가 쌓일수록 모델의 판단(테스트·PB·훈련 추세)이 더 크게 반영됩니다.</p>
-      <div class="eyebrow gray" style="margin-top:10px;">Prediction에 영향을 준 데이터</div>
-      <div style="display:flex; flex-direction:column; gap:5px; margin-top:6px;">
-        ${p0.dataCategories.map(c=>`<div class="hstack" style="gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:${c.status==='green'?'var(--green)':c.status==='yellow'?'var(--amber)':'var(--red)'};"></span><span style="font-size:12px;color:var(--gray);">${escapeHtml(c.label)}</span></div>`).join("")}
-      </div>
-      ${p0.missingData.length? `<div class="reason-line" style="margin-top:10px;">추가하면 정확도가 올라가는 데이터: ${p0.missingData.map(escapeHtml).join(" · ")}</div>` : `<div class="reason-line" style="margin-top:10px; color:var(--green);">핵심 데이터가 충분히 쌓여있습니다</div>`}
-      ${p0.baseline.source.includes("추정") ? "" : `<div class="reason-line" style="margin-top:6px; color:var(--gray-dim);">Raw Model 계산값(블렌딩 전): ${fmtTime(p0.rawModelPrediction)}</div>`}
-    </div>
+    <p class="reason-line" style="color:var(--gray-dim);">이 예측이 어느 기록/Division에서 나왔는지, 데이터 신뢰도, 세부 산출 근거는 <b>모델 설명 &gt; 기록 예측</b> 탭에서 확인할 수 있습니다.</p>
 
     <div class="card">
       <h2 class="section-title">Current Ability vs Potential</h2>
@@ -12096,40 +12078,6 @@ function renderPrediction(wrap){
     </div>
 
     <div class="card">
-      <h2 class="section-title">예측 근거</h2>
-      <div class="kv"><span class="k">Baseline Source</span><span class="v">${escapeHtml(p0.baseline.source)}</span></div>
-      ${p0.baseline.recentActual? `<div class="kv"><span class="k">Recent Actual</span><span class="v">${fmtTime(p0.baseline.recentActual.value)} (${p0.baseline.recentActual.ageDays}일 전)</span></div>` : ""}
-      ${p0.baseline.bestRecentActual? `<div class="kv"><span class="k">Best Recent Actual</span><span class="v">${fmtTime(p0.baseline.bestRecentActual.value)} (${p0.baseline.bestRecentActual.ageDays}일 전, ${RECENT_ACTUAL_WINDOW_DAYS}일 이내 최고 기록)</span></div>` : ""}
-      ${p0.baseline.segmentEstimate? `<div class="kv"><span class="k">Segment Estimate</span><span class="v">${fmtTime(p0.baseline.segmentEstimate.value)}</span></div>` : ""}
-      ${p0.baseline.simulationEstimate? `<div class="kv"><span class="k">Simulation</span><span class="v">${fmtTime(p0.baseline.simulationEstimate.value)} (${p0.baseline.simulationEstimate.type}, ${p0.baseline.simulationEstimate.ageDays}일 전${p0.baseline.simulationUsed?`, 반영 ${Math.round(p0.baseline.simulationWeight*100)}%`:", 신뢰도 낮아 미반영"})</span></div>` : ""}
-      <div class="kv"><span class="k">Current Anchor</span><span class="v">${fmtTime(p0.baseline.value)}</span></div>
-      ${p0.baseline.anchorNote? `<div class="reason-line" style="margin-top:2px;color:var(--amber);">${escapeHtml(p0.baseline.anchorNote)}</div>` : ""}
-      <div class="kv"><span class="k">HPI</span><span class="v">${round1(hpiResult.hpi)}</span></div>
-      <div class="kv"><span class="k">주간 HPI 성장률</span><span class="v">${hpiTrendPerWeek()!=null? round1(hpiTrendPerWeek())+"/주 (실측)" : round1(defaultWeeklyGrowth(currentPhase()))+"/주 (구간 기본값)"}</span></div>
-      <div class="kv"><span class="k">Tier 2(훈련 트렌드) 기여분</span><span class="v">${round1(p0.tier2Gap)}pt ${Math.abs(p0.tier2Gap*Number(STATE.settings.improvementPerHpiPoint)/100)>0.04?"→ ±4% 상한 적용됨":"(상한 이내)"}</span></div>
-      <div class="kv"><span class="k">현실적 범위 (신뢰도 반영)</span><span class="v">${fmtTime(p0.ciLow)} ~ ${fmtTime(p0.ciHigh)}</span></div>
-      <div class="kv"><span class="k">최근 개선 추세</span><span class="v">${trendQualitativeLabel().emoji} ${trendQualitativeLabel().label}</span></div>
-      <div class="kv"><span class="k">Prediction Confidence</span><span class="v">${p0.confidenceLabel} (${round1(p0.confidence*100)}%)</span></div>
-      <div class="kv"><span class="k">Prediction Bias Calibration</span><span class="v">${p4.biasCalibration.applied? `Median Bias ${p4.biasCalibration.medianBiasSec>=0?"+":""}${round1(p4.biasCalibration.medianBiasSec)}초 → Forecast에 ${p4.biasCalibration.adjustmentSec>=0?"+":""}${round1(p4.biasCalibration.adjustmentSec)}초 적용 (n=${p4.biasCalibration.n})` : `표본 부족 (n=${p4.biasCalibration.n}/${PREDICTION_BIAS_MIN_SAMPLES}) — 보정 없음`}</span></div>
-      <div class="kv"><span class="k">Forecast Adjustment (4주)</span><span class="v">${fmtTime(p4.predicted)} − ${fmtTime(p0.predicted)} = ${p4.predicted-p0.predicted>=0?"+":""}${round1(p4.predicted-p0.predicted)}초</span></div>
-      <div class="divider" style="margin:10px 0;"></div>
-      <p class="lead">계산식: <span class="mono">현재(0주) = Current Anchor (미래 요소 미적용)</span> · <span class="mono">N주 후 = Anchor×(1−Confidence) + ModelPrediction×Confidence + Bias Calibration</span>. Anchor는 최근 실제 대회 기록/Segment 모델 중 데이터 신뢰도가 높은 쪽(실제 기록 보호 로직 포함), ModelPrediction은 ΔHPI×k(Tier2 상한 포함) 기반 원시 계산값입니다. Confidence는 단순 입력 개수가 아니라 항목별 중요도 가중합으로 계산합니다. 범위 폭도 Race Execution Index뿐 아니라 이 신뢰도에 반비례해 넓어지거나 좁아집니다.</p>
-    </div>
-
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">예측 정확도 추적 (Prediction Accuracy)</h2>${predAcc.sufficient? `<span class="mono" style="font-size:10.5px;color:var(--gray-dim);">매칭된 예측 ${predAcc.matchedCount}건</span>` : ""}</div>
-      ${predAcc.sufficient ? `
-      <p class="lead" style="margin:6px 0 12px;">과거 저장된 Prediction 스냅샷을 이후 실제로 나온 다음 HYROX 기록과 비교합니다. Range 폭은 이 실측 오차 데이터가 쌓일수록 아래 Coverage 값 기준으로 자동 보정됩니다(임의 축소 없음).</p>
-      <div class="grid grid-3">
-        ${statCard("평균 절대 오차 (MAE)", fmtTime(predAcc.maeSec), `${predAcc.matchedCount}건 기준`, "var(--white)")}
-        ${statCard("중앙값 오차", `${predAcc.medianErrorSec>=0?"+":"-"}${fmtTime(Math.abs(predAcc.medianErrorSec))}`, predAcc.medianErrorSec>=0?"실제가 더 느림":"실제가 더 빠름", predAcc.medianErrorSec>=0?"var(--red)":"var(--green)")}
-        ${predAcc.coverage!=null? statCard("Range 적중률 (Coverage)", `${round1(predAcc.coverage*100)}%`, `${predAcc.coverageSampleSize}건 중 · 목표 ${round1(PREDICTION_TARGET_COVERAGE*100)}%`, "var(--orange)") : statCard("Range 적중률", "N/A", "range 없는 스냅샷만 매칭됨", "var(--gray-dim)")}
-      </div>
-      <div class="reason-line" style="margin-top:10px;">현재 Range 폭 보정 배율: <b style="color:var(--orange);">×${round1(calibMult)}</b> ${calibMult===1?"(최소 표본 미달 또는 목표 Coverage 근접 — 기본값 유지)":calibMult>1?"(실측 Coverage가 목표보다 낮아 range를 넓혔습니다)":"(실측 Coverage가 목표보다 높아 range를 좁혔습니다)"}</div>
-      ` : `<div class="empty-note">Prediction 스냅샷과 그 이후 실제 대회 기록이 최소 2쌍 이상 쌓여야 정확도를 계산할 수 있습니다 (현재 매칭 ${predAcc.matchedCount}건). 훈련 기록·대회 기록을 입력할 때마다 예측 스냅샷이 자동 저장됩니다.</div>`}
-    </div>
-
-    <div class="card">
       <h2 class="section-title">목표 시나리오 (A/B/C)</h2>
       ${!goals.hasRaceDate? `<p class="reason-line" style="color:var(--amber);margin-bottom:8px;">대회 날짜가 설정되지 않아 4/8/12주 기본 구간으로 계산되었습니다.</p>` : ""}
       <div class="grid grid-3" style="margin-top:10px;">
@@ -12149,6 +12097,19 @@ function renderPrediction(wrap){
       </div>
     </div>
 
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">예측 정확도 추적 (Prediction Accuracy)</h2>${predAcc.sufficient? `<span class="mono" style="font-size:10.5px;color:var(--gray-dim);">매칭된 예측 ${predAcc.matchedCount}건</span>` : ""}</div>
+      ${predAcc.sufficient ? `
+      <p class="lead" style="margin:6px 0 12px;">과거 저장된 Prediction 스냅샷을 이후 실제로 나온 다음 HYROX 기록과 비교합니다. Range 폭은 이 실측 오차 데이터가 쌓일수록 아래 Coverage 값 기준으로 자동 보정됩니다(임의 축소 없음).</p>
+      <div class="grid grid-3">
+        ${statCard("평균 절대 오차 (MAE)", fmtTime(predAcc.maeSec), `${predAcc.matchedCount}건 기준`, "var(--white)")}
+        ${statCard("중앙값 오차", `${predAcc.medianErrorSec>=0?"+":"-"}${fmtTime(Math.abs(predAcc.medianErrorSec))}`, predAcc.medianErrorSec>=0?"실제가 더 느림":"실제가 더 빠름", predAcc.medianErrorSec>=0?"var(--red)":"var(--green)")}
+        ${predAcc.coverage!=null? statCard("Range 적중률 (Coverage)", `${round1(predAcc.coverage*100)}%`, `${predAcc.coverageSampleSize}건 중 · 목표 ${round1(PREDICTION_TARGET_COVERAGE*100)}%`, "var(--orange)") : statCard("Range 적중률", "N/A", "range 없는 스냅샷만 매칭됨", "var(--gray-dim)")}
+      </div>
+      <div class="reason-line" style="margin-top:10px;">현재 Range 폭 보정 배율: <b style="color:var(--orange);">×${round1(calibMult)}</b> ${calibMult===1?"(최소 표본 미달 또는 목표 Coverage 근접 — 기본값 유지)":calibMult>1?"(실측 Coverage가 목표보다 낮아 range를 넓혔습니다)":"(실측 Coverage가 목표보다 높아 range를 좁혔습니다)"}</div>
+      ` : `<div class="empty-note">Prediction 스냅샷과 그 이후 실제 대회 기록이 최소 2쌍 이상 쌓여야 정확도를 계산할 수 있습니다 (현재 매칭 ${predAcc.matchedCount}건). 훈련 기록·대회 기록을 입력할 때마다 예측 스냅샷이 자동 저장됩니다.</div>`}
+    </div>
+
     ${attribution ? `<div class="card">
       <div class="row-between"><h2 class="section-title">Prediction Attribution</h2><span class="mono" style="font-size:10.5px;color:var(--gray-dim);">${attribution.fromDate} → ${attribution.toDate}</span></div>
       <p class="lead" style="margin:6px 0 10px;">최근 두 스냅샷 사이 예상 기록이 왜 바뀌었는지 <b style="color:var(--orange);">구간(segment)별</b>로 분해합니다 (Running/Sled Push/Wall Ball 등 개별 구간까지 — 대응되는 구간 실측 데이터가 없는 지표는 지표 단위로 표시).</p>
@@ -12158,11 +12119,6 @@ function renderPrediction(wrap){
       <div class="divider" style="margin:10px 0;"></div>
       <div class="kv"><span class="k">합계</span><span class="v mono" style="color:${attribution.totalTimeImpact<=0?'var(--green)':'var(--red)'}">${attribution.totalTimeImpact<=0?"-":"+"}${fmtTime(Math.abs(attribution.totalTimeImpact))}</span></div>
     </div>` : `<div class="card"><div class="empty-note">스냅샷이 2개 이상 쌓이면(대회·훈련기록·테스트 추가 시 자동 기록) 예상 기록 변화 원인을 구간별로 분해해서 보여드립니다.</div></div>`}
-
-    <div class="card">
-      <h2 class="section-title">HPI 추이</h2>
-      ${hist.length? svgLineTrend(hist.map(h=>({x:new Date(h.date).getTime(), y:h.hpi})), 700, 160, {minY:0,maxY:100}) : `<div class="empty-note">기록을 입력하면 HPI 히스토리가 자동으로 쌓입니다</div>`}
-    </div>
 
     ${(() => {
       // PHASE 5 STEP 4-C — Candidate/Debug ONLY. NOT the Production prediction (that's still the
@@ -12927,6 +12883,7 @@ function renderModel(wrap){
       <div class="tab ${MODEL_TAB==="plan"?"active":""}" data-model-tab="plan">훈련계획 (코치 사고 과정)</div>
       <div class="tab ${MODEL_TAB==="dna"?"active":""}" data-model-tab="dna">DNA 데이터</div>
       <div class="tab ${MODEL_TAB==="podium"?"active":""}" data-model-tab="podium">포디움 산출근거</div>
+      <div class="tab ${MODEL_TAB==="prediction"?"active":""}" data-model-tab="prediction">기록 예측</div>
     </div>
     <div id="model-tab-body"></div>
   `;
@@ -12936,6 +12893,7 @@ function renderModel(wrap){
   else if(MODEL_TAB==="plan") renderModelPlanningTab(body);
   else if(MODEL_TAB==="dna") renderModelDnaImportTab(body);
   else if(MODEL_TAB==="podium") renderModelPodiumBasisTab(body);
+  else if(MODEL_TAB==="prediction") renderModelPredictionBasisTab(body);
   else renderModelExplainTab(body);
 }
 
@@ -13021,6 +12979,56 @@ function podiumBasisRowsHtml(rows){
     </div>`;
   }).join("");
 }
+// "기록 예측" 탭 — 기록 예측 페이지에 있던 "현재 예측 기준 / 데이터 신뢰도 / 예측 근거" 3개
+// 카드를 이쪽으로 옮긴 것 (포디움 산출근거 탭과 동일한 패턴: 결과 화면은 요약만 보여주고,
+// 상세 산출 근거는 모델 설명 쪽에서 확인).
+function renderModelPredictionBasisTab(wrap){
+  const hpiResult=calcHPI();
+  const predDiv = normalizeRaceDivision(STATE.profile.division) || "Open";
+  const inRaceCtx = (fn)=>withPredictionContext({mode:"race", division:predDiv}, fn);
+  const p0=inRaceCtx(()=>predictTime(hpiResult,0)), p4=inRaceCtx(()=>predictTime(hpiResult,4));
+  const confBadgeCls = p0.confidenceLabel==="HIGH"?"elite":p0.confidenceLabel==="MEDIUM"?"med":"crit";
+  const confColor = p0.confidenceLabel==="HIGH"?"var(--green)":p0.confidenceLabel==="MEDIUM"?"var(--amber)":"var(--red)";
+  wrap.innerHTML = `
+    ${predictionSourceCardHtml(predDiv, p0)}
+
+    <div class="card" style="border-left:3px solid ${confColor};">
+      <div class="row-between">
+        <h2 class="section-title">데이터 신뢰도</h2>
+        <span class="badge ${confBadgeCls}">${p0.confidenceLabel} · ${round1(p0.confidence*100)}%</span>
+      </div>
+      <p class="lead" style="margin:8px 0;">예측은 현재 실제 기록(Anchor)과 모델 계산값을 이 신뢰도 비율로 블렌딩합니다 — <b style="color:var(--orange);">Predicted = Anchor×(1−신뢰도) + Model×신뢰도</b>. 데이터가 부족할수록 예측이 실제 기록에서 크게 벗어나지 않고, 데이터가 쌓일수록 모델의 판단(테스트·PB·훈련 추세)이 더 크게 반영됩니다.</p>
+      <div class="eyebrow gray" style="margin-top:10px;">Prediction에 영향을 준 데이터</div>
+      <div style="display:flex; flex-direction:column; gap:5px; margin-top:6px;">
+        ${p0.dataCategories.map(c=>`<div class="hstack" style="gap:8px;"><span style="width:8px;height:8px;border-radius:50%;background:${c.status==='green'?'var(--green)':c.status==='yellow'?'var(--amber)':'var(--red)'};"></span><span style="font-size:12px;color:var(--gray);">${escapeHtml(c.label)}</span></div>`).join("")}
+      </div>
+      ${p0.missingData.length? `<div class="reason-line" style="margin-top:10px;">추가하면 정확도가 올라가는 데이터: ${p0.missingData.map(escapeHtml).join(" · ")}</div>` : `<div class="reason-line" style="margin-top:10px; color:var(--green);">핵심 데이터가 충분히 쌓여있습니다</div>`}
+      ${p0.baseline.source.includes("추정") ? "" : `<div class="reason-line" style="margin-top:6px; color:var(--gray-dim);">Raw Model 계산값(블렌딩 전): ${fmtTime(p0.rawModelPrediction)}</div>`}
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">예측 근거</h2>
+      <div class="kv"><span class="k">Baseline Source</span><span class="v">${escapeHtml(p0.baseline.source)}</span></div>
+      ${p0.baseline.recentActual? `<div class="kv"><span class="k">Recent Actual</span><span class="v">${fmtTime(p0.baseline.recentActual.value)} (${p0.baseline.recentActual.ageDays}일 전)</span></div>` : ""}
+      ${p0.baseline.bestRecentActual? `<div class="kv"><span class="k">Best Recent Actual</span><span class="v">${fmtTime(p0.baseline.bestRecentActual.value)} (${p0.baseline.bestRecentActual.ageDays}일 전, ${RECENT_ACTUAL_WINDOW_DAYS}일 이내 최고 기록)</span></div>` : ""}
+      ${p0.baseline.segmentEstimate? `<div class="kv"><span class="k">Segment Estimate</span><span class="v">${fmtTime(p0.baseline.segmentEstimate.value)}</span></div>` : ""}
+      ${p0.baseline.simulationEstimate? `<div class="kv"><span class="k">Simulation</span><span class="v">${fmtTime(p0.baseline.simulationEstimate.value)} (${p0.baseline.simulationEstimate.type}, ${p0.baseline.simulationEstimate.ageDays}일 전${p0.baseline.simulationUsed?`, 반영 ${Math.round(p0.baseline.simulationWeight*100)}%`:", 신뢰도 낮아 미반영"})</span></div>` : ""}
+      <div class="kv"><span class="k">Current Anchor</span><span class="v">${fmtTime(p0.baseline.value)}</span></div>
+      ${p0.baseline.anchorNote? `<div class="reason-line" style="margin-top:2px;color:var(--amber);">${escapeHtml(p0.baseline.anchorNote)}</div>` : ""}
+      <div class="kv"><span class="k">HPI</span><span class="v">${round1(hpiResult.hpi)}</span></div>
+      <div class="kv"><span class="k">주간 HPI 성장률</span><span class="v">${hpiTrendPerWeek()!=null? round1(hpiTrendPerWeek())+"/주 (실측)" : round1(defaultWeeklyGrowth(currentPhase()))+"/주 (구간 기본값)"}</span></div>
+      <div class="kv"><span class="k">Tier 2(훈련 트렌드) 기여분</span><span class="v">${round1(p0.tier2Gap)}pt ${Math.abs(p0.tier2Gap*Number(STATE.settings.improvementPerHpiPoint)/100)>0.04?"→ ±4% 상한 적용됨":"(상한 이내)"}</span></div>
+      <div class="kv"><span class="k">현실적 범위 (신뢰도 반영)</span><span class="v">${fmtTime(p0.ciLow)} ~ ${fmtTime(p0.ciHigh)}</span></div>
+      <div class="kv"><span class="k">최근 개선 추세</span><span class="v">${trendQualitativeLabel().emoji} ${trendQualitativeLabel().label}</span></div>
+      <div class="kv"><span class="k">Prediction Confidence</span><span class="v">${p0.confidenceLabel} (${round1(p0.confidence*100)}%)</span></div>
+      <div class="kv"><span class="k">Prediction Bias Calibration</span><span class="v">${p4.biasCalibration.applied? `Median Bias ${p4.biasCalibration.medianBiasSec>=0?"+":""}${round1(p4.biasCalibration.medianBiasSec)}초 → Forecast에 ${p4.biasCalibration.adjustmentSec>=0?"+":""}${round1(p4.biasCalibration.adjustmentSec)}초 적용 (n=${p4.biasCalibration.n})` : `표본 부족 (n=${p4.biasCalibration.n}/${PREDICTION_BIAS_MIN_SAMPLES}) — 보정 없음`}</span></div>
+      <div class="kv"><span class="k">Forecast Adjustment (4주)</span><span class="v">${fmtTime(p4.predicted)} − ${fmtTime(p0.predicted)} = ${p4.predicted-p0.predicted>=0?"+":""}${round1(p4.predicted-p0.predicted)}초</span></div>
+      <div class="divider" style="margin:10px 0;"></div>
+      <p class="lead">계산식: <span class="mono">현재(0주) = Current Anchor (미래 요소 미적용)</span> · <span class="mono">N주 후 = Anchor×(1−Confidence) + ModelPrediction×Confidence + Bias Calibration</span>. Anchor는 최근 실제 대회 기록/Segment 모델 중 데이터 신뢰도가 높은 쪽(실제 기록 보호 로직 포함), ModelPrediction은 ΔHPI×k(Tier2 상한 포함) 기반 원시 계산값입니다. Confidence는 단순 입력 개수가 아니라 항목별 중요도 가중합으로 계산합니다. 범위 폭도 Race Execution Index뿐 아니라 이 신뢰도에 반비례해 넓어지거나 좁아집니다.</p>
+    </div>
+  `;
+}
+
 // 실제 HYROX 결과 DB 가져오기 — Race DNA 페이지에서 여기로 이동 (DNA 페이지는 분석 결과만 보여주고,
 // 데이터 관리는 모델 설명 쪽 탭에서 하도록 분리).
 
