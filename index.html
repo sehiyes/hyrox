@@ -7516,7 +7516,7 @@ const NAV = [
   { group:"Engine Output", items:[
     { id:"prediction", label:"기록 예측", ico:"▲" },
     { id:"goal", label:"목표 설정", ico:"◆" },
-    { id:"peer", label:"동일 그룹 비교 (Race DNA)", ico:"◈" },
+    { id:"peer", label:"Race DNA", ico:"◈" },
     { id:"division", label:"Division 전환 예측", ico:"⇄" },
     { id:"plan", label:"주간 훈련계획", ico:"▦" },
   ]},
@@ -7534,12 +7534,15 @@ function renderNav(){
   `).join("");
   el.querySelectorAll(".nav-item").forEach(n=>n.addEventListener("click",()=>{ CURRENT_PAGE=n.dataset.page; setMobileMenu(false); renderAll(); }));
 }
-// spec (모바일 개편): 하단 고정 3탭 — 기록/DNA/목표. 데스크톱 사이드바(NAV)는 그대로 두고 전체 메뉴에도
+// spec (모바일 개편): 하단 고정 3탭 — 기록/DNA/포디움. 데스크톱 사이드바(NAV)는 그대로 두고 전체 메뉴에도
 // 계속 접근 가능하게 유지 — "메인 메뉴에서 숨김"이지 "기능 삭제"가 아니라는 원칙 그대로.
 const BOTTOM_NAV_ITEMS = [
-  { id:"myrecord", label:"기록", ico:"🏠" },
+  // 기록 탭은 집(🏠)이 아니라 HYROX 종목을 연상시키는 아이콘으로. 이 페이지가 홈이 아니라
+  // "내 경기 기록"이라는 걸 아이콘만 봐도 알 수 있게 한다.
+  { id:"myrecord", label:"기록", ico:"🏋️" },
   { id:"mydna", label:"DNA", ico:"🧬" },
-  { id:"mygoal", label:"목표", ico:"🎯" },
+  // 이 페이지의 핵심 산출물이 "포디움 가능성"이므로 라벨을 실제 내용에 맞춘다.
+  { id:"mygoal", label:"포디움", ico:"🏆" },
 ];
 function renderBottomNav(){
   const el=document.getElementById("bottom-nav");
@@ -12157,87 +12160,6 @@ function renderPrediction(wrap){
     </div>` : `<div class="card"><div class="empty-note">스냅샷이 2개 이상 쌓이면(대회·훈련기록·테스트 추가 시 자동 기록) 예상 기록 변화 원인을 구간별로 분해해서 보여드립니다.</div></div>`}
 
     <div class="card">
-      <div class="row-between"><h2 class="section-title">능력 요약 — 무엇이 강하고 무엇을 개선해야 할까요?</h2></div>
-      ${overrideRuleLabel ? `<div class="reason-line" style="background:rgba(255,176,32,.10);border:1px solid var(--amber);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--amber);">⚠ <b>대회까지 ${dLeft}일 — ${overrideRuleLabel.id==="TAP-2"?"Race Week":"Taper"} 안전 우선 구간입니다.</b> 아래 순위는 평소처럼 "체력상 무엇이 부족한가"를 계산한 결과이며, 실제 이번 주 훈련은 이 순위와 무관하게 부상 방지·회복을 최우선으로 가볍게(Shakeout/Easy 위주) 구성됩니다. 예를 들어 지금 Running이 1순위로 나와도 실제 계획에 Threshold/Interval이 배정되지 않는 게 정상입니다.</div>` : ""}
-      <p class="lead" style="margin:6px 0 12px;">아래 점수는 <b style="color:var(--orange);">이 시스템이 계산한 능력 점수(0~100)</b>이며, 다른 선수와 비교한 percentile/순위가 아닙니다. 점수가 높을수록 해당 능력이 좋습니다. 실제 선수 DB와 비교한 percentile은 "동일 그룹 비교" 페이지에서 별도로 확인할 수 있습니다.</p>
-      <div style="display:flex;flex-direction:column;gap:10px;">
-        ${priority.map((p,i)=>{
-          const meta=INDEX_META[p.key], band=indexStatusBand(p.score), infl=indexInfluenceLabel(i);
-          const conf=hpiResult.indices[p.key]?.confidence;
-          return `<div class="card tight" style="background:var(--surface2);border-left:3px solid ${band.color};">
-            <div class="row-between" style="align-items:flex-start;">
-              <div>
-                <div style="font-size:15px;font-weight:800;" title="${meta.label}">${meta.emoji} ${meta.friendly}</div>
-                <div class="mono" style="font-size:13px;margin-top:2px;">${p.score!=null?`${round1(p.score)}점`:"데이터 부족"} <span style="color:${band.color};">· ${band.label}</span></div>
-                ${conf ? `<div class="mono" style="font-size:10.5px;margin-top:2px;color:var(--gray-dim);">신뢰도: <span style="color:${conf.label==="HIGH"?"var(--green)":conf.label==="MEDIUM"?"var(--amber)":"var(--red)"};font-weight:700;">${conf.label}</span> (근거 데이터 ${conf.coverageCount}/${conf.coverageTotal})</div>` : ""}
-              </div>
-              <div style="text-align:right;">
-                <div style="font-size:10px;color:var(--gray-dim);">목표 기록 영향</div>
-                <div style="font-size:13px;font-weight:700;color:${infl.color};">${infl.label}</div>
-              </div>
-            </div>
-            <div style="margin-top:8px;font-size:12.5px;color:var(--gray);line-height:1.6;"><b style="color:var(--white);">현재:</b> ${escapeHtml(indexCurrentStatement(p.key,p.score))}</div>
-            <div style="margin-top:4px;font-size:12.5px;color:var(--gray);line-height:1.6;"><b style="color:var(--white);">추천:</b> ${escapeHtml(INDEX_STATIC_TRAINING_HINT[p.key])}</div>
-          </div>`;
-        }).join("")}
-      </div>
-      <p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">※ 90~100 매우 강점 · 80~89 강점 · 70~79 양호 · 60~69 개선 여지 · 0~59 주요 개선 영역 (이 시스템 내 능력 점수 해석 기준이며, 다른 선수 대비 등급이 아닙니다). 신뢰도는 점수와 별개로 "이 점수를 뒷받침하는 실제 데이터가 얼마나 있는가"를 나타냅니다 — 같은 점수라도 신뢰도가 낮으면 실제와 다를 수 있습니다.</p>
-    </div>
-
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">훈련 우선순위 (상세)</h2><span class="mono" style="font-size:10.5px;color:var(--gray-dim);">Impact × Gap × Trainability × Urgency × Specificity × Recovery</span></div>
-      ${overrideRuleLabel ? `<p class="reason-line" style="color:var(--amber);margin:4px 0 8px;">⚠ 이 순위는 안전 override(${overrideRuleLabel.id})와 무관하게 계산된 "체력 필요도" 순위입니다 — 실제 이번 주 훈련 구성은 아래 순위가 아니라 안전 우선순위를 따릅니다.</p>` : ""}
-      <div style="display:flex;flex-direction:column;gap:6px;margin:8px 0 14px;">
-        ${narrativeParts.map(p=>`<div style="font-family:var(--font-body);color:var(--white);font-size:13px;line-height:1.6;">✅ ${escapeHtml(p)}</div>`).join("")}
-      </div>
-      <table><thead><tr><th>순위</th><th>영역</th><th class="num">점수</th><th class="num">개선여지</th><th class="num">레이스 비중</th><th class="num">8주 추세</th></tr></thead><tbody>
-        ${priority.map((p,i)=>`<tr>
-          <td class="mono">${i+1}</td>
-          <td title="${p.label}">${INDEX_META[p.key].emoji} ${INDEX_META[p.key].friendly}${p.sufficient?` <span class="badge elite" style="margin-left:4px;">충분</span>`:""}</td>
-          <td class="num mono">${p.score!=null?`${round1(p.score)}점`:"—"}</td>
-          <td class="num mono">${round1(p.headroom)}</td>
-          <td class="num mono">${Math.round(p.impactWeight*100)}%</td>
-          <td class="num mono" style="color:${p.trend==null?'var(--gray-dim)':p.trend>0?'var(--green)':'var(--red)'}">${p.trend==null?"데이터 부족":(p.trend>=0?"+":"")+round1(p.trend)+"/주"}</td>
-        </tr>
-        <tr><td></td><td colspan="5" style="padding:2px 4px 10px;font-size:10.5px;color:var(--gray-dim);font-family:var(--font-mono);">Impact ${round1(p.v3.raceImpact*100)}% · Gap ${round1(p.v3.performanceGap*100)}% · Trainability ${round1(p.v3.trainability*100)}% · Urgency ${round1(p.v3.urgency*100)}% · Specificity ${round1(p.v3.specificity*100)}% · Recovery ${round1(p.v3.recoveryModifier*100)}% → <span style="color:var(--orange);">Priority ${round1(p.priorityScore)}</span></td></tr>`).join("")}
-      </tbody></table>
-      <p class="lead" style="margin-top:10px;">"8주 추세"는 최근 컨디션(ACWR ${acwr!=null?round1(acwr):"N/A"})과는 별개로, 지난 8주간 이 지표가 실제로 향상됐는지를 봅니다 — "최근에 잘했다"와 "실력이 늘었다"는 다르게 판단합니다. Specificity는 목표 기록을 입력한 경우 실제 Target Gap 중 이 영역이 차지하는 비중을, 목표가 없으면 전체 레이스 비중을 사용합니다.</p>
-    </div>
-
-    ${degradation.length? `<div class="card">
-      <h2 class="section-title">Station-induced Run Degradation</h2>
-      <p class="lead" style="margin:6px 0 10px;">최근 대회에서 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지 (해당 스테이션의 피로가 다음 Run으로 넘어간 정도).</p>
-      <table><thead><tr><th>스테이션</th><th class="num">직후 Run</th><th class="num">평균 Run</th><th class="num">저하</th></tr></thead><tbody>
-        ${degradation.map(d=>`<tr><td>${d.label}</td><td class="num mono">${fmtTime(d.afterRunSec)}</td><td class="num mono" style="color:var(--gray-dim);">${fmtTime(d.baselineSec)}</td><td class="num mono" style="color:${d.degradationSec>0?'var(--red)':'var(--green)'}">${d.degradationSec>=0?"+":""}${fmtTime(Math.abs(d.degradationSec))}</td></tr>`).join("")}
-      </tbody></table>
-      ${(() => { const rex=analyzeRaceExecution(race); if(!rex) return "";
-        const dCls={good:"elite",station:"crit",mixed:"med",pacing:"low"}[rex.diagnosis.key];
-        return `<div class="divider" style="margin:10px 0;"></div>
-        <div class="row-between"><span class="eyebrow gray">Run1→Run8 진단</span><span class="badge ${dCls}">${escapeHtml(rex.diagnosis.label)}</span></div>
-        <p class="reason-line" style="margin-top:6px;">Run1 ${fmtTime(parseTimeToSec(race.runs?.[1]))} → Run8 ${fmtTime(parseTimeToSec(race.runs?.[8]))} (${rex.fadeSec>=0?"+":""}${fmtTime(Math.abs(rex.fadeSec))}, ${round1(rex.fadePct)}%). ${escapeHtml(rex.diagnosis.detail)}</p>`; })()}
-    </div>` : ""}
-
-    <div class="card">
-      <h2 class="section-title">개선 필요 구간 상세</h2>
-      ${(() => { const peer=computePeerAnalysis();
-        if(peer){
-          const items=peer.impactList.filter(c=>c.timeLoss>0).map(c=>({label:c.label, gapPct:c.impactPct}));
-          return `<p class="lead" style="margin-bottom:6px;">DNA · 동일 그룹 비교 영향도(%) 기준</p>${svgBottleneckBars(items)}`;
-        }
-        return `${svgBottleneckBars(bottleneck.items)}
-        ${bottleneck.worstIndex? `<p class="lead" style="margin-top:10px;">가장 낮은 능력 점수: <b style="color:var(--orange)" title="${INDEX_META[bottleneck.worstIndex.key].label}">${INDEX_META[bottleneck.worstIndex.key].emoji} ${INDEX_META[bottleneck.worstIndex.key].friendly}</b> (${round1(bottleneck.worstIndex.score)}점) — 개선 시 HPI 기여도가 가장 큽니다.</p>`:""}`; })()}
-    </div>
-
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">개선 가능성이 큰 구간</h2></div>
-      ${(() => { const rank=getDnaWeaknessRanking(3);
-        return `<p class="lead" style="margin-bottom:10px;">예상 기록 ${fmtTime(p0.predicted)}에 가장 큰 영향을 주는 구간 (${rank.source==="dna"?"DNA 기준":"훈련 우선순위 기준"})</p>
-        <div class="hstack" style="gap:8px;flex-wrap:wrap;">
-          ${rank.items.length? rank.items.map(it=>`<span class="badge crit">${escapeHtml(it.label)}</span>`).join("") : `<span class="empty-note">데이터가 더 쌓이면 표시됩니다</span>`}
-        </div>`; })()}
-    </div>
-
-    <div class="card">
       <h2 class="section-title">HPI 추이</h2>
       ${hist.length? svgLineTrend(hist.map(h=>({x:new Date(h.date).getTime(), y:h.hpi})), 700, 160, {minY:0,maxY:100}) : `<div class="empty-note">기록을 입력하면 HPI 히스토리가 자동으로 쌓입니다</div>`}
     </div>
@@ -12416,11 +12338,110 @@ function peerSourceBadgeCompact(isReal, n){
     ? `<span class="badge elite" style="font-size:10px;">🟢 REAL · n=${n}</span>`
     : `<span class="badge med" style="font-size:10px;">🟡 ESTIMATE</span>`;
 }
+/* 기록 예측 페이지에 있던 "개선 분석" 5개 블록을 Race DNA 페이지로 옮긴 것.
+   원래 renderPrediction()의 지역변수에 의존하고 있어서, 필요한 값을 여기서 직접 계산한다. */
+function improvementAnalysisHtml(){
+  const hpiResult=calcHPI();
+  const predDiv = normalizeRaceDivision(STATE.profile.division) || "Open";
+  const p0=withPredictionContext({mode:"race", division:predDiv}, ()=>predictTime(hpiResult,0));
+  const bottleneck=analyzeBottleneck(hpiResult);
+  const priority=computeTrainingPriority();
+  const ruleResultForOverride=evaluateRules();
+  const overrideRuleLabel = ruleResultForOverride.fired.find(r=>["TAP-1","TAP-2","RACE-1"].includes(r.id));
+  const narrativeParts=[...buildLimitingFactorNarrative(priority,true), ...fitnessProfileNarrative(true)];
+  const race=latestRace();
+  const degradation=computeStationInducedDegradation(race);
+  const acwr=calcACWR();
+  const p=STATE.profile;
+  return `
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">능력 요약 — 무엇이 강하고 무엇을 개선해야 할까요?</h2></div>
+      ${overrideRuleLabel ? `<div class="reason-line" style="background:rgba(255,176,32,.10);border:1px solid var(--amber);border-radius:8px;padding:10px 12px;margin-bottom:10px;color:var(--amber);">⚠ <b>대회까지 ${dLeft}일 — ${overrideRuleLabel.id==="TAP-2"?"Race Week":"Taper"} 안전 우선 구간입니다.</b> 아래 순위는 평소처럼 "체력상 무엇이 부족한가"를 계산한 결과이며, 실제 이번 주 훈련은 이 순위와 무관하게 부상 방지·회복을 최우선으로 가볍게(Shakeout/Easy 위주) 구성됩니다. 예를 들어 지금 Running이 1순위로 나와도 실제 계획에 Threshold/Interval이 배정되지 않는 게 정상입니다.</div>` : ""}
+      <p class="lead" style="margin:6px 0 12px;">아래 점수는 <b style="color:var(--orange);">이 시스템이 계산한 능력 점수(0~100)</b>이며, 다른 선수와 비교한 percentile/순위가 아닙니다. 점수가 높을수록 해당 능력이 좋습니다. 실제 선수 DB와 비교한 percentile은 "동일 그룹 비교" 페이지에서 별도로 확인할 수 있습니다.</p>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        ${priority.map((p,i)=>{
+          const meta=INDEX_META[p.key], band=indexStatusBand(p.score), infl=indexInfluenceLabel(i);
+          const conf=hpiResult.indices[p.key]?.confidence;
+          return `<div class="card tight" style="background:var(--surface2);border-left:3px solid ${band.color};">
+            <div class="row-between" style="align-items:flex-start;">
+              <div>
+                <div style="font-size:15px;font-weight:800;" title="${meta.label}">${meta.emoji} ${meta.friendly}</div>
+                <div class="mono" style="font-size:13px;margin-top:2px;">${p.score!=null?`${round1(p.score)}점`:"데이터 부족"} <span style="color:${band.color};">· ${band.label}</span></div>
+                ${conf ? `<div class="mono" style="font-size:10.5px;margin-top:2px;color:var(--gray-dim);">신뢰도: <span style="color:${conf.label==="HIGH"?"var(--green)":conf.label==="MEDIUM"?"var(--amber)":"var(--red)"};font-weight:700;">${conf.label}</span> (근거 데이터 ${conf.coverageCount}/${conf.coverageTotal})</div>` : ""}
+              </div>
+              <div style="text-align:right;">
+                <div style="font-size:10px;color:var(--gray-dim);">목표 기록 영향</div>
+                <div style="font-size:13px;font-weight:700;color:${infl.color};">${infl.label}</div>
+              </div>
+            </div>
+            <div style="margin-top:8px;font-size:12.5px;color:var(--gray);line-height:1.6;"><b style="color:var(--white);">현재:</b> ${escapeHtml(indexCurrentStatement(p.key,p.score))}</div>
+            <div style="margin-top:4px;font-size:12.5px;color:var(--gray);line-height:1.6;"><b style="color:var(--white);">추천:</b> ${escapeHtml(INDEX_STATIC_TRAINING_HINT[p.key])}</div>
+          </div>`;
+        }).join("")}
+      </div>
+      <p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">※ 90~100 매우 강점 · 80~89 강점 · 70~79 양호 · 60~69 개선 여지 · 0~59 주요 개선 영역 (이 시스템 내 능력 점수 해석 기준이며, 다른 선수 대비 등급이 아닙니다). 신뢰도는 점수와 별개로 "이 점수를 뒷받침하는 실제 데이터가 얼마나 있는가"를 나타냅니다 — 같은 점수라도 신뢰도가 낮으면 실제와 다를 수 있습니다.</p>
+    </div>
+
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">훈련 우선순위 (상세)</h2><span class="mono" style="font-size:10.5px;color:var(--gray-dim);">Impact × Gap × Trainability × Urgency × Specificity × Recovery</span></div>
+      ${overrideRuleLabel ? `<p class="reason-line" style="color:var(--amber);margin:4px 0 8px;">⚠ 이 순위는 안전 override(${overrideRuleLabel.id})와 무관하게 계산된 "체력 필요도" 순위입니다 — 실제 이번 주 훈련 구성은 아래 순위가 아니라 안전 우선순위를 따릅니다.</p>` : ""}
+      <div style="display:flex;flex-direction:column;gap:6px;margin:8px 0 14px;">
+        ${narrativeParts.map(p=>`<div style="font-family:var(--font-body);color:var(--white);font-size:13px;line-height:1.6;">✅ ${escapeHtml(p)}</div>`).join("")}
+      </div>
+      <table><thead><tr><th>순위</th><th>영역</th><th class="num">점수</th><th class="num">개선여지</th><th class="num">레이스 비중</th><th class="num">8주 추세</th></tr></thead><tbody>
+        ${priority.map((p,i)=>`<tr>
+          <td class="mono">${i+1}</td>
+          <td title="${p.label}">${INDEX_META[p.key].emoji} ${INDEX_META[p.key].friendly}${p.sufficient?` <span class="badge elite" style="margin-left:4px;">충분</span>`:""}</td>
+          <td class="num mono">${p.score!=null?`${round1(p.score)}점`:"—"}</td>
+          <td class="num mono">${round1(p.headroom)}</td>
+          <td class="num mono">${Math.round(p.impactWeight*100)}%</td>
+          <td class="num mono" style="color:${p.trend==null?'var(--gray-dim)':p.trend>0?'var(--green)':'var(--red)'}">${p.trend==null?"데이터 부족":(p.trend>=0?"+":"")+round1(p.trend)+"/주"}</td>
+        </tr>
+        <tr><td></td><td colspan="5" style="padding:2px 4px 10px;font-size:10.5px;color:var(--gray-dim);font-family:var(--font-mono);">Impact ${round1(p.v3.raceImpact*100)}% · Gap ${round1(p.v3.performanceGap*100)}% · Trainability ${round1(p.v3.trainability*100)}% · Urgency ${round1(p.v3.urgency*100)}% · Specificity ${round1(p.v3.specificity*100)}% · Recovery ${round1(p.v3.recoveryModifier*100)}% → <span style="color:var(--orange);">Priority ${round1(p.priorityScore)}</span></td></tr>`).join("")}
+      </tbody></table>
+      <p class="lead" style="margin-top:10px;">"8주 추세"는 최근 컨디션(ACWR ${acwr!=null?round1(acwr):"N/A"})과는 별개로, 지난 8주간 이 지표가 실제로 향상됐는지를 봅니다 — "최근에 잘했다"와 "실력이 늘었다"는 다르게 판단합니다. Specificity는 목표 기록을 입력한 경우 실제 Target Gap 중 이 영역이 차지하는 비중을, 목표가 없으면 전체 레이스 비중을 사용합니다.</p>
+    </div>
+
+    ${degradation.length? `<div class="card">
+      <h2 class="section-title">Station-induced Run Degradation</h2>
+      <p class="lead" style="margin:6px 0 10px;">최근 대회에서 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지 (해당 스테이션의 피로가 다음 Run으로 넘어간 정도).</p>
+      <table><thead><tr><th>스테이션</th><th class="num">직후 Run</th><th class="num">평균 Run</th><th class="num">저하</th></tr></thead><tbody>
+        ${degradation.map(d=>`<tr><td>${d.label}</td><td class="num mono">${fmtTime(d.afterRunSec)}</td><td class="num mono" style="color:var(--gray-dim);">${fmtTime(d.baselineSec)}</td><td class="num mono" style="color:${d.degradationSec>0?'var(--red)':'var(--green)'}">${d.degradationSec>=0?"+":""}${fmtTime(Math.abs(d.degradationSec))}</td></tr>`).join("")}
+      </tbody></table>
+      ${(() => { const rex=analyzeRaceExecution(race); if(!rex) return "";
+        const dCls={good:"elite",station:"crit",mixed:"med",pacing:"low"}[rex.diagnosis.key];
+        return `<div class="divider" style="margin:10px 0;"></div>
+        <div class="row-between"><span class="eyebrow gray">Run1→Run8 진단</span><span class="badge ${dCls}">${escapeHtml(rex.diagnosis.label)}</span></div>
+        <p class="reason-line" style="margin-top:6px;">Run1 ${fmtTime(parseTimeToSec(race.runs?.[1]))} → Run8 ${fmtTime(parseTimeToSec(race.runs?.[8]))} (${rex.fadeSec>=0?"+":""}${fmtTime(Math.abs(rex.fadeSec))}, ${round1(rex.fadePct)}%). ${escapeHtml(rex.diagnosis.detail)}</p>`; })()}
+    </div>` : ""}
+
+    <div class="card">
+      <h2 class="section-title">개선 필요 구간 상세</h2>
+      ${(() => { const peer=computePeerAnalysis();
+        if(peer){
+          const items=peer.impactList.filter(c=>c.timeLoss>0).map(c=>({label:c.label, gapPct:c.impactPct}));
+          return `<p class="lead" style="margin-bottom:6px;">DNA · 동일 그룹 비교 영향도(%) 기준</p>${svgBottleneckBars(items)}`;
+        }
+        return `${svgBottleneckBars(bottleneck.items)}
+        ${bottleneck.worstIndex? `<p class="lead" style="margin-top:10px;">가장 낮은 능력 점수: <b style="color:var(--orange)" title="${INDEX_META[bottleneck.worstIndex.key].label}">${INDEX_META[bottleneck.worstIndex.key].emoji} ${INDEX_META[bottleneck.worstIndex.key].friendly}</b> (${round1(bottleneck.worstIndex.score)}점) — 개선 시 HPI 기여도가 가장 큽니다.</p>`:""}`; })()}
+    </div>
+
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">개선 가능성이 큰 구간</h2></div>
+      ${(() => { const rank=getDnaWeaknessRanking(3);
+        return `<p class="lead" style="margin-bottom:10px;">예상 기록 ${fmtTime(p0.predicted)}에 가장 큰 영향을 주는 구간 (${rank.source==="dna"?"DNA 기준":"훈련 우선순위 기준"})</p>
+        <div class="hstack" style="gap:8px;flex-wrap:wrap;">
+          ${rank.items.length? rank.items.map(it=>`<span class="badge crit">${escapeHtml(it.label)}</span>`).join("") : `<span class="empty-note">데이터가 더 쌓이면 표시됩니다</span>`}
+        </div>`; })()}
+    </div>
+
+    `;
+}
 function renderPeer(wrap){
   const analysis=computePeerAnalysis();
   if(!analysis){
     wrap.innerHTML = `
-      <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">동일 그룹 비교 · Race DNA</h1></div>
+      <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">Race DNA</h1></div>
       <div class="card"><div class="empty-note">대회 기록(러닝 8구간 + 스테이션)을 등록하면 아시아 동일 성별·연령대·Division 그룹과 비교 분석이 생성됩니다. HYROX 대회 기록 페이지에서 먼저 기록을 추가해주세요.</div></div>
     `;
     return;
@@ -12453,7 +12474,7 @@ function renderPeer(wrap){
     : "";
 
   wrap.innerHTML = `
-    <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">동일 그룹 비교 · Race DNA</h1></div>
+    <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">Race DNA</h1></div>
     <p class="lead">비교 그룹: <b style="color:var(--orange)">Asia · ${group.gender==="female"?"Female":"Male"} · ${group.ageGroup} · ${group.division}</b>. ${
       dataSource.totalSegmentCount>0 && dataSource.realSegmentCount===dataSource.totalSegmentCount
         ? `실제 참가자 결과 DB 기반 비교입니다 (${dataSource.realSegmentCount}/${dataSource.totalSegmentCount}개 구간 모두 실제 데이터 ${MIN_REAL_SAMPLE}건 이상).`
@@ -12521,7 +12542,11 @@ function renderPeer(wrap){
     </div>
 
     <div class="card">
-      <div class="qbtn" id="peer-detail-toggle">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기"}</div>
+      <div class="hstack" style="gap:8px;flex-wrap:wrap;">
+        <div class="qbtn" id="peer-detail-toggle" style="flex:1;min-width:150px;">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기"}</div>
+        <div class="qbtn" id="peer-improve-toggle" style="flex:1;min-width:150px;">${PEER_IMPROVE_OPEN?"− 개선 분석 접기":"+ 개선 분석"}</div>
+      </div>
+      ${PEER_IMPROVE_OPEN ? `<div style="margin-top:16px;">${improvementAnalysisHtml()}</div>` : ""}
       ${PEER_DETAIL_OPEN ? `
       <div style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
@@ -12582,6 +12607,7 @@ function renderPeer(wrap){
     </div>
   `;
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
+  wrap.querySelector("#peer-improve-toggle")?.addEventListener("click",()=>{ PEER_IMPROVE_OPEN=!PEER_IMPROVE_OPEN; renderAll(); });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
 }
 function starBadgeClass(stars){ return stars>=5?"elite":stars===4?"low":stars===3?"med":stars===2?"high":"crit"; }
@@ -12705,6 +12731,7 @@ function buildRaceDnaCoachInsight(improvementTop3){
   return text;
 }
 let PEER_DETAIL_OPEN = false;
+let PEER_IMPROVE_OPEN = false;
 let PEER_RUN_DETAIL_OPEN = false;
 
 /* ---------------------------------------------------------------------- */
