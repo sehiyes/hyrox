@@ -6679,6 +6679,49 @@ const SINGLES_GENDER_MULT = 1.22; // ~90min vs ~110min sourced Open Singles aver
 // by this directly; it's built by averaging the resulting Men's/Women's Doubles benchmarks instead.
 const DOUBLES_GENDER_MULT = 1.14;
 
+// spec (DNA Evolution): the exact per-race, per-segment computation that computePeerAnalysisUncached()
+// already does for "the current race" (division/gender/age-group group filters resolved from the race
+// itself, queryPeerSegmentStats() → resolveOfficialSegment() → z/percentile — identical call chain, zero
+// new benchmark logic) — factored out so DNA Evolution can run it across MULTIPLE historical races
+// without duplicating or reinventing any of this math. computePeerAnalysisUncached() below now calls
+// this too, so the existing single-race Race DNA screen's output is byte-for-byte unchanged.
+function computeDnaSegmentsForRace(race){
+  if(!race) return null;
+  const profile=STATE.profile;
+  const ageGroup=getAgeGroup(Number(profile.age));
+  const gender = profile.gender==="female" ? "female":"male";
+  const raceDiv = normalizeRaceDivision(race.division) || profile.division;
+  const division = DIVISIONS.includes(raceDiv) ? raceDiv : (DIVISIONS.includes(profile.division) ? profile.division : "Open");
+  const groupFilters = {
+    gender, ageGroup, division,
+    event: race.name || null,           // e.g. "HYROX Seoul" — null = all events
+    date: race.date || null,            // real DB would use this for a date-window filter (e.g. same season)
+    country: profile.country || null,   // not currently collected in the profile form; null = all regions
+  };
+  // Calculation order (spec §1), same whether the source is illustrative or a real DB:
+  //   내 기록 → 동일 그룹 평균/SD (queryPeerSegmentStats) → z-score → percentile → time loss
+  const segments = PEER_SEGMENTS.map(seg=>{
+    // peerMean/peerSd now flow through the queryPeerSegmentStats() seam (spec §7/①/⑯) — ASIA/Global
+    // derived benchmark first, same resolver Prediction uses, illustrative model only as final fallback.
+    const stats = queryPeerSegmentStats(seg, groupFilters);
+    const { mean:peerMean, sd:peerSd, n:peerN, isReal:peerIsReal, benchmarkSource, sampleN } = stats;
+    // doc9 §30-2/§30-7/TEST-07: DNA's "actual" now comes ONLY from this specific official race —
+    // resolveOfficialSegment() has no Simulation/trainingLog fallback tier, so changing Simulation data
+    // can never move a DNA percentile/Z-score. (Prediction's own segment model, below/elsewhere, keeps
+    // using the full resolveSegment() hierarchy including Simulation — that's a deliberately different,
+    // separate question: "current estimated ability" vs. DNA's "position among real HYROX finishers".)
+    const slEntry = toSegmentListEntry(seg);
+    const resolved = slEntry ? resolveOfficialSegment(slEntry, race) : null;
+    const actual = resolved && resolved.sec!=null ? resolved.sec : null;
+    const basis = resolved ? resolved.basis : null;
+    if(actual==null) return { ...seg, actual:null, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z:null, percentile:null, star:null, timeLoss:null };
+    const z = (peerMean-actual)/peerSd;
+    const percentile = clamp(normalCdf(z)*100, 0.5, 99.5);
+    const timeLoss = actual-peerMean;
+    return { ...seg, actual, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z, percentile, star:starRating(z), timeLoss };
+  });
+  return { group:{gender,ageGroup,division}, race, segments };
+}
 function computePeerAnalysis(){
   return memoPure("peer:"+pureCacheProfileKey(), ()=>computePeerAnalysisUncached());
 }
@@ -6695,48 +6738,12 @@ function computePeerAnalysisUncached(){
   const race = fallbackRace;
   if(!race) return null;
   const raceDivisionMismatch = !exactRace;
-  const profile=STATE.profile;
-  const ageGroup=getAgeGroup(Number(profile.age));
-  const gender = profile.gender==="female" ? "female":"male";
-  const raceDiv = normalizeRaceDivision(race.division) || profile.division;
-  const division = DIVISIONS.includes(raceDiv) ? raceDiv : (DIVISIONS.includes(profile.division) ? profile.division : "Open");
-  const am = AGE_MULT[ageGroup] || 1.0;
-  // Comparison group filters (spec §1): Gender/AgeGroup/Division are already wired into the
-  // illustrative model's math. Event/Date/Country are accepted here so the *interface* a real DB
-  // query would use is already the interface the UI calls — queryPeerSegmentStats() currently
-  // ignores them (the illustrative model has no such breakdown), but a real integration filters on
-  // all six without touching computePeerAnalysis or any rendering code.
-  const groupFilters = {
-    gender, ageGroup, division,
-    event: race.name || null,           // e.g. "HYROX Seoul" — null = all events
-    date: race.date || null,            // real DB would use this for a date-window filter (e.g. same season)
-    country: profile.country || null,   // not currently collected in the profile form; null = all regions
-  };
-
-  // Calculation order (spec §1), same whether the source is illustrative or a real DB:
-  //   내 기록 → 동일 그룹 평균/SD (queryPeerSegmentStats) → z-score → percentile → time loss →
-  //   가장 큰 limiter (Impact Score) → 개선 우선순위 (impactList sort)
-  const segments = PEER_SEGMENTS.map(seg=>{
-    // peerMean/peerSd now flow through the queryPeerSegmentStats() seam (spec §7/①/⑯) — ASIA/Global
-    // derived benchmark first, same resolver Prediction uses, illustrative model only as final fallback.
-    const stats = queryPeerSegmentStats(seg, groupFilters);
-    const { mean:peerMean, sd:peerSd, n:peerN, isReal:peerIsReal, benchmarkSource, sampleN } = stats;
-    // doc9 §30-2/§30-7/TEST-07: DNA's "actual" now comes ONLY from this specific official race —
-    // resolveOfficialSegment() has no Simulation/trainingLog fallback tier, so changing Simulation data
-    // can never move a DNA percentile/Z-score. (Prediction's own segment model, below/elsewhere, keeps
-    // using the full resolveSegment() hierarchy including Simulation — that's a deliberately different,
-    // separate question: "current estimated ability" vs. DNA's "position among real HYROX finishers".)
-    const slEntry = toSegmentListEntry(seg);
-    const resolved = slEntry ? resolveOfficialSegment(slEntry, race) : null;
-    const actual = resolved && resolved.sec!=null ? resolved.sec : null;
-    const personalHistory = getPersonalSegmentHistory(seg);
-    const basis = resolved ? resolved.basis : null;
-    if(actual==null) return { ...seg, actual:null, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, personalHistory, basis, z:null, percentile:null, star:null, timeLoss:null };
-    const z = (peerMean-actual)/peerSd;
-    const percentile = clamp(normalCdf(z)*100, 0.5, 99.5);
-    const timeLoss = actual-peerMean;
-    return { ...seg, actual, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, personalHistory, basis, z, percentile, star:starRating(z), timeLoss };
-  });
+  const core = computeDnaSegmentsForRace(race);
+  if(!core) return null;
+  const { group } = core;
+  // personalHistory is a cross-race, current-division-scoped lookup (unchanged) — attached here exactly
+  // as it always was, on top of the shared per-race segment computation above.
+  const segments = core.segments.map(s=>({ ...s, personalHistory: getPersonalSegmentHistory(s) }));
   const have = segments.filter(s=>s.actual!=null);
   if(!have.length) return null;
 
@@ -6779,7 +6786,7 @@ function computePeerAnalysisUncached(){
   const realSegmentCount = segments.filter(s=>s.peerIsReal).length;
   const totalSegmentCount = segments.filter(s=>s.actual!=null).length;
 
-  return { group:{gender,ageGroup,division}, race, raceDivisionMismatch, segments, impactList, totalLossSec, strengthIdx, raceDna, interpretation,
+  return { group, race, raceDivisionMismatch, segments, impactList, totalLossSec, strengthIdx, raceDna, interpretation,
     dataSource: { isReal: PEER_DATA_SOURCE.isReal, sourceLabel: PEER_DATA_SOURCE.sourceLabel,
       realSegmentCount, totalSegmentCount, externalDbSize: EXTERNAL_RACE_DB.length } };
 }
@@ -12559,12 +12566,15 @@ function renderPeer(wrap){
           ${rowsHtml(otherSegsForTable)}
         </tbody></table></div>`;
       })()}
+      ${dnaEvolutionSectionHtml()}
       ` : ""}
     </div>
   `;
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
   wrap.querySelector("#peer-improve-toggle")?.addEventListener("click",()=>{ PEER_IMPROVE_OPEN=!PEER_IMPROVE_OPEN; renderAll(); });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
+  wrap.querySelectorAll("[data-dna-evo-tab]").forEach(el=>el.addEventListener("click",()=>{ DNA_EVO_TAB=el.dataset.dnaEvoTab; renderAll(); }));
+  wrap.querySelector("#dna-evo-show-all")?.addEventListener("click",()=>{ DNA_EVO_SHOW_ALL=!DNA_EVO_SHOW_ALL; renderAll(); });
 }
 function starBadgeClass(stars){ return stars>=5?"elite":stars===4?"low":stars===3?"med":stars===2?"high":"crit"; }
 
@@ -12689,6 +12699,173 @@ function buildRaceDnaCoachInsight(improvementTop3){
 let PEER_DETAIL_OPEN = false;
 let PEER_IMPROVE_OPEN = false;
 let PEER_RUN_DETAIL_OPEN = false;
+
+/* ---------------------------------------------------------------------- */
+/* 9g. DNA EVOLUTION ("경기력 변화") — spec: DNA 자체(computePeerAnalysis,    */
+/*     전체 historical benchmark 기반, 장기 특성)는 절대 변경하지 않는다.       */
+/*     이 섹션은 그 SAME 계산 파이프라인(computeDnaSegmentsForRace →           */
+/*     queryPeerSegmentStats → z-score → percentile)을 대회별로 반복 실행해    */
+/*     "시간에 따른 DNA Score 변화"만 보여주는 별도의 읽기 전용 뷰다. 새로운     */
+/*     benchmark나 새 fallback 구조를 만들지 않고, Race DNA 화면의               */
+/*     "+ 상세 분석 보기" 맨 마지막에만 추가된다.                               */
+/* ---------------------------------------------------------------------- */
+let DNA_EVO_TAB = "all";       // "all" | one of DNA_EVOLUTION_ITEMS[].key
+let DNA_EVO_SHOW_ALL = false;  // false = 최근 대회 중심 표시, true = 전체 기록
+const DNA_EVO_RECENT_COUNT = 8; // 기본 화면에 표시할 최근 대회 수 (spec §7 — 표시 범위일 뿐, 계산 범위와 무관)
+const DNA_EVOLUTION_ITEMS = [
+  { key:"run",      label:"Run",           color:"#FF5A1F" },
+  { key:"ski",      label:"Ski",           color:"#5C8CFF" },
+  { key:"sledPush", label:"Sled Push",     color:"#33D17A" },
+  { key:"sledPull", label:"Sled Pull",     color:"#B36BFF" },
+  { key:"burpee",   label:"Burpee",        color:"#FFB020" },
+  { key:"row",      label:"Row",           color:"#3FC7D6" },
+  { key:"carry",    label:"Farmers Carry", color:"#FF6BA8" },
+  { key:"lunge",    label:"Sandbag Lunge", color:"#C9C24B" },
+  { key:"wallball", label:"Wall Ball",     color:"#8C6DFF" },
+];
+function dnaEvoItemMeta(key){ return DNA_EVOLUTION_ITEMS.find(i=>i.key===key) || null; }
+// spec §4/§13: same canonical segments Race DNA already uses (PEER_SEGMENTS/toSegmentListEntry), same
+// percentile pipeline (computeDnaSegmentsForRace, reused verbatim) — run per race, oldest → newest.
+// Missing a segment for one race never breaks the others (spec §12 "해당 segment만 missing 처리").
+function computeDnaEvolution(){
+  const races = [...STATE.races].filter(r=>r && r.date).sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+  if(!races.length) return null;
+  const points = races.map(race=>{
+    const core = computeDnaSegmentsForRace(race);
+    if(!core) return null;
+    const segments = core.segments;
+    const byKey=k=>segments.find(s=>s.key===k);
+    const runSegs = segments.filter(s=>s.kind==="run" && s.actual!=null && s.percentile!=null);
+    const scores = { run: runSegs.length ? mean(runSegs.map(s=>s.percentile)) : null };
+    ["ski","sledPush","sledPull","burpee","row","carry","lunge","wallball"].forEach(k=>{
+      const s = byKey(k);
+      scores[k] = (s && s.actual!=null && s.percentile!=null) ? s.percentile : null;
+    });
+    return { race, date:race.date, label: race.name || dnaEvoDateLabel(race.date), division:core.group.division, scores };
+  }).filter(p=>p && Object.values(p.scores).some(v=>v!=null));
+  if(!points.length) return null;
+  return { points };
+}
+function dnaEvoDateLabel(dateStr){
+  if(!dateStr) return "—";
+  const parts = String(dateStr).split("-");
+  return parts.length===3 ? `${parts[0].slice(2)}.${parts[1]}.${parts[2]}` : String(dateStr);
+}
+// spec §9: 가장 크게 향상/하락한 항목 — 최근 대회 대비 그 이전 대회의 percentile 변화량(=DNA Score
+// 변화량) 기준. run/station 통틀어 하나의 목록으로 랭킹한다.
+function computeDnaEvoChanges(points){
+  if(points.length<2) return [];
+  const last = points[points.length-1], prev = points[points.length-2];
+  return DNA_EVOLUTION_ITEMS.map(it=>{
+    const cur = last.scores[it.key], before = prev.scores[it.key];
+    if(cur==null || before==null) return null;
+    return { key:it.key, label:it.label, delta: cur-before };
+  }).filter(Boolean).sort((a,b)=>Math.abs(b.delta)-Math.abs(a.delta));
+}
+function dnaEvoChangeBadge(delta){
+  if(delta>=5) return "🟢";
+  if(delta>0)  return "🟡";
+  if(delta>-5) return "🟡";
+  return "🔴";
+}
+function svgMultiLineTrend(series, w=680, h=200, opts={}){
+  const usable = series.filter(s=>s.points && s.points.length);
+  if(!usable.length) return `<div class="empty-note">데이터가 쌓이면 추이가 표시됩니다</div>`;
+  const pad=28;
+  const allPts = usable.flatMap(s=>s.points);
+  const xs=allPts.map(p=>p.x);
+  const minX=Math.min(...xs), maxX=Math.max(...xs)||1;
+  const minY = opts.minY!=null? opts.minY : 0;
+  const maxY = opts.maxY!=null? opts.maxY : 100;
+  const sx=(x)=> pad + (maxX===minX?(w-pad*2)/2:(x-minX)/(maxX-minX))*(w-pad*2);
+  const sy=(y)=> h-pad - (maxY===minY?0:(clamp(y,minY,maxY)-minY)/(maxY-minY))*(h-pad*2);
+  const lines = usable.map(s=>{
+    const pts=s.points;
+    const path = pts.length===1
+      ? `M${sx(pts[0].x)-4},${sy(pts[0].y)} L${sx(pts[0].x)+4},${sy(pts[0].y)}`
+      : pts.map((p,i)=>`${i===0?"M":"L"}${sx(p.x)},${sy(p.y)}`).join(" ");
+    const dots = pts.map((p,i)=>{
+      const isLast = i===pts.length-1;
+      return `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="${isLast?4.5:3}" fill="${s.color}" ${isLast?`stroke="#0B0B0D" stroke-width="1.5"`:""}/>`;
+    }).join("");
+    return `<path d="${path}" fill="none" stroke="${s.color}" stroke-width="2"/>${dots}`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
+    <line x1="${pad}" y1="${h-pad}" x2="${w-pad}" y2="${h-pad}" stroke="#28282C"/>
+    <line x1="${pad}" y1="${sy(50)}" x2="${w-pad}" y2="${sy(50)}" stroke="#28282C" stroke-dasharray="3,4"/>
+    ${lines}
+  </svg>`;
+}
+function dnaEvolutionSectionHtml(){
+  const evo = computeDnaEvolution();
+  const head = `<div class="divider" style="margin:16px 0;"></div>
+    <div class="eyebrow gray">📈 DNA Evolution · 경기력 변화</div>
+    <p class="lead" style="margin:6px 0 12px;">대회별 기록을 동일 기준의 DNA Score로 환산해 나의 경기력이 어떻게 변화했는지 보여줍니다. (DNA 자체의 전체 데이터 기준은 그대로이며, 이 그래프는 그 위에서 대회별 변화만 보여주는 뷰입니다.)</p>`;
+  if(!evo || evo.points.length<2){
+    return `${head}<div class="empty-note">아직 경기력 변화 데이터를 표시하기에 충분한 대회 기록이 없습니다${evo&&evo.points.length===1?` (현재 1건 — 2건 이상부터 변화 추이가 표시됩니다)`:""}.</div>`;
+  }
+  const allPoints = evo.points;
+  const shown = DNA_EVO_SHOW_ALL ? allPoints : allPoints.slice(-DNA_EVO_RECENT_COUNT);
+  const tab = DNA_EVO_TAB;
+  const selector = `<div class="hstack" style="gap:6px;flex-wrap:wrap;margin-bottom:12px;">
+    <div class="chip ${tab==="all"?"on":""}" data-dna-evo-tab="all">전체</div>
+    ${DNA_EVOLUTION_ITEMS.map(it=>`<div class="chip ${tab===it.key?"on":""}" data-dna-evo-tab="${it.key}">${it.label}</div>`).join("")}
+  </div>`;
+  const seriesFor = (key,color)=> ({
+    key, color,
+    points: shown.filter(p=>p.scores[key]!=null).map(p=>({ x:new Date(p.date).getTime(), y:p.scores[key] }))
+  });
+  const chartSeries = tab==="all"
+    ? DNA_EVOLUTION_ITEMS.map(it=>seriesFor(it.key,it.color))
+    : [seriesFor(tab, dnaEvoItemMeta(tab)?.color || "#FF5A1F")];
+  const legend = `<div style="display:flex;flex-wrap:wrap;gap:10px 14px;margin-top:8px;">
+    ${(tab==="all"?DNA_EVOLUTION_ITEMS:[dnaEvoItemMeta(tab)]).filter(Boolean).map(it=>`<div class="hstack" style="gap:5px;"><span style="width:8px;height:8px;border-radius:50%;background:${it.color};display:inline-block;"></span><span style="font-size:11px;color:var(--gray-dim);">${escapeHtml(it.label)}</span></div>`).join("")}
+  </div>`;
+  const chartHtml = svgMultiLineTrend(chartSeries, 680, 200, {minY:0,maxY:100});
+
+  // 단일 항목 선택 시: 대회별 값 목록 + CURRENT DNA 표시 (spec §6/§8)
+  let detailHtml = "";
+  if(tab!=="all"){
+    const key=tab, meta=dnaEvoItemMeta(key);
+    const rows = shown.filter(p=>p.scores[key]!=null);
+    if(rows.length){
+      const last = rows[rows.length-1];
+      detailHtml = `<div style="margin-top:14px;">
+        <div class="eyebrow gray" style="margin-bottom:6px;">${escapeHtml(meta.label)} — 대회별 DNA Score</div>
+        <div style="display:flex;flex-direction:column;gap:4px;">
+          ${rows.map((p,i)=>`<div class="row-between" style="font-size:12.5px;padding:2px 0;">
+            <span style="color:var(--gray-dim);">${escapeHtml(p.label)} <span style="color:var(--gray-dim);font-size:10.5px;">${dnaEvoDateLabel(p.date)}</span></span>
+            <span class="mono" style="font-weight:${i===rows.length-1?800:600};color:${i===rows.length-1?meta.color:"var(--white)"};">${Math.round(p.scores[key])}${i===rows.length-1?` <span style="font-size:9.5px;color:${meta.color};">◀ CURRENT DNA</span>`:""}</span>
+          </div>`).join("")}
+        </div>
+      </div>`;
+    }
+  }
+
+  // 변화량 요약 (spec §9) — 최근 두 대회 비교, 전 항목(run+8개 station) 통합 랭킹
+  const changes = computeDnaEvoChanges(allPoints);
+  let changeSummaryHtml = "";
+  if(changes.length){
+    const best = changes.find(c=>c.delta>0);
+    const worst = [...changes].reverse().find(c=>c.delta<0);
+    changeSummaryHtml = `<div style="margin-top:14px;">
+      <div class="eyebrow gray" style="margin-bottom:6px;">최근 경기력 변화 (직전 대회 대비)</div>
+      <div style="display:flex;flex-direction:column;gap:5px;">
+        ${changes.slice(0,6).map(c=>`<div class="row-between" style="font-size:12.5px;">
+          <span>${dnaEvoChangeBadge(c.delta)} ${escapeHtml(c.label)}</span>
+          <span class="mono" style="font-weight:700;color:${c.delta>=0?"var(--green)":"var(--red)"};">${c.delta>=0?"+":""}${round1(c.delta)}</span>
+        </div>`).join("")}
+      </div>
+      ${best||worst ? `<p class="reason-line" style="margin-top:8px;">${best?`<b style="color:var(--green);">가장 크게 향상:</b> ${escapeHtml(best.label)} +${round1(best.delta)}`:""}${best&&worst?" · ":""}${worst?`<b style="color:var(--red);">개선이 필요한 변화:</b> ${escapeHtml(worst.label)} ${round1(worst.delta)}`:""}</p>` : ""}
+    </div>`;
+  }
+
+  const rangeNote = !DNA_EVO_SHOW_ALL && allPoints.length>DNA_EVO_RECENT_COUNT
+    ? `<div class="hstack" style="margin-top:10px;"><span class="chip" id="dna-evo-show-all">최근 ${DNA_EVO_RECENT_COUNT}개 대회 표시 중 — 전체 ${allPoints.length}개 보기 →</span></div>`
+    : (DNA_EVO_SHOW_ALL && allPoints.length>DNA_EVO_RECENT_COUNT ? `<div class="hstack" style="margin-top:10px;"><span class="chip" id="dna-evo-show-all">전체 ${allPoints.length}개 표시 중 — 최근만 보기 →</span></div>` : "");
+
+  return `${head}${selector}${chartHtml}${legend}${detailHtml}${changeSummaryHtml}${rangeNote}`;
+}
 
 /* ---------------------------------------------------------------------- */
 /* 21. PAGE: RULE ENGINE                                                   */
