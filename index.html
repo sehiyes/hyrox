@@ -7607,6 +7607,16 @@ function gatherPooledDnaRaces(goalDiv){
 // applies the SAME estimateSoloStationSec() the Doubles→Singles conversion already uses, when this
 // specific race has a recorded sharePct for this station. A Doubles race with no sharePct keeps its
 // raw team actual as-is (never assumes 50%) — flagged so confidence can be lowered downstream.
+// spec (Race DNA P0 fix — DNA와 Division 전환 계산 완전 분리): estimateSoloStationSec()는 "이 선수가
+// Singles로 나갔다면 전체 workload를 혼자 다 했을 때 걸릴 시간"을 추정하는 함수로, Division 전환
+// 예측 전용이다 (그대로 유지, 다른 곳에서 계속 사용). DNA는 그와 다른 질문 — "실제 경기에서 내가
+// 담당한 몫을 얼마나 잘 수행했는가" — 이므로, 전체 workload로 부풀리지 않고 팀 기록에 내 담당 비율
+// (share%)만 곱한 "내가 실제로 일한 시간"을 최소한의 보정으로 사용한다. share=30(%)이면
+// personalSec = teamSec × 0.30 — 2배 이상 부풀리는 일 없음.
+function estimateDnaPersonalStationSec(doublesSec, sharePctRaw){
+  const sharePct = clamp(Number(sharePctRaw)||50, 1, 99);
+  return doublesSec * (sharePct/100);
+}
 function resolveDnaSegmentContribution(seg, race){
   const slEntry = toSegmentListEntry(seg);
   if(!slEntry) return null;
@@ -7618,8 +7628,10 @@ function resolveDnaSegmentContribution(seg, race){
   const sharePctRaw = canShare ? race.share?.[seg.key] : null;
   const hasShare = canShare && sharePctRaw!=null && sharePctRaw!=="" && !isNaN(Number(sharePctRaw));
   if(isDoublesRace && canShare && hasShare){
-    const workloadAdjustedTime = estimateSoloStationSec(resolved.sec, Number(sharePctRaw));
-    return { teamTime:resolved.sec, sharePct:Number(sharePctRaw), workloadAdjustedTime, sec:workloadAdjustedTime,
+    // DNA 전용: Division 전환의 estimateSoloStationSec()(전체 workload 환산, Prediction 전용)를 여기서
+    // 재사용하지 않는다 — DNA는 estimateDnaPersonalStationSec()(내 담당 몫 시간)만 쓴다.
+    const personalSec = estimateDnaPersonalStationSec(resolved.sec, Number(sharePctRaw));
+    return { teamTime:resolved.sec, sharePct:Number(sharePctRaw), workloadAdjustedTime:personalSec, sec:personalSec,
       adjustmentApplied:true, hasShareData:true, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
   }
   // spec (Race DNA P0 fix): Doubles Station인데 개인 담당 비율(sharePct)이 없으면, 팀 전체 기록을
@@ -7923,17 +7935,25 @@ function computePeerAnalysisUncached(forceNoFilter){
   // profile.goalDivision(목표)도 전혀 사용하지 않는다 — 실제로 보유한 대회 기록 중 가장 최근 기록의
   // Division을 그대로 쓴다 (deriveDnaActualDivision()). "내 위치 확인"이 목적이므로, 아직 도달하지
   // 않은 목표 Division이나 별도로 설정된 기준값이 여기 섞여 들어오면 안 된다.
-  const goalDivision = deriveDnaActualDivision() || STATE.profile.division;
+  // spec (전면수정 Phase 2 - 완전 분리): Race DNA의 비교 Division은 profile.division("기준" 필드)도
+  // profile.goalDivision(목표)도 전혀 사용하지 않는다 — 실제로 보유한 대회 기록의 Division을 그대로
+  // 쓴다. 특정 경기를 선택했을 때는(activeRaceFilter) 그 "선택한 경기"의 Division을 기준으로 삼고,
+  // "전체"일 때만 가장 최근 기록의 Division(deriveDnaActualDivision())을 쓴다 — 이전에는 경기를
+  // 선택해도 항상 가장 최근 기록 기준으로 고정되어 "다른 기록을 클릭해도 기준 Division이 안 바뀌는"
+  // 버그가 있었다.
+  const chosenRaceForFilter = activeRaceFilter ? STATE.races.find(r=>r && r.id===activeRaceFilter) : null;
+  const goalDivision = chosenRaceForFilter
+    ? (normalizeRaceDivision(chosenRaceForFilter.division) || chosenRaceForFilter.division)
+    : (deriveDnaActualDivision() || STATE.profile.division);
   const baseDivision = goalDivision;
   const goalDiv = normalizeRaceDivision(goalDivision) || goalDivision;
   // 특정 경기가 선택되어 있으면(DNA_RACE_FILTER) 그 경기 하나만 weight=1로 사용 — 없으면 기존과
   // 동일하게 최근 대회들을 recency-weighted로 pooling한다.
   let pool;
   if(activeRaceFilter){
-    const chosen = STATE.races.find(r=>r && r.id===activeRaceFilter);
-    if(chosen){
-      const sourceDiv = normalizeRaceDivision(chosen.division)||chosen.division;
-      pool = { entries:[{ race:chosen, weight:1, tier:0, sourceDivision:sourceDiv, conversion:dnaDivisionPath(goalDiv,sourceDiv,STATE.profile.gender) }],
+    if(chosenRaceForFilter){
+      const sourceDiv = normalizeRaceDivision(chosenRaceForFilter.division)||chosenRaceForFilter.division;
+      pool = { entries:[{ race:chosenRaceForFilter, weight:1, tier:0, sourceDivision:sourceDiv, conversion:dnaDivisionPath(goalDiv,sourceDiv,STATE.profile.gender) }],
         exactMatch: sourceDiv===goalDiv, tierUsed:0, blended:false, tierDivisions:[sourceDiv], secondaryDivisions:null };
     } else {
       pool = gatherPooledDnaRaces(goalDiv); // stale/deleted id — fall back to normal pooling
@@ -13767,8 +13787,8 @@ function dnaContributionCompositionLabel(seg){
   if(!contribs.length) return null;
   const adjusted = contribs.filter(c=>c.adjustmentApplied);
   const direct = contribs.filter(c=>!c.adjustmentApplied);
-  if(adjusted.length && direct.length) return { text:"실제 개인 기록 + 개인 workload 환산 기록(Doubles share 적용) 혼합", adjusted };
-  if(adjusted.length) return { text:"개인 workload 환산 기록 (Doubles share 적용)", adjusted };
+  if(adjusted.length && direct.length) return { text:"실제 개인 기록 + 팀 기록에서 내 담당 몫만 반영(Doubles share 적용) 혼합", adjusted };
+  if(adjusted.length) return { text:"팀 기록에서 내 담당 몫만 반영 (Doubles share 적용 — Singles workload 환산 아님)", adjusted };
   return { text:"실제 개인 기록", adjusted:[] };
 }
 function renderPeer(wrap){
@@ -13859,7 +13879,7 @@ function renderPeer(wrap){
 
     <div class="card">
       <h2 class="section-title">📊 Station별 수행력</h2>
-      <p class="lead" style="margin:4px 0 12px;">점수는 그룹 평균 대비 상대적 수행력을 0~100으로 환산한 내부 점수입니다(퍼센타일 아님, "점"으로 표시).</p>
+      <p class="lead" style="margin:4px 0 12px;">점수는 동일 비교그룹 대비 z-score를 percentile(0~100)로 환산한 값입니다 — 다른 선수 대비 실제 percentile이며, 화면에는 "점"으로 표시합니다.</p>
       <div>
         ${stationSegs.map(s=>{
           const score = s.percentile!=null ? Math.round(s.percentile) : null;
@@ -13872,7 +13892,7 @@ function renderPeer(wrap){
             <div class="bar-track" style="margin-top:6px;"><div class="bar-fill" style="width:${score!=null?clamp(score,2,100):0}%;background:${band.color};"></div></div>
             ${s.actual!=null? `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${s.basis?` (${s.basis})`:""} · 동일 그룹 기준 ${fmtTime(s.peerMean)} · <span style="color:${s.timeLoss>=0?'var(--red)':'var(--green)'};">${s.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(s.timeLoss))}</span></div>` : ""}
             ${(()=>{ const comp=dnaContributionCompositionLabel(s); if(!comp) return ""; 
-              const adjDetail = comp.adjusted.length ? comp.adjusted.map(c=>`${escapeHtml(c.raceName||c.date||"")}: 팀 ${fmtTime(c.teamTime)} → 개인 환산 ${fmtTime(c.workloadAdjustedTime)} (share ${Math.round((c.sharePct||0)*100)}%)`).join(" · ") : "";
+              const adjDetail = comp.adjusted.length ? comp.adjusted.map(c=>`${escapeHtml(c.raceName||c.date||"")}: 팀 ${fmtTime(c.teamTime)} → 개인 몫 ${fmtTime(c.workloadAdjustedTime)} (share ${Math.round(c.sharePct||0)}%)`).join(" · ") : "";
               return `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">기록 구성: ${escapeHtml(comp.text)}${adjDetail?`<br>${adjDetail}`:""}</div>`; })()}
             <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">비교 그룹(기준 Division 기준): ${escapeHtml(deriveBenchmarkGender(group.division))} · ${escapeHtml(deriveAgeBand(STATE.profile.age)||"전연령")} · ${escapeHtml(group.division)} · Source=${escapeHtml(srcLabel)}${s.sampleN?` · n=${s.sampleN}`:""}${s.debug&&s.debug.actualSource&&s.debug.sourceDivision&&(Array.isArray(s.debug.sourceDivision)?s.debug.sourceDivision.join(","):s.debug.sourceDivision)!==group.division ? ` · 실제 기록 출처: ${escapeHtml(s.debug.actualSource)}` : ""}</div>
             ${s.personalHistory? `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">개인 경기 ${s.personalHistory.n}회 · 최근 ${fmtTime(s.personalHistory.latest)} · 최고 ${fmtTime(s.personalHistory.best)} · 중앙값 ${fmtTime(s.personalHistory.median)}</div>` : ""}
