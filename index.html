@@ -2646,27 +2646,373 @@ function getBaselineTime(hpiResult){
 /*        race at all in the base division), falls back to the plain      */
 /*        getBaselineTime() value with that limitation flagged in `debug`. */
 /* ---------------------------------------------------------------------- */
+/* ====================================================================== */
+/* UNIFIED PERFORMANCE V4                                                 */
+/* No Base Division: every real race is a source; Goal Division is target. */
+/* Run1~Run8 are intentionally aggregated as RUN_TOTAL. Stations remain   */
+/* independent. Doubles contribution is optional and applies to stations, */
+/* never to Run Total. Mixed Doubles keeps MIXED team division while the   */
+/* athlete gender selects the gendered conversion path.                   */
+/* ====================================================================== */
+
+const UNIFIED_PERFORMANCE_MODEL_VERSION = "UNIFIED-PERFORMANCE-V4.1";
+/*
+ * V4.1:
+ * derived_benchmark.json is immutable benchmark input.
+ * Conversion Matrix and Doubles Contribution Prior are separate layers.
+ * Goal Division is the sole target; Base/registered Division is not the
+ * calculation anchor.
+ */
+const UNIFIED_PERFORMANCE_CONFIG = {
+  benchmarkFile: "derived_benchmark.json",
+  goalIsTarget: true,
+  baseDivisionIsCalculationAnchor: false,
+  runAggregation: "run_1..run_8",
+  recencyWeights: [
+    {maxMonths:6, weight:1.00},
+    {maxMonths:12, weight:0.75},
+    {maxMonths:18, weight:0.55},
+    {maxMonths:24, weight:0.35},
+    {maxMonths:Infinity, weight:0.15}
+  ],
+  doublesContribution: {
+    enabled:true,
+    runTotalFactor:1,
+    stationAsConfidenceWeight:true,
+    genderAware:true,
+    divisionAware:true,
+    segmentAware:true
+  }
+};
+
+let UNIFIED_CONVERSION_MATRIX = null;
+let UNIFIED_CONTRIBUTION_PRIOR = null;
+
+function setUnifiedConversionMatrix(matrix){
+  UNIFIED_CONVERSION_MATRIX = matrix || null;
+}
+function setUnifiedContributionPrior(prior){
+  UNIFIED_CONTRIBUTION_PRIOR = prior || null;
+}
+function getUnifiedConversionEntry(gender, source, target, segment){
+  if(!UNIFIED_CONVERSION_MATRIX) return null;
+  return UNIFIED_CONVERSION_MATRIX[`${gender}|${source}|${target}|${segment}`] || null;
+}
+function getUnifiedContributionPrior(gender, division, segment){
+  if(!UNIFIED_CONTRIBUTION_PRIOR) return null;
+  const v = UNIFIED_CONTRIBUTION_PRIOR[`${gender}|${division}|${segment}`];
+  return typeof v==="number" ? Math.min(1,Math.max(0,v)) : null;
+}
+
+
+const UPV4_SEGMENTS = [
+  "runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"
+];
+
+const UPV4_RECENCY_BANDS = [
+  { maxMonths: 6,  weight: 1.00 },
+  { maxMonths: 12, weight: 0.75 },
+  { maxMonths: 18, weight: 0.55 },
+  { maxMonths: 24, weight: 0.35 },
+  { maxMonths: Infinity, weight: 0.15 }
+];
+
+const UPV4_DIVISION_GRAPH = {
+  "Open": [
+    ["Open",0],["Open Doubles",1],["Pro",2],["Pro Doubles",3]
+  ],
+  "Pro": [
+    ["Pro",0],["Pro Doubles",1],["Open",2],["Open Doubles",3]
+  ],
+  "Open Doubles": [
+    ["Open Doubles",0],["Pro Doubles",1],["Open",2],["Pro",3]
+  ],
+  "Pro Doubles": [
+    ["Pro Doubles",0],["Open Doubles",1],["Pro",2],["Open",3]
+  ],
+  "Mixed Doubles": [
+    ["Mixed Doubles",0]
+  ]
+};
+
+const UPV4_EMPIRICAL_TOTAL = {
+  "male|Open|Pro": 1.061,
+  "female|Open|Pro": 1.040,
+  "male|Open Doubles|Pro Doubles": 1.008,
+  "female|Open Doubles|Pro Doubles": 0.956,
+  "male|Open|Open Doubles": 0.862,
+  "female|Open|Open Doubles": 0.915,
+  "male|Pro|Pro Doubles": 0.830,
+  "female|Pro|Pro Doubles": 0.868,
+  "male|Open|Pro Doubles": 0.867,
+  "female|Open|Pro Doubles": 0.887,
+  "male|Pro|Open Doubles": 0.843,
+  "female|Pro|Open Doubles": 0.929,
+  "male|Mixed Doubles|Open Doubles": 0.938,
+  "female|Mixed Doubles|Open Doubles": 1.041,
+  "male|Mixed Doubles|Pro Doubles": 0.931,
+  "female|Mixed Doubles|Pro Doubles": 1.058
+};
+
+const UPV4_EMPIRICAL_SEGMENT = {
+  "male|Open|Pro": {
+    runTotal:1.001,ski:1.000,sledPush:1.257,sledPull:1.258,bbj:0.977,row:0.997,farmers:1.176,lunges:1.189,wallBalls:1.230,roxzone:1.047
+  },
+  "female|Open|Pro": {
+    runTotal:0.998,ski:0.997,sledPush:1.344,sledPull:1.153,bbj:0.986,row:1.003,farmers:1.254,lunges:1.255,wallBalls:1.254,roxzone:1.071
+  },
+  "male|Open Doubles|Pro Doubles": {
+    runTotal:0.969,ski:0.988,sledPush:1.209,sledPull:1.252,bbj:0.950,row:0.989,farmers:1.085,lunges:1.129,wallBalls:1.062,roxzone:0.985
+  },
+  "female|Open Doubles|Pro Doubles": {
+    runTotal:0.963,ski:0.974,sledPush:1.220,sledPull:1.096,bbj:0.967,row:0.974,farmers:1.130,lunges:1.201,wallBalls:1.077,roxzone:0.984
+  },
+  "male|Open|Open Doubles": {
+    runTotal:0.982,ski:0.888,sledPush:0.644,sledPull:0.696,bbj:0.634,row:0.920,farmers:0.734,lunges:0.698,wallBalls:0.685,roxzone:0.902
+  },
+  "female|Open|Open Doubles": {
+    runTotal:1.019,ski:0.913,sledPush:0.670,sledPull:0.748,bbj:0.649,row:0.945,farmers:0.760,lunges:0.715,wallBalls:0.679,roxzone:0.930
+  },
+  "male|Pro|Pro Doubles": {
+    runTotal:0.948,ski:0.935,sledPush:1.000,sledPull:1.057,bbj:0.899,row:0.945,farmers:1.000,lunges:1.000,wallBalls:1.000,roxzone:1.000
+  },
+  "female|Pro|Pro Doubles": {
+    runTotal:0.951,ski:0.951,sledPush:1.147,sledPull:1.151,bbj:1.049,row:1.041,farmers:1.096,lunges:1.069,wallBalls:1.009,roxzone:1.000
+  },
+  "male|Mixed Doubles|Open Doubles": {
+    runTotal:0.940,ski:0.934,sledPush:0.844,sledPull:0.840,bbj:0.903,row:0.945,farmers:0.898,lunges:0.882,wallBalls:0.928,roxzone:0.927
+  },
+  "female|Mixed Doubles|Open Doubles": {
+    runTotal:1.047,ski:1.106,sledPush:0.877,sledPull:1.036,bbj:1.104,row:1.077,farmers:0.979,lunges:0.892,wallBalls:0.907,roxzone:0.974
+  },
+  "male|Mixed Doubles|Pro Doubles": {
+    runTotal:0.938,ski:0.935,sledPush:1.000,sledPull:1.057,bbj:0.899,row:0.945,farmers:1.000,lunges:1.000,wallBalls:1.000,roxzone:1.000
+  },
+  "female|Mixed Doubles|Pro Doubles": {
+    runTotal:1.008,ski:1.068,sledPush:1.147,sledPull:1.151,bbj:1.049,row:1.041,farmers:1.096,lunges:1.069,wallBalls:1.009,roxzone:1.000
+  }
+};
+
+function upv4NormGender(g){
+  return String(g||"").toLowerCase().includes("female") || String(g||"").toLowerCase().includes("woman")
+    ? "female" : "male";
+}
+function upv4MonthsSince(date){
+  const d = new Date(date);
+  if(!date || Number.isNaN(d.getTime())) return Infinity;
+  return Math.max(0, (Date.now()-d.getTime())/(1000*60*60*24*30.4375));
+}
+function upv4RecencyWeight(date){
+  const m=upv4MonthsSince(date);
+  return (UPV4_RECENCY_BANDS.find(x=>m<=x.maxMonths)||UPV4_RECENCY_BANDS.at(-1)).weight;
+}
+function upv4IsDoubles(d){ return String(d||"").includes("Doubles"); }
+function upv4IsMixed(d){ return String(d||"")==="Mixed Doubles"; }
+
+function upv4DefaultContribution({gender, division, segment}){
+  /* Conservative prior: no station-specific personal split is known. */
+  /* Future DB-derived contribution priors can replace these values without */
+  /* changing the resolver contract. */
+  if(!upv4IsDoubles(division) || segment==="runTotal") return 1;
+  return 0.50;
+}
+
+function upv4GetContribution(race, gender, segment){
+  if(!upv4IsDoubles(race?.division) || segment==="runTotal") return 1;
+
+  const direct =
+    race?.athleteContribution ??
+    race?.myContribution ??
+    race?.doublesContribution ??
+    race?.contribution;
+
+  if(typeof direct==="number" && Number.isFinite(direct)){
+    return Math.min(1,Math.max(0,direct));
+  }
+
+  const map = race?.stationContributions || race?.doublesStationContributions;
+  const raw = map && (map[segment] ?? map[segment==="runTotal"?"total":segment]);
+  if(typeof raw==="number" && Number.isFinite(raw)){
+    return Math.min(1,Math.max(0,raw));
+  }
+
+  const prior = getUnifiedContributionPrior(gender, race?.division, segment);
+  if(prior!=null) return prior;
+
+  return 0.50;
+}
+
+function upv4ConversionKey(gender, source, target){
+  return `${gender}|${source}|${target}`;
+}
+function upv4Conversion(gender, source, target, segment){
+  if(source===target) return {multiplier:1, confidence:"EXACT", hops:0, source:"exact"};
+
+  const empirical = getUnifiedConversionEntry(gender, source, target, segment);
+  if(empirical && Number.isFinite(Number(empirical.median_ratio))){
+    const hops = Number.isFinite(Number(empirical.hops)) ? Number(empirical.hops) : 1;
+    return {
+      multiplier:Number(empirical.median_ratio),
+      confidence:empirical.confidence || (hops===1?"MEDIUM":hops===2?"LOW":"VERY_LOW"),
+      hops,
+      source:"REAL_RACE_CONVERSION_MATRIX"
+    };
+  }
+
+  const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
+  return {
+    multiplier:null,
+    confidence:"UNAVAILABLE",
+    hops:path ? path[1] : null,
+    source:"CONVERSION_MATRIX_NOT_LOADED"
+  };
+}
+
+function upv4SegmentValue(race, segment){
+  if(segment==="runTotal"){
+    const keys = (typeof RUN_KEYS!=="undefined"?RUN_KEYS:[]);
+    const vals=keys.map(k=>parseTimeToSec(race?.runs?.[k])).filter(v=>v!=null);
+    return vals.length ? vals.reduce((a,b)=>a+b,0) : parseTimeToSec(race?.officialTime);
+  }
+  const stationMap={
+    ski:"ski",sledPush:"sledPush",sledPull:"sledPull",bbj:"bbj",row:"row",
+    farmers:"farmers",lunges:"lunges",wallBalls:"wallBalls",roxzone:"roxzone"
+  };
+  const key=stationMap[segment];
+  if(segment==="roxzone") return parseTimeToSec(race?.transition);
+  const st=race?.stations?.[key];
+  return parseTimeToSec(st);
+}
+
+function upv4ResolveAthleteGender(race){
+  if(race?.athleteGender==="female"||race?.athlete_gender==="female") return "female";
+  if(race?.athleteGender==="male"||race?.athlete_gender==="male") return "male";
+  if(upv4IsMixed(race?.division)){
+    const g=STATE?.profile?.gender;
+    return upv4NormGender(g);
+  }
+  return upv4NormGender(STATE?.profile?.gender);
+}
+
+/*
+  Core resolver:
+  - goalDivision is the ONLY target context.
+  - all real races are candidates.
+  - Mixed Doubles is never silently renamed to Open.
+  - Run is aggregated; contribution only affects Doubles stations.
+*/
+function resolveUnifiedPerformance(goalDivision, options={}){
+  const goal=normalizeRaceDivision(goalDivision)||goalDivision;
+  const races=(STATE?.races||[]).filter(r=>r && r.date);
+  if(!goal || !races.length) return {goalDivision:goal,segments:{},records:[],confidence:"NONE"};
+
+  const records=[];
+  const targetCandidates=(UPV4_DIVISION_GRAPH[goal]||[[goal,0]]).map(x=>x[0]);
+
+  for(const race of races){
+    const source=normalizeRaceDivision(race.division)||race.division;
+    const gender=upv4ResolveAthleteGender(race);
+
+    /* Mixed is gender-aware for conversion, but remains Mixed Doubles as source. */
+    let best=null;
+    for(const targetSource of targetCandidates){
+      if(targetSource===source){ best={source,target:targetSource}; break; }
+    }
+    if(!best){
+      /* A Mixed source can only bridge when target is gendered Doubles. */
+      const mixedBridge=upv4IsMixed(source) && (goal==="Open Doubles"||goal==="Pro Doubles");
+      if(mixedBridge) best={source,target:goal};
+      else best={source,target:source};
+    }
+
+    for(const segment of UPV4_SEGMENTS){
+      const raw=upv4SegmentValue(race,segment);
+      if(raw==null) continue;
+      const conv=upv4Conversion(gender,source,goal,segment);
+      const contribution=upv4GetContribution(race,gender,segment);
+      const recency=upv4RecencyWeight(race.date);
+      const completeness=typeof raceDataCompleteness==="function"
+        ? Math.max(0.25,raceDataCompleteness(race)/17) : 1;
+      const contributionConfidence = upv4IsDoubles(source) && segment!=="runTotal"
+        ? (race?.athleteContribution!=null || race?.myContribution!=null || race?.doublesContribution!=null ? 1 : 0.75)
+        : 1;
+
+      /*
+        Conversion transforms the source segment into target-equivalent seconds.
+        Contribution is a confidence/representation weight for Doubles stations,
+        not a multiplication of elapsed time.
+      */
+      if(conv.multiplier==null) continue;
+      const converted=raw*conv.multiplier;
+      const weight=recency*completeness*contributionConfidence;
+      records.push({
+        date:race.date,sourceDivision:source,goalDivision:goal,
+        gender,segment,rawSec:raw,convertedSec:converted,
+        conversion:conv,recencyWeight:recency,
+        completeness,contribution,weight,
+        officialTime:parseTimeToSec(race.officialTime)
+      });
+    }
+  }
+
+  const segments={};
+  for(const seg of UPV4_SEGMENTS){
+    const xs=records.filter(x=>x.segment===seg && Number.isFinite(x.convertedSec));
+    if(!xs.length) continue;
+    const sumW=xs.reduce((s,x)=>s+x.weight,0);
+    segments[seg]={
+      value:sumW ? xs.reduce((s,x)=>s+x.convertedSec*x.weight,0)/sumW : null,
+      sampleN:xs.length,
+      sources:[...new Set(xs.map(x=>x.sourceDivision))],
+      records:xs.sort((a,b)=>b.date.localeCompare(a.date)).slice(0,10)
+    };
+  }
+  return {
+    goalDivision:goal,
+    segments,
+    records,
+    sourceDivisions:[...new Set(records.map(x=>x.sourceDivision))],
+    modelVersion:"UNIFIED-PERFORMANCE-V4",
+    noBaseDivision:true
+  };
+}
+
+/* Explicit audit helper: can be run from console without mutating STATE. */
+function auditUnifiedPerformanceV4(goalDivision){
+  const r=resolveUnifiedPerformance(goalDivision);
+  console.table(Object.entries(r.segments).map(([segment,x])=>({
+    segment, valueSec:x.value, sampleN:x.sampleN, sources:x.sources.join(" | ")
+  })));
+  return r;
+}
+
 function getGoalAwareBaseline(hpiResult){
-  const baseDiv = STATE.profile.division;
-  const goalDiv = STATE.profile.goalDivision || baseDiv;
-  const sameBase = divisionBase(goalDiv)===divisionBase(baseDiv);
-  if(sameBase){
-    const b=getBaselineTime(hpiResult);
-    return { ...b, debug:{ path:"same-division", baseDiv, goalDiv, usedConversion:false } };
+  const goalDiv = normalizeRaceDivision(STATE.profile.goalDivision || STATE.profile.division) ||
+    (STATE.profile.goalDivision || STATE.profile.division);
+  const unified = resolveUnifiedPerformance(goalDiv);
+  const run = unified.segments?.runTotal?.value;
+  if(run!=null){
+    return {
+      value: run,
+      source:`Unified Performance (${goalDiv})`,
+      baselineHpiDate:null,
+      divisionConversion:{
+        mode:"unified-all-races",
+        targetDivision:goalDiv,
+        sourceDivisions:unified.sourceDivisions,
+        modelVersion:UNIFIED_PERFORMANCE_MODEL_VERSION
+      },
+      debug:{
+        path:"unified-performance",
+        goalDiv,
+        usedConversion:true,
+        noBaseDivision:true,
+        sourceDivisions:unified.sourceDivisions
+      }
+    };
   }
-  const baseRaceCount = racesByDivision(baseDiv).length;
-  if(baseRaceCount===0){
-    const b=getBaselineTime(hpiResult);
-    return { ...b, debug:{ path:"cross-division-no-source-race-fallback", baseDiv, goalDiv, usedConversion:false,
-      note:`${baseDiv} 기록이 없어 Division 전환 계산 불가 — 일반 baseline으로 대체됨` } };
-  }
-  const conv = predictDivisionTransition(baseDiv, goalDiv);
-  if(!conv || conv.predictedCenterNow==null){
-    const b=getBaselineTime(hpiResult);
-    return { ...b, debug:{ path:"cross-division-conversion-unavailable-fallback", baseDiv, goalDiv, usedConversion:false } };
-  }
-  return { value:conv.predictedCenterNow, source:`Division 전환 예측 (${baseDiv} → ${goalDiv})`, baselineHpiDate:null,
-    divisionConversion:conv, debug:{ path:"cross-division-conversion", baseDiv, goalDiv, usedConversion:true, confidence:conv.confidence, mode:conv.mode } };
+  const b=getBaselineTime(hpiResult);
+  return { ...b, debug:{ path:"unified-performance-no-run-data-fallback", goalDiv, usedConversion:false } };
 }
 /* ---------------------------------------------------------------------- */
 /* CANONICAL CURRENT-PERFORMANCE BASELINE (audit item #3)                  */
@@ -2692,10 +3038,19 @@ function withDivisionContext(division, fn){
   }
 }
 function getCurrentPerformanceBaseline(hpiResult, division){
-  // V3: an explicitly requested division is ALWAYS an exact race division request. It never
-  // collapses to divisionBase() and never mutates STATE.profile.division.
-  const targetDiv = division || STATE.profile.division;
-  return withPredictionContext({ mode:"race", division:targetDiv }, ()=>getBaselineTime(hpiResult||calcHPI()));
+  /* V4: target-only context. Base/registered Division is not a calculation anchor. */
+  const target = division || STATE.profile.goalDivision || STATE.profile.division;
+  const u = resolveUnifiedPerformance(target);
+  if(u.segments?.runTotal?.value!=null){
+    return {
+      value:u.segments.runTotal.value,
+      source:`Unified Performance (${target})`,
+      baselineHpiDate:null,
+      unifiedPerformance:u,
+      debug:{path:"unified-performance-target", targetDivision:target, noBaseDivision:true}
+    };
+  }
+  return getBaselineTime(hpiResult);
 }
 function getHpiAtDate(dateStr){
   const hist=[...STATE.hpiHistory].filter(h=>h.date<=dateStr).sort((a,b)=>b.date.localeCompare(a.date));
@@ -4814,7 +5169,7 @@ function runHpsAudit(){
 
     // Test A — DNA "나의 강점"에 Run 1~8이 개별 항목으로 나오지 않는지
     STATE.profile.division = snapDivision; STATE.profile.goalDivision = snapGoal;
-    const peer = computePeerAnalysis();
+    const peer = computePeerAnalysis(true);
     if(peer){
       const top3 = buildStrengthsTop3(peer.segments);
       const anyIndividualRun = top3.some(s=>/^Run\s*\d/.test(s.label));
@@ -4983,7 +5338,7 @@ function runHpsAudit(){
       const ageBand = deriveAgeBand(snapAge);
 
       // TEST A — Asia benchmark가 존재하면 DNA가 실제로 그걸 쓰는가
-      const peer = computePeerAnalysis();
+      const peer = computePeerAnalysis(true);
       if(peer){
         const withAsiaAvailable = peer.segments.filter(s=>{
           const key = s.key==="roxzone" ? "transition" : s.key;
@@ -6404,7 +6759,7 @@ function buildCoachContext(){
   const reasoning = buildTopRecommendationReasoning(ruleResult);
   const topRule = ruleResult.fired[0] || null;
   let raceDna = null;
-  try{ const peer = computePeerAnalysis(); if(peer) raceDna = { type:peer.raceDna.id, label:peer.raceDna.label,
+  try{ const peer = computePeerAnalysis(true); if(peer) raceDna = { type:peer.raceDna.id, label:peer.raceDna.label,
     strengthIdx:peer.strengthIdx, isRealData:peer.dataSource.isReal }; } catch(e){ raceDna = null; }
 
   return {
@@ -7084,10 +7439,9 @@ function resolveOfficialSegment(seg, race){
 const DNA_POOL_MAX_RACES = 3;
 const DNA_POOL_RECENCY_WEIGHTS = [0.6, 0.3, 0.1];
 
-// Division fallback priority list for a given GOAL division. Mixed Doubles only ever pools with
-// itself — never blended with Open/Pro real data in EITHER direction (a Mixed Doubles record is
-// never used as fallback for an Open/Pro Doubles goal, and an Open/Pro record is never used as
-// fallback for a Mixed Doubles goal). Every other goal division falls back through progressively
+// Division fallback priority list for a given GOAL division. Mixed Doubles is a real benchmark
+// division, but it is NOT collapsed into Open. Mixed can bridge to gendered doubles only as a
+// lower-priority fallback, and the athlete's gender is retained for benchmark conversion. Every other goal division falls back through progressively
 // less-similar real divisions the athlete may have actually competed in, all the way down to the
 // OTHER Singles/Doubles division at the very end (P0 fix: "Open Doubles → Pro Doubles → Open → Pro" /
 // "Pro Doubles → Open Doubles → Pro → Open" — a Doubles goal must still be able to fall back to
@@ -7101,14 +7455,79 @@ const DNA_POOL_RECENCY_WEIGHTS = [0.6, 0.3, 0.1];
 // Open/Pro symmetric with the Doubles branches so every real race the athlete has ever logged is at
 // least reachable as a lowest-priority fallback, regardless of which of the 4 non-Mixed divisions the
 // goal or the source race is in.
-function dnaDivisionTierList(goalDiv){
+/* ======================================================================
+ * DNA DIVISION CONVERSION GRAPH v2
+ *
+ * Mixed Doubles is a real benchmark division (gender=MIXED), but an
+ * individual athlete inside a Mixed team still has a real sex/gender.
+ * Therefore Mixed is kept as-is for benchmark lookup, while fallback
+ * routing uses athleteGender to choose the closest gendered division.
+ *
+ * Priority is similarity, NOT a blanket "Mixed = Open" rule:
+ *   exact -> same-format level -> same-gender other format -> Mixed bridge
+ *   -> last-resort real division.
+ * Every hop is recorded so downstream DNA can apply a conversion factor and
+ * lower confidence as the path becomes longer.
+ * ====================================================================== */
+const DNA_DIVISION_MAX_HOPS = 4;
+const DNA_DIVISION_HOP_CONFIDENCE = ["High","Medium","Low","Very Low"];
+
+function athleteBenchmarkGender(){
+  return STATE.profile.gender==="female" ? "W" : "M";
+}
+function divisionIsMixed(d){ return normalizeRaceDivision(d)==="Mixed Doubles"; }
+function divisionIsDoubles(d){ return String(normalizeRaceDivision(d)||d||"").includes("Doubles"); }
+function divisionIsSingles(d){ return !divisionIsDoubles(d); }
+
+// Returns the ordered fallback tiers for a GOAL division. Mixed is never
+// silently collapsed into Open. For a Mixed goal, the athlete's own Mixed
+// record is exact; if absent, we use that athlete's gendered doubles history.
+function dnaDivisionTierList(goalDiv, athleteGender=STATE.profile.gender){
   const g = normalizeRaceDivision(goalDiv) || goalDiv;
-  if(g==="Mixed Doubles") return [["Mixed Doubles"]];
-  if(g==="Open Doubles") return [["Open Doubles"], ["Pro Doubles"], ["Open"], ["Pro"]];
-  if(g==="Pro Doubles")  return [["Pro Doubles"], ["Open Doubles"], ["Pro"], ["Open"]];
-  if(g==="Open") return [["Open"], ["Open Doubles"], ["Pro"], ["Pro Doubles"]];
-  if(g==="Pro")  return [["Pro"], ["Pro Doubles"], ["Open"], ["Open Doubles"]];
+  const isFemale = athleteGender==="female";
+  const ownD = isFemale ? "Women Open Doubles" : "Men Open Doubles";
+  const proD = isFemale ? "Women Pro Doubles" : "Men Pro Doubles";
+  // The stored race divisions are gender-neutral labels (Open Doubles / Pro
+  // Doubles). Gender-specific names above are conceptual only; keep actual
+  // labels below so this works with the existing STATE.races schema.
+  if(g==="Mixed Doubles") return [
+    ["Mixed Doubles"],
+    ["Open Doubles"],
+    ["Pro Doubles"],
+    ["Open"],
+    ["Pro"]
+  ];
+  if(g==="Open Doubles") return [["Open Doubles"], ["Pro Doubles"], ["Open"], ["Pro"], ["Mixed Doubles"]];
+  if(g==="Pro Doubles")  return [["Pro Doubles"], ["Open Doubles"], ["Pro"], ["Open"], ["Mixed Doubles"]];
+  if(g==="Open") return [["Open"], ["Open Doubles"], ["Pro"], ["Pro Doubles"], ["Mixed Doubles"]];
+  if(g==="Pro")  return [["Pro"], ["Pro Doubles"], ["Open"], ["Open Doubles"], ["Mixed Doubles"]];
   return [[g]];
+}
+
+function dnaDivisionPath(goalDiv, sourceDiv, athleteGender=STATE.profile.gender){
+  const g=normalizeRaceDivision(goalDiv)||goalDiv;
+  const s=normalizeRaceDivision(sourceDiv)||sourceDiv;
+  if(!g || !s) return {reachable:false, hops:99, path:[], confidence:"Very Low", reason:"unknown-division"};
+  if(g===s) return {reachable:true, hops:0, path:[s], confidence:"High", reason:"exact"};
+
+  // Explicit, auditable paths. These are the same similarity rules used by
+  // the tier list, but now represent the actual conversion route rather than
+  // merely a pooling bucket.
+  const routes={
+    "Open Doubles": {"Pro Doubles":["Open Doubles","Pro Doubles"],"Open":["Open Doubles","Open"],"Pro":["Open Doubles","Open","Pro"],"Mixed Doubles":["Open Doubles","Mixed Doubles"]},
+    "Pro Doubles": {"Open Doubles":["Pro Doubles","Open Doubles"],"Pro":["Pro Doubles","Pro"],"Open":["Pro Doubles","Pro","Open"],"Mixed Doubles":["Pro Doubles","Mixed Doubles"]},
+    "Open": {"Open Doubles":["Open","Open Doubles"],"Pro":["Open","Pro"],"Pro Doubles":["Open","Open Doubles","Pro Doubles"],"Mixed Doubles":["Open","Open Doubles","Mixed Doubles"]},
+    "Pro": {"Pro Doubles":["Pro","Pro Doubles"],"Open":["Pro","Open"],"Open Doubles":["Pro","Pro Doubles","Open Doubles"],"Mixed Doubles":["Pro","Pro Doubles","Mixed Doubles"]},
+    "Mixed Doubles": {"Open Doubles":["Mixed Doubles","Open Doubles"],"Pro Doubles":["Mixed Doubles","Open Doubles","Pro Doubles"],"Open":["Mixed Doubles","Open Doubles","Open"],"Pro":["Mixed Doubles","Open Doubles","Pro Doubles","Pro"]}
+  };
+  let path=routes[s]?.[g] || null;
+  // For a Mixed source/target, the bridge is deliberately gender-aware at the
+  // athlete level even though the stored division label remains Mixed Doubles.
+  // This prevents Mixed from becoming an unlabelled Open fallback.
+  if(!path) return {reachable:false,hops:99,path:[],confidence:"Very Low",reason:"no-route"};
+  const hops=path.length-1;
+  return {reachable:hops<=DNA_DIVISION_MAX_HOPS,hops,path,confidence:DNA_DIVISION_HOP_CONFIDENCE[Math.min(hops,3)],
+    reason:hops===0?"exact":(s==="Mixed Doubles"||g==="Mixed Doubles"?"mixed-bridge":"cross-division")};
 }
 
 // P0 fix: race selection within a tier must not let a near-empty race (no official Run/Station/
@@ -7136,7 +7555,8 @@ function pickTopRacesForDnaPool(candidateRacesDateDesc, maxCount){
 function gatherPooledDnaRaces(goalDiv){
   const allRaces = [...STATE.races].filter(r=>r&&r.date).sort((a,b)=>String(b.date).localeCompare(String(a.date)));
   if(!allRaces.length) return { entries:[], exactMatch:false, tierUsed:null, blended:false, tierDivisions:null, secondaryDivisions:null };
-  const tiers = dnaDivisionTierList(goalDiv);
+  const athleteGender=STATE.profile.gender;
+  const tiers = dnaDivisionTierList(goalDiv, athleteGender);
   const racesInTier = (tier)=>allRaces.filter(r=>tier.includes(normalizeRaceDivision(r.division)||r.division));
   for(let i=0;i<tiers.length;i++){
     const primaryAll = racesInTier(tiers[i]);
@@ -7154,14 +7574,59 @@ function gatherPooledDnaRaces(goalDiv){
     const primaryTierWeight = blended ? 0.7 : 1.0;
     const secondaryTierWeight = blended ? 0.3 : 0;
     const entries = [];
-    primary.forEach((race,idx)=> entries.push({ race, weight: primaryTierWeight*DNA_POOL_RECENCY_WEIGHTS[idx], tier:i }));
-    secondary.forEach((race,idx)=> entries.push({ race, weight: secondaryTierWeight*DNA_POOL_RECENCY_WEIGHTS[idx], tier:secondaryTierIdx }));
+    const add=(race,idx,tier)=>{
+      const sourceDiv=normalizeRaceDivision(race.division)||race.division;
+      const conversion=dnaDivisionPath(goalDiv,sourceDiv,athleteGender);
+      entries.push({ race, weight:(tier===i?primaryTierWeight:secondaryTierWeight)*DNA_POOL_RECENCY_WEIGHTS[idx], tier, sourceDivision:sourceDiv, conversion });
+    };
+    primary.forEach((race,idx)=>add(race,idx,i));
+    secondary.forEach((race,idx)=>add(race,idx,secondaryTierIdx));
     const totalW = entries.reduce((s,e)=>s+e.weight,0);
-    if(totalW>0) entries.forEach(e=>e.weight/=totalW); // normalize so weights always sum to 1
+    if(totalW>0) entries.forEach(e=>e.weight/=totalW);
     return { entries, exactMatch: i===0 && !blended, tierUsed:i, blended,
       tierDivisions: tiers[i], secondaryDivisions: blended? tiers[secondaryTierIdx] : null };
   }
-  return { entries:[], exactMatch:false, tierUsed:null, blended:false, tierDivisions:null, secondaryDivisions:null };
+  return {entries:[],exactMatch:false,tierUsed:null,blended:false,tierDivisions:null,secondaryDivisions:null};
+}
+// spec (전면수정 Phase 2): 상세분석의 Strength Index(7축 레이더 + 구간별 퍼센타일/등급 표)는 "전체
+// 대회 선택" 상태일 때 최근 대회 recency-weighted pool(최대 3개, 60/30/10%)이 아니라, 보유한 모든
+// 유효 대회를 동일 가중치로 단순평균한다 — "전체 대회에서 평균적으로 나는 어느 정도인가"를 보는
+// 지표이기 때문. 퍼센타일/등급 산출 방식(computePooledDnaSegment) 자체는 그대로 재사용하고,
+// pool의 구성(전체 · 동일가중치)만 다르다. 특정 경기를 선택한 경우는 이 함수를 쓰지 않는다(그 경기
+// 하나만의 실제 데이터를 그대로 보여주는 게 맞다).
+function gatherAllRacesEqualWeightPool(goalDiv){
+  const allRaces = [...STATE.races].filter(r=>r&&r.date);
+  if(!allRaces.length) return { entries:[] };
+  const athleteGender=STATE.profile.gender;
+  const entries = allRaces.map(race=>{
+    const sourceDiv=normalizeRaceDivision(race.division)||race.division;
+    const conversion=dnaDivisionPath(goalDiv,sourceDiv,athleteGender);
+    return { race, weight:1/allRaces.length, tier:0, sourceDivision:sourceDiv, conversion };
+  });
+  return { entries };
+}
+function computeStrengthIndexAllRacesAvg(goalDiv, baseDivision){
+  const pool = gatherAllRacesEqualWeightPool(goalDiv);
+  if(!pool.entries.length) return null;
+  const segments = PEER_SEGMENTS.map(seg=>computePooledDnaSegment(seg, pool.entries, goalDiv, baseDivision));
+  const byKey=k=>segments.find(s=>s.key===k);
+  const runSegs = segments.filter(s=>s.kind==="run" && s.actual!=null);
+  const stationSegs = segments.filter(s=>s.kind==="station" && s.actual!=null);
+  const roxzone = byKey("roxzone");
+  const runningC = avgPctWithConf(runSegs.map(s=>s.key), byKey);
+  const stationsC = avgPctWithConf(stationSegs.map(s=>s.key), byKey);
+  const powerC = avgPctWithConf(["sledPush","sledPull","lunge"], byKey);
+  const engineC = avgPctWithConf(["ski","row","burpee"], byKey);
+  const gripC = avgPctWithConf(["carry","sledPull"], byKey);
+  const earlyC = avgPctWithConf(["ski","sledPush"], byKey);
+  const lateC = avgPctWithConf(["lunge","wallball"], byKey);
+  const fatigueResistance = (earlyC.value!=null&&lateC.value!=null) ? clamp(100-(earlyC.value-lateC.value),0,100) : null;
+  const fatigueResConf = (earlyC.value!=null&&lateC.value!=null) ? { count:earlyC.count+lateC.count, total:4,
+    confidence: (earlyC.confidence==="none"||lateC.confidence==="none")?"none":(earlyC.count+lateC.count<4?"medium":"high") } : { count:0,total:4,confidence:"none" };
+  const strengthIdx = { running:runningC.value, stations:stationsC.value, transition:roxzone?.percentile, power:powerC.value, engine:engineC.value, grip:gripC.value, fatigueResistance };
+  const strengthIdxConfidence = { running:runningC, stations:stationsC, transition:{count:roxzone?.percentile!=null?1:0,total:1,confidence:roxzone?.confidence||"none"},
+    power:powerC, engine:engineC, grip:gripC, fatigueResistance:fatigueResConf };
+  return { segments, strengthIdx, strengthIdxConfidence, raceCount: pool.entries.length };
 }
 
 // Resolves ONE race's contribution to ONE segment — reuses resolveOfficialSegment() for the raw
@@ -7200,10 +7665,61 @@ function resolveDnaSegmentContribution(seg, race){
 // Benchmark-source are never allowed to collapse into a single label, even when they differ (e.g.
 // Base=Pro Doubles / Goal=Pro / Source=Open Doubles: Actual stays "Open Doubles raw actual", the
 // benchmark stays "Pro", and neither is ever mislabeled as the other).
+// Converts one pooled DNA segment from its REAL source division into the GOAL division.
+// Priority: same-athlete real paired races -> derived real benchmark p50 ratio -> no conversion.
+// This keeps source actuals intact for audit/debug while the percentile calculation uses a target-
+// comparable value. Mixed uses MIXED benchmark rows as the source and the athlete's gendered
+// benchmark as the target, so it is never silently treated as Open.
+function dnaSegmentConversionFactor(seg, sourceDiv, goalDiv){
+  if(!sourceDiv || !goalDiv || sourceDiv===goalDiv) return {factor:1,confidence:"High",method:"exact",hops:0};
+  const path=dnaDivisionPath(goalDiv,sourceDiv,STATE.profile.gender);
+  if(!path.reachable) return {factor:1,confidence:"Very Low",method:"unreachable",hops:path.hops};
+
+  // First try the athlete's OWN real source/target race pairs. This is the strongest evidence
+  // because STATE.races are already the same athlete's history. For each pair, compare the exact
+  // segment after applying the existing Doubles share/workload logic. Two or more pairs are High;
+  // one pair is Medium and falls back to the benchmark ratio only when the segment is missing.
+  const pairs=pairRacesForTransition(sourceDiv,goalDiv,5);
+  const personal=[];
+  pairs.forEach(pair=>{
+    const srcRace=STATE.races.find(r=>r.date===pair.fromDate && normalizeRaceDivision(r.division)===sourceDiv);
+    const dstRace=STATE.races.find(r=>r.date===pair.toDate && normalizeRaceDivision(r.division)===goalDiv);
+    if(!srcRace||!dstRace) return;
+    const src=resolveDnaSegmentContribution(seg,srcRace);
+    const dst=resolveDnaSegmentContribution(seg,dstRace);
+    if(src?.sec>0 && dst?.sec>0) personal.push({ratio:dst.sec/src.sec});
+  });
+  if(personal.length){
+    const weights=personal.map((_,i)=>Math.pow(0.6,i));
+    const w=weights.reduce((a,b)=>a+b,0);
+    const factor=personal.reduce((a,v,i)=>a+v.ratio*weights[i],0)/w;
+    return {factor:clamp(factor,0.65,1.60),confidence:personal.length>=2?"High":"Medium",
+      method:"personal-paired-ratio",hops:path.hops,pairCount:personal.length};
+  }
+  // Benchmark ratio is the stable fallback and is based on the loaded ASIA/Global real benchmark.
+  const ageBand=deriveAgeBand(Number(STATE.profile.age));
+  const sourceGender=deriveBenchmarkGender(sourceDiv);
+  const targetGender=deriveBenchmarkGender(goalDiv);
+  const derivedKey=seg.key==="roxzone"?"transition":seg.key;
+  const src=queryDerivedBenchmark(sourceDiv,sourceGender,ageBand,derivedKey);
+  const dst=queryDerivedBenchmark(goalDiv,targetGender,ageBand,derivedKey);
+  if(src?.p50 && dst?.p50){
+    const factor=Number(dst.p50)/Number(src.p50);
+    // Do not allow a sparse/mismatched fallback to explode a real athlete result.
+    const safe=clamp(factor,0.65,1.60);
+    return {factor:safe,confidence:path.confidence,method:"derived-benchmark-ratio",hops:path.hops,
+      sourceP50:src.p50,targetP50:dst.p50,sourceBenchmark:src.benchmark_source,targetBenchmark:dst.benchmark_source};
+  }
+  return {factor:1,confidence:path.confidence,method:"path-only-no-benchmark",hops:path.hops};
+}
+
 function computePooledDnaSegment(seg, poolEntries, goalDiv, baseDivision){
   const contributions = poolEntries.map(e=>{
     const c = resolveDnaSegmentContribution(seg, e.race);
-    return c ? { ...c, weight:e.weight, tier:e.tier } : null;
+    if(!c) return null;
+    const sourceDivision=c.division||normalizeRaceDivision(e.race.division)||e.race.division;
+    const conversion=dnaSegmentConversionFactor(seg,sourceDivision,goalDiv);
+    return { ...c, weight:e.weight, tier:e.tier, sourceDivision, conversion, rawSec:c.sec, sec:c.sec*conversion.factor };
   }).filter(Boolean);
   const groupFilters = {
     gender: STATE.profile.gender==="female" ? "female":"male",
@@ -7238,14 +7754,20 @@ function computePooledDnaSegment(seg, poolEntries, goalDiv, baseDivision){
   const percentile = clamp(normalCdf(z)*100, 0.5, 99.5);
   const timeLoss = pooledActual-peerMean;
   const anyMissingShare = contributions.some(c=>c.isDoublesRace && !c.hasShareData);
-  const confidence = contributions.length>=2 ? (anyMissingShare?"medium":"high") : (anyMissingShare?"low":"medium");
+  const anyConverted=contributions.some(c=>c.conversion?.hops>0);
+  const maxHops=contributions.reduce((m,c)=>Math.max(m,c.conversion?.hops||0),0);
+  const conversionConfidence=maxHops>=3?"Very Low":maxHops===2?"Low":maxHops===1?"Medium":"High";
+  let confidence = contributions.length>=2 ? (anyMissingShare?"medium":"high") : (anyMissingShare?"low":"medium");
+  if(anyConverted && conversionConfidence==="Very Low") confidence="very low";
+  else if(anyConverted && conversionConfidence==="Low" && confidence==="high") confidence="medium";
   const debug = { baseDivision, goalDivision:goalDiv, sourceDivision, actualSource,
-    benchmarkDivision:goalDiv, benchmarkSource, sampleN, confidence };
+    benchmarkDivision:goalDiv, benchmarkSource, sampleN, confidence, anyConverted, maxHops, conversionConfidence };
   return { ...seg, actual:pooledActual, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN,
     basis: contributions.length>1?"pooled-multi-race":"actual", z, percentile, star:starRating(z), timeLoss,
     confidence, debug, contributions: contributions.map(c=>({ date:c.date, raceName:c.raceName, division:c.division, weight:Math.round(c.weight*1000)/1000,
       teamTime:c.teamTime, sharePct:c.sharePct, workloadAdjustedTime:c.workloadAdjustedTime, adjustmentApplied:c.adjustmentApplied,
-      resolvedSec:c.sec })) };
+      resolvedSec:c.rawSec, convertedSec:c.sec, conversionFactor:Math.round((c.conversion?.factor||1)*10000)/10000,
+      conversionMethod:c.conversion?.method||"exact", conversionHops:c.conversion?.hops||0, conversionConfidence:c.conversion?.confidence||"High" })) };
 }
 
 // Per-division adjustment applied to the PEER_SEGMENTS base (Open Singles) table, by segment kind.
@@ -7308,8 +7830,13 @@ function computeDnaSegmentsForRace(race){
   });
   return { group:{gender,ageGroup,division}, race, segments };
 }
-function computePeerAnalysis(){
-  return memoPure("peer:"+pureCacheProfileKey(), ()=>computePeerAnalysisUncached());
+// spec (전면수정 Phase 2): 상세분석(Race DNA) 페이지에서, 등록된 대회가 여러 건이면 "가중 평균(전체)"
+// 대신 특정 한 경기만 골라서 그 경기 기준 DNA를 볼 수 있게 한다. null이면 기존과 동일하게 최근
+// 대회들을 recency-weighted로 pooling한다.
+let DNA_RACE_FILTER = null;
+function computePeerAnalysis(forceNoFilter){
+  const filterKey = forceNoFilter ? "all" : (DNA_RACE_FILTER||"all");
+  return memoPure("peer:"+pureCacheProfileKey()+":"+filterKey, ()=>computePeerAnalysisUncached(forceNoFilter));
 }
 // spec (DNA Division fallback): the race actually chosen for DNA computation is deliberately
 // SEPARATE from the athlete's configured Division (STATE.profile.division, which this never mutates
@@ -7336,12 +7863,12 @@ function raceDataCompleteness(race){
 function pickDnaRace(){
   const races = STATE.races.filter(r=>r && r.date);
   if(!races.length) return { race:null, exactMatch:false };
-  // P0 fix (Base/Goal/Source separation): this must resolve against the GOAL Division
-  // (STATE.profile.goalDivision, falling back to the BASE Division only when no goal is set) — never
-  // STATE.profile.division alone, which is the athlete's BASE/registered Division and may differ from
-  // what they're actually being compared/predicted against.
+  // spec (전면수정 Phase 2): Race DNA는 "지금 내 위치가 어디인가"를 보여주는 페이지이므로, 목표
+  // Division이 아니라 실제 수행 중인 기준(Base) Division 기준으로 비교 그룹을 정한다 — 목표
+  // Division으로 계산하면 아직 도달하지 않은 목표 기준과 비교하게 되어 "내 위치 확인"이라는 목적과
+  // 어긋난다. (목표 Division 기준 비교는 예측/목표 페이지에서 별도로 제공된다.)
   const baseDivision = STATE.profile.division;
-  const goalDivision = STATE.profile.goalDivision || baseDivision;
+  const goalDivision = baseDivision;
   const goalDiv = normalizeRaceDivision(goalDivision) || goalDivision;
   const goalIsMixed = String(goalDiv||"").includes("Mixed");
   const isMixedRace = r=>String(normalizeRaceDivision(r.division)||r.division||"").includes("Mixed");
@@ -7385,7 +7912,8 @@ function avgPctWithConf(keys, byKeyFn){
   if(vals.length<keys.length && label==="high") label="medium"; // partial coverage never reads as full-confidence
   return { value: mean(vals), count:vals.length, total:keys.length, confidence:label };
 }
-function computePeerAnalysisUncached(){
+function computePeerAnalysisUncached(forceNoFilter){
+  const activeRaceFilter = forceNoFilter ? null : DNA_RACE_FILTER;
   // spec (Race DNA 실제 기록 기반 가중치): the main DNA snapshot no longer picks ONE race and uses only
   // its data — it pools up to 3 real races (recency-weighted 60/30/10, Division-fallback-tiered per
   // dnaDivisionTierList) and resolves each of the 17 segments INDEPENDENTLY across whichever pooled
@@ -7401,10 +7929,28 @@ function computePeerAnalysisUncached(){
   // Previously this read STATE.profile.division directly, so whenever a Goal Division was set that
   // differed from the Base Division (e.g. Base=Pro Doubles / Goal=Pro), Race DNA silently benchmarked
   // against the BASE Division instead of the Goal Division the athlete actually configured.
+  // spec (전면수정 Phase 2): Race DNA의 비교 그룹은 목표(Goal) Division이 아니라 실제 수행 중인
+  // 기준(Base) Division으로 계산한다 — "내 위치 확인"이 목적이므로 아직 도달하지 않은 목표 Division
+  // 기준으로 벤치마크하면 안 된다. (goalDivision 변수명은 하위 함수 호출부와의 호환을 위해 유지하되
+  // 실제 값은 baseDivision을 그대로 쓴다.)
   const baseDivision = STATE.profile.division;
-  const goalDivision = STATE.profile.goalDivision || baseDivision;
+  const goalDivision = baseDivision;
   const goalDiv = normalizeRaceDivision(goalDivision) || goalDivision;
-  const pool = gatherPooledDnaRaces(goalDiv);
+  // 특정 경기가 선택되어 있으면(DNA_RACE_FILTER) 그 경기 하나만 weight=1로 사용 — 없으면 기존과
+  // 동일하게 최근 대회들을 recency-weighted로 pooling한다.
+  let pool;
+  if(activeRaceFilter){
+    const chosen = STATE.races.find(r=>r && r.id===activeRaceFilter);
+    if(chosen){
+      const sourceDiv = normalizeRaceDivision(chosen.division)||chosen.division;
+      pool = { entries:[{ race:chosen, weight:1, tier:0, sourceDivision:sourceDiv, conversion:dnaDivisionPath(goalDiv,sourceDiv,STATE.profile.gender) }],
+        exactMatch: sourceDiv===goalDiv, tierUsed:0, blended:false, tierDivisions:[sourceDiv], secondaryDivisions:null };
+    } else {
+      pool = gatherPooledDnaRaces(goalDiv); // stale/deleted id — fall back to normal pooling
+    }
+  } else {
+    pool = gatherPooledDnaRaces(goalDiv);
+  }
   if(!pool.entries.length) return null;
   const raceDivisionMismatch = !pool.exactMatch;
   const primaryRace = pool.entries[0].race; // most-weighted race — kept for the handful of call sites
@@ -7922,7 +8468,7 @@ async function computePodiumAnalysis(){
   const pred = predictPodiumForDivision(goalDiv, weeksToRace);
   // doc8: DNA Race Score + Matrix consistency, surfaced alongside (not injected into) pred — see the
   // PODIUM <-> DNA CONNECTION block above for why predictedSec itself is intentionally left untouched.
-  const peer = computePeerAnalysis();
+  const peer = computePeerAnalysis(true);
   const dnaScore = computeDnaRaceCompetitiveScore(peer);
   const dnaConsistencyFlags = checkDnaMatrixConsistency(peer);
   const dnaWeaknessRank = getDnaWeaknessRanking(3);
@@ -8201,26 +8747,24 @@ function raceStrip(race){
 /* ---------------------------------------------------------------------- */
 // MY HYROX(기록/DNA/목표)와 Account는 히든메뉴에서 제외한다 — 하단 탭 등 다른 진입점으로만
 // 접근한다. 페이지 자체는 살아 있으므로 CURRENT_PAGE로 이동하는 기존 경로는 그대로 동작한다.
+// spec (전면수정 Phase 1): 목표설정/기록예측/Division전환 예측을 "목표 설정" 한 페이지로 일원화하고
+// (내부 탭으로 계속 접근 가능 — renderGoalPage 참고), 근력·훈련추천이 필요한 페이지(훈련 기록/주간
+// 훈련계획/레이스 로드맵)는 훈련 추천 기능 자체가 나중으로 미뤄져서 메인 네비게이션에서 뺀다 —
+// 기능은 삭제되지 않고 모델 설명 > 아카이브 탭에서 계속 접근 가능하다.
 const NAV = [
   { group:"Overview", items:[
     { id:"dashboard", label:"대시보드", ico:"◆" },
   ]},
   { group:"Data Input", items:[
-    { id:"profile", label:"선수 프로필", ico:"1" },
     { id:"races", label:"HYROX 대회 기록", ico:"2" },
     { id:"running", label:"러닝 능력치", ico:"3" },
-    { id:"strength", label:"근력 · 스테이션", ico:"4" },
-    { id:"training", label:"훈련 기록", ico:"5" },
+    { id:"strength", label:"테스트 · 시뮬레이션", ico:"4" },
   ]},
   { group:"Engine Output", items:[
-    { id:"prediction", label:"기록 예측", ico:"▲" },
     { id:"goal", label:"목표 설정", ico:"◆" },
     { id:"peer", label:"Race DNA", ico:"◈" },
-    { id:"division", label:"Division 전환 예측", ico:"⇄" },
-    { id:"plan", label:"주간 훈련계획", ico:"▦" },
   ]},
   { group:"Admin", items:[
-    { id:"roadmap", label:"레이스 로드맵", ico:"➜" },
     { id:"model", label:"모델 설명", ico:"ℹ" },
   ]},
 ];
@@ -8284,7 +8828,7 @@ function renderAll(){
     myrecord: renderMyRecordPage, mydna: renderMyDnaPage, mygoal: renderMyGoalPage,
     dashboard: renderDashboard, profile: renderProfile, races: renderRaces, running: renderRunning,
     strength: renderStrength, training: renderTraining,
-    goal: renderGoal, prediction: renderPrediction, division: renderDivision, peer: renderPeer, rules: renderRules, plan: renderPlan, roadmap: renderRoadmap, model: renderModel,
+    goal: renderGoalPage, prediction: renderPrediction, division: renderDivision, peer: renderPeer, rules: renderRules, plan: renderPlan, roadmap: renderRoadmap, model: renderModel,
     account: renderAccount,
   };
   (renderers[CURRENT_PAGE]||renderMyRecordPage)(wrap);
@@ -9188,7 +9732,9 @@ function renderMyRecordPage(wrap){
 const MY_DNA_AXES = ["running","engine","strengthEnd","skill","raceExec"];
 function renderMyDnaPage(wrap){
   const hpiResult=calcHPI();
-  const peer=computePeerAnalysis();
+  // spec (전면수정 Phase 2): 하단 탭 DNA는 상세분석 페이지의 "기준 경기 선택"과 무관하게 항상
+  // 최근 대회 가중평균(pooled) 기준으로 보여준다 — forceNoFilter=true.
+  const peer=computePeerAnalysis(true);
   // "기록 등록하러 가기" shortcut uses the SAME literal check as 목표 page (racesByDivision existence) —
   // !peer alone conflates "no race at all" with "a race exists but has zero segment splits filled in",
   // which would otherwise show this prompt to someone who already registered a race with just an
@@ -9471,7 +10017,6 @@ function renderDashboard(wrap){
         </div>
         <div class="hstack" style="gap:8px;flex-wrap:wrap;">
           <button class="btn sm" id="dash-quicklog">🏋️ 오늘 운동 기록하기</button>
-          <button class="btn sm secondary" id="dash-survey">${fp.completedAt? "📋 설문 수정" : "📋 간단 질문 답변하기"}</button>
         </div>
       </div>
       <p class="lead" style="margin:10px 0 0;">${coach.desc}</p>
@@ -9594,7 +10139,6 @@ function renderDashboard(wrap){
     </div>
   `;
   wrap.querySelector("#dash-quicklog")?.addEventListener("click", openQuickLogModal);
-  wrap.querySelector("#dash-survey")?.addEventListener("click", openFitnessSurveyModal);
   wrap.querySelector("#dash-sim-log")?.addEventListener("click", ()=>{ CURRENT_PAGE="races"; RACES_TAB="input"; renderAll(); });
   wrap.querySelector("#dash-insight-toggle")?.addEventListener("click",()=>{ DASH_INSIGHT_EXPANDED=!DASH_INSIGHT_EXPANDED; renderAll(); });
 }
@@ -9742,23 +10286,15 @@ function segmentTargetGapTable(segmentGap){
 let PROFILE_TAB = "basic";
 let BODY_METRIC_DRAFT = null; // set when the add/edit form is open
 let BODY_METRICS_RANGE = "3m";
+// spec (전면수정 Phase 1): 신체정보 프로필(신체데이터 탭)과 설문은 제거하고, 고정 스케줄·예측 및
+// 훈련 설정(회복주기/예측민감도)은 훈련 추천 기능이 나중으로 미뤄지면서 모델 설명 > 아카이브 탭으로
+// 옮겼다 (예측 민감도만 로그인/계정 페이지로 이동). 프로필 페이지는 이제 기본 정보 하나만 남는다.
 function renderProfile(wrap){
   wrap.innerHTML = `
     <div><div class="eyebrow">DATA INPUT · ① ATHLETE</div><h1 class="page-title">선수 프로필</h1></div>
-    <div class="tabs">
-      <div class="tab ${PROFILE_TAB==="basic"?"active":""}" data-profile-tab="basic">기본 정보</div>
-      <div class="tab ${PROFILE_TAB==="body"?"active":""}" data-profile-tab="body">신체데이터</div>
-      <div class="tab ${PROFILE_TAB==="schedule"?"active":""}" data-profile-tab="schedule">고정 스케줄 설정</div>
-      <div class="tab ${PROFILE_TAB==="settings"?"active":""}" data-profile-tab="settings">예측 및 훈련 설정</div>
-    </div>
     <div id="profile-tab-body"></div>
   `;
-  wrap.querySelectorAll("[data-profile-tab]").forEach(t=>t.addEventListener("click",()=>{ PROFILE_TAB=t.dataset.profileTab; renderAll(); }));
-  const body=wrap.querySelector("#profile-tab-body");
-  if(PROFILE_TAB==="body") renderProfileBodyTab(body);
-  else if(PROFILE_TAB==="schedule") renderProfileScheduleTab(body);
-  else if(PROFILE_TAB==="settings") renderProfileSettingsTab(body);
-  else renderProfileBasicTab(body);
+  renderProfileBasicTab(wrap.querySelector("#profile-tab-body"));
 }
 // "나는 어떤 선수인가?" — basic athlete info only. Goal Division/Date/Time live exclusively on the
 // 목표 설정 page now (same underlying STATE.profile.targetDate/targetTime fields, just no longer
@@ -9769,51 +10305,18 @@ function renderProfileBasicTab(wrap){
     <div class="card">
       <div class="grid grid-3">
         ${field("이름", `<input data-bind="profile.name" value="${escapeHtml(p.name)}">`)}
-        ${field("나이", `<input type="number" data-bind="profile.age" value="${escapeHtml(p.age)}">`)}
         ${field("성별", `<select data-bind="profile.gender"><option value="male" ${p.gender==="male"?"selected":""}>남성</option><option value="female" ${p.gender==="female"?"selected":""}>여성</option></select>`)}
         ${field("키 (cm)", `<input type="number" data-bind="profile.height" value="${escapeHtml(p.height)}">`)}
-        ${field("체중 (kg)", `<input type="number" step="0.1" id="pb-weight" value="${escapeHtml(p.weight)}">`)}
-        ${field("체지방률 (%)", `<input type="number" step="0.1" id="pb-bodyfat" value="${escapeHtml(p.bodyFat)}">`)}
-        ${field("골격근량 (kg)", `<input type="number" step="0.1" id="pb-muscle" value="${escapeHtml(p.skeletalMuscle)}">`)}
         ${field("주간 가용 훈련시간 (h)", `<input type="number" data-bind="profile.availableHoursPerWeek" value="${escapeHtml(p.availableHoursPerWeek)}">`)}
       </div>
       <div class="hstack" style="margin-top:12px;justify-content:flex-end;">
         <button class="btn sm secondary" id="profile-goto-goal">목표 설정으로 이동 →</button>
       </div>
-      <p class="reason-line" style="margin-top:12px;">Division·파트너 이름·대회 날짜·목표 기록은 <b style="color:var(--orange);">목표 설정</b> 메뉴에서 관리합니다. 체중·체지방률·골격근량을 여기서 입력하면 오늘 날짜로 <b style="color:var(--orange);">신체데이터</b> 탭에 자동 기록되어 그래프에 반영됩니다.</p>
-    </div>
-    <div class="card">
-      <div class="row-between"><div class="eyebrow gray">📋 Fitness Profile (설문 기반)</div><button class="btn sm secondary" id="profile-open-survey">${p.fitnessProfile.completedAt? "수정":"답변하기"}</button></div>
-      <p class="lead" style="margin:6px 0 12px;">운동 기록이 없어도 답변할 수 있는 간단한 질문입니다. 실제 기록이 아닌 자기평가로 저장되며, 훈련계획의 강도·우선순위 조정에만 보조적으로 사용됩니다.</p>
-      ${p.fitnessProfile.completedAt ? `
-        <div class="grid grid-3">
-          ${statCard("Running Capacity", runningCapacityFromProfile()||"정보 부족", "설문 기반 추정", "var(--white)")}
-          ${statCard("Training Capacity", trainingCapacityFromProfile()||"—", "주당 운동 가능 빈도", "var(--white)")}
-          ${statCard("HYROX Experience", hyroxExperienceLevel(), "실제 대회 참가 횟수 기준", "var(--white)")}
-        </div>
-        <div class="reason-line" style="margin-top:12px;">가장 어려운 Station: <b style="color:var(--orange);">${(p.fitnessProfile.hardestStations||[]).length && !p.fitnessProfile.hardestStations.includes("unknown") ? p.fitnessProfile.hardestStations.map(k=>STATIONS.find(s=>s.key===k)?.label||k).join(", ") : "모르겠음"}</b> · 마지막 응답일 ${p.fitnessProfile.completedAt}</div>
-      ` : `<div class="empty-note">아직 답변하지 않았습니다 — 답변 없이도 기본 분석은 계속 이용할 수 있습니다.</div>`}
+      <p class="reason-line" style="margin-top:12px;">Division·파트너 이름·대회 날짜·목표 기록·연령대(Age Group)는 <b style="color:var(--orange);">목표 설정</b> 메뉴에서 관리합니다.</p>
     </div>
   `;
   bindInputs(wrap);
-  wrap.querySelector("#profile-open-survey")?.addEventListener("click", openFitnessSurveyModal);
   wrap.querySelector("#profile-goto-goal")?.addEventListener("click", ()=>{ CURRENT_PAGE="goal"; renderAll(); });
-  // spec: editing weight/bodyFat/muscle here also writes a dated record into bodyMetricsHistory
-  // (today's date) so the 신체데이터 tab's graphs/history pick it up automatically — merges with
-  // whatever else was already recorded for today rather than blanking the other two fields out.
-  const syncBodyMetricFromBasicTab=()=>{
-    const w=wrap.querySelector("#pb-weight").value, bf=wrap.querySelector("#pb-bodyfat").value, mm=wrap.querySelector("#pb-muscle").value;
-    const today=todayISO();
-    const existing=STATE.bodyMetricsHistory.find(m=>m.date===today) || {};
-    upsertBodyMetric({ date:today,
-      weight: w!==""? w : (existing.weight ?? null),
-      bodyFat: bf!==""? bf : (existing.bodyFat ?? null),
-      muscleMass: mm!==""? mm : (existing.muscleMass ?? null) });
-    persist();
-  };
-  wrap.querySelector("#pb-weight")?.addEventListener("change",(e)=>{ STATE.profile.weight=e.target.value; syncBodyMetricFromBasicTab(); });
-  wrap.querySelector("#pb-bodyfat")?.addEventListener("change",(e)=>{ STATE.profile.bodyFat=e.target.value; syncBodyMetricFromBasicTab(); });
-  wrap.querySelector("#pb-muscle")?.addEventListener("change",(e)=>{ STATE.profile.skeletalMuscle=e.target.value; syncBodyMetricFromBasicTab(); });
 }
 function bodyMetricChip(label, field, unit, isPct){
   const latest=latestBodyMetric();
@@ -9961,26 +10464,12 @@ function renderProfileScheduleTab(wrap){
     persist(); renderAll();
   }));
 }
+// spec (전면수정 Phase 1): 예측 민감도는 로그인/계정 페이지로 옮기고(renderAccount), 회복 주기는
+// 훈련 추천 기능이 나중으로 미뤄지면서 모델 설명 > 아카이브 탭으로 옮겼다 — 이 함수는 이제 회복
+// 주기 설정만 담당하며, 프로필 페이지가 아니라 아카이브 탭에서 호출된다.
 function renderProfileSettingsTab(wrap){
   wrap.innerHTML = `
     <div class="card">
-      <div class="eyebrow gray">예측 및 훈련 설정</div>
-      <p class="lead" style="margin:6px 0 16px;">복잡한 내부 계수 대신 이해하기 쉬운 코칭 설정만 조정합니다. 세부 계산 원리는 모델 설명 페이지에서 읽기 전용으로 확인할 수 있습니다.</p>
-
-      <div style="margin-bottom:20px;">
-        <div style="font-size:13px; font-weight:700; margin-bottom:4px;">예측 민감도</div>
-        <p class="lead" style="margin:0 0 10px;">훈련 데이터의 변화가 예상 경기 기록에 얼마나 빠르게 반영될지 설정합니다.</p>
-        <div class="hstack" style="gap:8px; flex-wrap:wrap;">
-          ${Object.entries(SENSITIVITY_META).map(([key,meta])=>`
-            <div class="chip ${STATE.settings.predictionSensitivity===key?"on":""}" data-sensitivity="${key}" style="padding:9px 16px; font-size:12.5px; cursor:pointer;">
-              ${meta.label}${key==="recommended"?" ⭐":""}
-            </div>`).join("")}
-        </div>
-        <p class="lead" style="margin-top:8px;">${escapeHtml(SENSITIVITY_META[STATE.settings.predictionSensitivity]?.desc || "")}</p>
-      </div>
-
-      <div class="divider" style="margin:16px 0;"></div>
-
       <div>
         <div style="font-size:13px; font-weight:700; margin-bottom:4px;">회복 주기</div>
         <p class="lead" style="margin:0 0 10px;">고강도 훈련이 누적되었을 때 회복 주간(Deload)을 얼마나 자주 고려할지 설정합니다.</p>
@@ -10006,9 +10495,6 @@ function renderProfileSettingsTab(wrap){
     </div>
   `;
   bindInputs(wrap);
-  wrap.querySelectorAll("[data-sensitivity]").forEach(chip=>chip.addEventListener("click",()=>{
-    STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
-  }));
   wrap.querySelector("#deload-mode")?.addEventListener("change",(e)=>{
     STATE.settings.deloadMode=e.target.value; persist(); renderAll();
   });
@@ -11850,22 +12336,23 @@ function renderRunning(wrap){
 /* ---------------------------------------------------------------------- */
 /* 17. PAGE: STRENGTH & STATIONS                                           */
 /* ---------------------------------------------------------------------- */
-let STRENGTH_TAB = "strength";
+// spec (전면수정 Phase 1): 근력 1RM 기록(① 근력 기록)은 제거 — Quick Calibration Test와
+// Simulation 기록만 남긴다 (renderStrengthSubTab은 더 이상 호출되지 않지만, 데이터/함수 자체는
+// 남겨둔다 — 나중에 필요하면 복구할 수 있게).
+let STRENGTH_TAB = "quicktest";
 function renderStrength(wrap){
   wrap.innerHTML = `
-    <div><div class="eyebrow">DATA INPUT · ⑤ STRENGTH & STATIONS</div><h1 class="page-title">근력 · 스테이션 기록</h1></div>
+    <div><div class="eyebrow">DATA INPUT · ④ TEST & SIMULATION</div><h1 class="page-title">테스트 · 시뮬레이션 기록</h1></div>
     <div class="tabs">
-      <div class="tab ${STRENGTH_TAB==="strength"?"active":""}" data-strength-tab="strength">① 근력 기록</div>
-      <div class="tab ${STRENGTH_TAB==="quicktest"?"active":""}" data-strength-tab="quicktest">② Quick Test</div>
-      <div class="tab ${STRENGTH_TAB==="simulation"?"active":""}" data-strength-tab="simulation">③ Simulation 기록</div>
+      <div class="tab ${STRENGTH_TAB==="quicktest"?"active":""}" data-strength-tab="quicktest">Quick Test</div>
+      <div class="tab ${STRENGTH_TAB==="simulation"?"active":""}" data-strength-tab="simulation">Simulation 기록</div>
     </div>
     <div id="strength-tab-body"></div>
   `;
   wrap.querySelectorAll("[data-strength-tab]").forEach(t=>t.addEventListener("click",()=>{ STRENGTH_TAB=t.dataset.strengthTab; renderAll(); }));
   const body=wrap.querySelector("#strength-tab-body");
-  if(STRENGTH_TAB==="quicktest") renderQuickTestTab(body);
-  else if(STRENGTH_TAB==="simulation") renderSimulationTab(body);
-  else renderStrengthSubTab(body);
+  if(STRENGTH_TAB==="simulation") renderSimulationTab(body);
+  else renderQuickTestTab(body);
 }
 function renderStrengthSubTab(wrap){
   const s=STATE.strength;
@@ -12594,10 +13081,33 @@ function computeCategoryGapDetail(plan, k){
   const realisticSec = segs.reduce((s,x)=>s+x.realisticSec,0);
   return { currentSec, targetSec, neededSec, conservativeSec, realisticSec };
 }
+// spec (전면수정 Phase 1 — 일원화): 목표 설정 / 기록 예측 / Division 전환 예측을 별도 페이지로 흩어
+// 두지 않고 "목표 설정" 한 페이지 안의 탭으로 합친다. 각 탭의 계산 로직·렌더 함수(renderGoal/
+// renderPrediction/renderDivision)는 그대로 두고, 이 wrapper가 탭 전환만 담당한다.
+let GOAL_TAB = "goal";
+function renderGoalPage(wrap){
+  wrap.innerHTML = `
+    <div class="tabs">
+      <div class="tab ${GOAL_TAB==="goal"?"active":""}" data-goal-page-tab="goal">목표 설정</div>
+      <div class="tab ${GOAL_TAB==="prediction"?"active":""}" data-goal-page-tab="prediction">기록 예측</div>
+      <div class="tab ${GOAL_TAB==="division"?"active":""}" data-goal-page-tab="division">Division 전환</div>
+    </div>
+    <div id="goal-page-tab-body"></div>
+  `;
+  wrap.querySelectorAll("[data-goal-page-tab]").forEach(t=>t.addEventListener("click",()=>{ GOAL_TAB=t.dataset.goalPageTab; renderAll(); }));
+  const body=wrap.querySelector("#goal-page-tab-body");
+  if(GOAL_TAB==="prediction") renderPrediction(body);
+  else if(GOAL_TAB==="division") renderDivision(body);
+  else renderGoal(body);
+}
 function renderGoal(wrap){
   const p=STATE.profile;
   const plan = STATE.profile.targetTime ? computeGoalPlan() : null;
   const effectiveGoalDiv = p.goalDivision || p.division;
+  // spec (전면수정 Phase 1): 신체정보 프로필의 "나이"를 없애는 대신, 벤치마크/DNA 비교에 쓰이는
+  // 연령대(Age Group)는 여기 목표 설정에서 직접 고른다 — 프로필에 나이가 남아있으면 그 값으로 기본
+  // 선택되고, 없으면 직접 골라야 한다(포디움 페이지와 동일한 방식, STATE.profile.goalAgeGroup 공유).
+  const effectiveGoalAgeGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
   wrap.innerHTML = `
     <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">목표 설정</h1></div>
     <div class="card">
@@ -12608,7 +13118,9 @@ function renderGoal(wrap){
       </div>
       <div class="grid grid-3" style="margin-top:14px;">
         ${field("목표 대회 날짜 (YYYY-MM-DD)", `<input id="goal-date" type="text" inputmode="numeric" placeholder="2026-10-04" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(p.targetDate)}">`)}
+        ${field("연령대 (Age Group)", `<select id="goal-age-group">${AGE_GROUPS.map(a=>`<option value="${a}" ${effectiveGoalAgeGroup===a?"selected":""}>${a}</option>`).join("")}</select>`)}
       </div>
+      <p class="reason-line" style="margin-top:8px;">연령대는 벤치마크·DNA 비교(peer comparison)에 사용됩니다 — 포디움 페이지의 연령대 설정과 같은 값을 공유합니다.</p>
       ${divisionBase(effectiveGoalDiv)!==divisionBase(p.division) ? `<div class="reason-line" style="margin-top:10px;color:var(--orange);">🟠 목표 Division이 현재 수행 Division과 다릅니다.<br>현재 기록은 목표 Division(${effectiveGoalDiv})의 workload 기준으로 환산한 뒤 목표 기록과 비교합니다 — Division 전환 예측(${p.division} → ${effectiveGoalDiv}) 결과를 사용하며, ${p.division} 기록을 그대로 목표 계산에 쓰지 않습니다.<br><span style="color:var(--gray-dim);">현재 예상 기록 = Division 전환 후 현재 능력 추정 (오류가 아니라 Cross-Division 예측입니다)</span></div>` : ""}
       <div style="margin-top:12px;"><button class="btn sm" id="goal-save">저장</button></div>
     </div>
@@ -12739,6 +13251,8 @@ function renderGoal(wrap){
     STATE.profile.goalDivision = goalDivSelected===STATE.profile.division ? "" : goalDivSelected;
     STATE.profile.targetTime=wrap.querySelector("#goal-time").value.trim();
     STATE.profile.targetDate=wrap.querySelector("#goal-date").value.trim();
+    const ageGroupSel=wrap.querySelector("#goal-age-group")?.value;
+    if(ageGroupSel!=null) STATE.profile.goalAgeGroup = ageGroupSel===getAgeGroup(Number(STATE.profile.age)) ? "" : ageGroupSel;
     persist(); showToast("목표가 저장되었습니다"); renderAll();
   });
   wrap.querySelectorAll("[data-goal-gap-toggle]").forEach(el=>el.addEventListener("click",()=>{
@@ -13243,10 +13757,9 @@ function stationRunFatigueSectionHtml(){
 // whatever real mix of races/Divisions/weights actually went into the pooled DNA computation.
 function dnaUserDataCompositionBanner(analysis){
   const uc = analysis.userDataComposition;
-  // P0 fix (Base/Goal/Source separation): this banner is ABOUT the Goal Division ("목표 Division의
-  // 실제 기록이 있는가?") — it must never read STATE.profile.division (Base Division) directly, or a
-  // Goal Division that differs from Base would show the wrong division here.
-  const goalDiv = uc.goalDivision || analysis.goalDivision || STATE.profile.goalDivision || STATE.profile.division;
+  // spec (전면수정 Phase 2): Race DNA는 이제 기준(Base) Division 기준으로 계산되므로, 이 배너도
+  // Base Division을 표시한다 (목표 Division이 아님 — 목표 기준 비교는 예측/목표 페이지 담당).
+  const baseDiv = uc.baseDivision || analysis.userDataComposition?.baseDivision || STATE.profile.division;
   const divLabel = (arr)=> arr && arr.length===1 ? arr[0] : (arr||[]).join("/");
   const raceCountLabel = `최근 ${uc.raceCount}개 경기 반영`;
   // P1: "Race Weight"(경기 전체 가중치 — 이 배너에 표시되는 값, 대회 하나가 전체 DNA에서 차지하는
@@ -13263,7 +13776,7 @@ function dnaUserDataCompositionBanner(analysis){
   if(!analysis.raceDivisionMismatch){
     return `<div class="card tight" style="background:var(--surface2);border-left:3px solid var(--green);">
       <div class="eyebrow" style="color:var(--green);">🟢 REAL USER DATA</div>
-      <div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(goalDiv)} 실제 경기 · ${raceCountLabel}${uc.raceCount>1?` (최근일수록 높은 가중치 60/30/10%)`:""}</div>
+      <div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(baseDiv)} 실제 경기 · ${raceCountLabel}${uc.raceCount>1?` (최근일수록 높은 가중치 60/30/10%)`:""}</div>
       ${weightNote}
     </div>`;
   }
@@ -13274,13 +13787,14 @@ function dnaUserDataCompositionBanner(analysis){
     compositionLine = `${escapeHtml(divLabel(uc.tierDivisions))} 100%`;
   }
   return `<div class="card tight" style="background:rgba(255,176,32,.08);border-left:3px solid var(--amber);">
-    <div class="eyebrow" style="color:var(--amber);">⚠️ ${escapeHtml(goalDiv)} 실제 기록이 없어 최근 실제 경기 기록을 기반으로 DNA를 계산했습니다</div>
+    <div class="eyebrow" style="color:var(--amber);">⚠️ ${escapeHtml(baseDiv)} 실제 기록이 없어 최근 실제 경기 기록을 기반으로 DNA를 계산했습니다</div>
     <div style="font-size:12.5px;color:var(--white);margin-top:6px;">${compositionLine} · ${raceCountLabel}</div>
-    <div style="font-size:11px;color:var(--gray-dim);margin-top:2px;">최근 경기일수록 높은 가중치가 적용됩니다(60/30/10%). 목표 Division 설정 자체는 그대로이며, 예측/목표 페이지는 계속 ${escapeHtml(goalDiv)} 기준으로 계산됩니다.</div>
+    <div style="font-size:11px;color:var(--gray-dim);margin-top:2px;">최근 경기일수록 높은 가중치가 적용됩니다(60/30/10%). Race DNA는 기준(Base) Division 기준으로 계산되며, 목표 Division 설정과는 별개입니다.</div>
     ${weightNote}
   </div>`;
 }
 function renderPeer(wrap){
+  const allRacesForFilter = STATE.races.filter(r=>r&&r.date).sort((a,b)=>String(b.date).localeCompare(String(a.date)));
   const analysis=computePeerAnalysis();
   if(!analysis){
     wrap.innerHTML = `
@@ -13290,17 +13804,23 @@ function renderPeer(wrap){
     return;
   }
   const { group, segments, impactList, strengthIdx, interpretation, totalLossSec, race, dataSource } = analysis;
+  // spec (전면수정 Phase 2): "전체" 선택 시(DNA_RACE_FILTER===null) 상세분석의 Strength Index(7축
+  // 레이더 + 구간별 퍼센타일/등급 표)는 최근 대회 가중평균(analysis.strengthIdx)이 아니라, 보유한
+  // 모든 유효 대회를 동일 가중치로 단순평균한 값을 쓴다. 특정 경기를 선택했을 때는 그 경기 그대로.
+  const detailStrength = DNA_RACE_FILTER
+    ? { strengthIdx, segments, strengthIdxConfidence: analysis.strengthIdxConfidence }
+    : (computeStrengthIndexAllRacesAvg(analysis.goalDivision, analysis.baseDivision) || { strengthIdx, segments, strengthIdxConfidence: analysis.strengthIdxConfidence });
   const realSegs = segments.filter(s=>s.actual!=null && s.peerIsReal);
   const raceDnaFullyReal = dataSource.totalSegmentCount>0 && dataSource.realSegmentCount===dataSource.totalSegmentCount;
   const raceDnaMinN = realSegs.length ? Math.min(...realSegs.map(s=>s.peerN)) : null;
   const radarItems = [
-    { label:"Running", score:strengthIdx.running },
-    { label:"Stations", score:strengthIdx.stations },
-    { label:"Transition", score:strengthIdx.transition },
-    { label:"Power", score:strengthIdx.power },
-    { label:"Engine", score:strengthIdx.engine },
-    { label:"Grip", score:strengthIdx.grip },
-    { label:"Fatigue Res.", score:strengthIdx.fatigueResistance },
+    { label:"Running", score:detailStrength.strengthIdx.running },
+    { label:"Stations", score:detailStrength.strengthIdx.stations },
+    { label:"Transition", score:detailStrength.strengthIdx.transition },
+    { label:"Power", score:detailStrength.strengthIdx.power },
+    { label:"Engine", score:detailStrength.strengthIdx.engine },
+    { label:"Grip", score:detailStrength.strengthIdx.grip },
+    { label:"Fatigue Res.", score:detailStrength.strengthIdx.fatigueResistance },
   ];
   // ---- new user-friendly framing (spec) — all derived from the SAME analysis object above ----
   const typeCombo = raceDnaTypeCombo(strengthIdx, dataSource);
@@ -13318,6 +13838,15 @@ function renderPeer(wrap){
 
   wrap.innerHTML = `
     <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">Race DNA</h1></div>
+    ${allRacesForFilter.length>1 ? `<div class="card tight" style="padding:10px 14px;">
+      <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
+        <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
+        <select id="dna-race-filter" style="max-width:260px;">
+          <option value="">전체 (최근 경기 가중 평균)</option>
+          ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
+        </select>
+      </div>
+    </div>` : ""}
     <p class="lead">비교 그룹: <b style="color:var(--orange)">Asia · ${group.gender==="female"?"Female":"Male"} · ${group.ageGroup} · ${group.division}</b>. ${
       dataSource.totalSegmentCount>0 && dataSource.realSegmentCount===dataSource.totalSegmentCount
         ? `실제 참가자 결과 DB 기반 비교입니다 (${dataSource.realSegmentCount}/${dataSource.totalSegmentCount}개 구간 모두 실제 데이터 ${MIN_REAL_SAMPLE}건 이상).`
@@ -13366,7 +13895,7 @@ function renderPeer(wrap){
             <div class="row-between"><span style="font-size:13px;font-weight:700;">${s.label}</span><span class="mono" style="font-size:12px;color:${band.color};">${score!=null?`${score}점 · ${band.label}`:"데이터 부족"}</span></div>
             <div class="bar-track" style="margin-top:6px;"><div class="bar-fill" style="width:${score!=null?clamp(score,2,100):0}%;background:${band.color};"></div></div>
             ${s.actual!=null? `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${s.basis?` (${s.basis})`:""} · 동일 그룹 기준 ${fmtTime(s.peerMean)} · <span style="color:${s.timeLoss>=0?'var(--red)':'var(--green)'};">${s.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(s.timeLoss))}</span></div>` : ""}
-            <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">비교 그룹(목표 Division 기준): ${escapeHtml(deriveBenchmarkGender(group.division))} · ${escapeHtml(deriveAgeBand(STATE.profile.age)||"전연령")} · ${escapeHtml(group.division)} · Source=${escapeHtml(srcLabel)}${s.sampleN?` · n=${s.sampleN}`:""}${s.debug&&s.debug.actualSource&&s.debug.sourceDivision&&(Array.isArray(s.debug.sourceDivision)?s.debug.sourceDivision.join(","):s.debug.sourceDivision)!==group.division ? ` · 실제 기록 출처: ${escapeHtml(s.debug.actualSource)}` : ""}</div>
+            <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">비교 그룹(기준 Division 기준): ${escapeHtml(deriveBenchmarkGender(group.division))} · ${escapeHtml(deriveAgeBand(STATE.profile.age)||"전연령")} · ${escapeHtml(group.division)} · Source=${escapeHtml(srcLabel)}${s.sampleN?` · n=${s.sampleN}`:""}${s.debug&&s.debug.actualSource&&s.debug.sourceDivision&&(Array.isArray(s.debug.sourceDivision)?s.debug.sourceDivision.join(","):s.debug.sourceDivision)!==group.division ? ` · 실제 기록 출처: ${escapeHtml(s.debug.actualSource)}` : ""}</div>
             ${s.personalHistory? `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">개인 경기 ${s.personalHistory.n}회 · 최근 ${fmtTime(s.personalHistory.latest)} · 최고 ${fmtTime(s.personalHistory.best)} · 중앙값 ${fmtTime(s.personalHistory.median)}</div>` : ""}
           </div>`;
         }).join("")}
@@ -13392,10 +13921,11 @@ function renderPeer(wrap){
       ${PEER_DETAIL_OPEN ? `
       <div style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
+        <p class="reason-line" style="margin-top:4px;color:var(--gray-dim);">${DNA_RACE_FILTER ? "선택한 경기 1건 기준입니다." : `보유한 모든 유효 대회(${detailStrength.raceCount||1}건)를 동일 가중치로 단순평균한 값입니다 — 최근 대회 가중치(60/30/10%)는 적용되지 않습니다.`}</p>
         ${svgRadarGeneric(radarItems, 280, "#5C8CFF")}
-        ${analysis.strengthIdxConfidence ? `<div style="display:flex;flex-direction:column;gap:4px;margin-top:10px;">
+        ${detailStrength.strengthIdxConfidence ? `<div style="display:flex;flex-direction:column;gap:4px;margin-top:10px;">
           ${Object.entries({running:"Running",stations:"Stations",transition:"Transition",power:"Power",engine:"Engine",grip:"Grip",fatigueResistance:"Fatigue Res."}).map(([k,label])=>{
-            const c=analysis.strengthIdxConfidence[k]; const v=strengthIdx[k];
+            const c=detailStrength.strengthIdxConfidence[k]; const v=detailStrength.strengthIdx[k];
             const confColor={high:"var(--green)",medium:"var(--amber)",low:"var(--red)",none:"var(--gray-dim)"}[c?.confidence||"none"];
             return `<div class="row-between" style="font-size:11.5px;"><span style="color:var(--gray);">${label}</span><span class="mono">${v!=null?round1(v):"—"} <span style="color:${confColor};text-transform:uppercase;">· ${c?.confidence||"none"}${c&&c.total?` · ${c.count}/${c.total}`:""}</span></span></div>`;
           }).join("")}
@@ -13405,18 +13935,12 @@ function renderPeer(wrap){
       </div>
 
       <div class="divider" style="margin:16px 0;"></div>
-      <div class="eyebrow gray">HYROX Impact Score (내부 가중치)</div>
-      <p class="lead" style="margin:6px 0 10px;">시간 손실 × 종목 가중치 기준. 가중치: Run 25% · Push 12% · Pull 10% · Burpee 10% · Lunge 10% · Wall Ball 10% · Ski 8% · Row 8% · Farmers 7%</p>
-      <div style="overflow-x:auto;"><table><thead><tr><th>종목</th><th class="num">기준(평균) 대비</th><th class="num">영향도</th></tr></thead><tbody>
-        ${impactList.map(it=>`<tr><td>${it.label}</td><td class="num mono" style="color:${it.timeLoss>=0?'var(--red)':'var(--green)'}">${it.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(it.timeLoss))}</td><td class="num mono">${round1(it.impactPct)}%</td></tr>`).join("")}
-      </tbody></table></div>
-
-      <div class="divider" style="margin:16px 0;"></div>
       <div class="eyebrow gray">구간별 퍼센타일/등급 · Z-score</div>
-      <p class="lead" style="margin:2px 0 8px;">🟢 REAL PEER DATA(${MIN_REAL_SAMPLE}건↑ 실측) · 🟡 REFERENCE ESTIMATE(예시 기준값)</p>
+      <p class="lead" style="margin:2px 0 8px;">🟢 REAL PEER DATA(${MIN_REAL_SAMPLE}건↑ 실측) · 🟡 REFERENCE ESTIMATE(예시 기준값)${DNA_RACE_FILTER ? "" : " · 전체 대회 단순평균 기준"}</p>
       ${(() => {
-        const runSegsForTable = segments.filter(s=>s.kind==="run" && s.actual!=null);
-        const otherSegsForTable = segments.filter(s=>s.kind!=="run" && s.actual!=null);
+        const detailSegments = detailStrength.segments;
+        const runSegsForTable = detailSegments.filter(s=>s.kind==="run" && s.actual!=null);
+        const otherSegsForTable = detailSegments.filter(s=>s.kind!=="run" && s.actual!=null);
         const runAvgPct = runSegsForTable.length ? mean(runSegsForTable.map(s=>s.percentile)) : null;
         const runAvgZ = runSegsForTable.length ? mean(runSegsForTable.map(s=>s.z)) : null;
         const runAllReal = runSegsForTable.length>0 && runSegsForTable.every(s=>s.peerIsReal);
@@ -13458,6 +13982,7 @@ function renderPeer(wrap){
       ` : ""}
     </div>
   `;
+  wrap.querySelector("#dna-race-filter")?.addEventListener("change",(e)=>{ DNA_RACE_FILTER=e.target.value||null; renderAll(); });
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
   wrap.querySelectorAll("[data-dna-evo-tab]").forEach(el=>el.addEventListener("click",()=>{ DNA_EVO_TAB=el.dataset.dnaEvoTab; renderAll(); }));
@@ -13551,7 +14076,7 @@ function buildImprovementTop3(impactList, race){
 /*     the UI can be honest about which source produced the list.          */
 /* ---------------------------------------------------------------------- */
 function getDnaWeaknessRanking(n=3){
-  const peer = computePeerAnalysis();
+  const peer = computePeerAnalysis(true);
   if(peer){
     const top3 = buildImprovementTop3(peer.impactList, peer.race).slice(0,n);
     if(top3.length) return { source:"dna", items: top3 };
@@ -13560,7 +14085,7 @@ function getDnaWeaknessRanking(n=3){
   return { source:"trainingPriority", items: priority.slice(0,n).map(p=>({ label:INDEX_META[p.key].friendly, key:p.key, reason:null })) };
 }
 function getDnaStrengthRanking(n=3){
-  const peer = computePeerAnalysis();
+  const peer = computePeerAnalysis(true);
   if(peer){
     const top3 = buildStrengthsTop3(peer.segments).slice(0,n);
     if(top3.length) return { source:"dna", items: top3.map(s=>({ label:s.label, key:null, reason:s.desc })) };
@@ -13703,6 +14228,31 @@ function dnaEvolutionSectionHtml(){
     return `${head}<div class="empty-note">아직 경기력 변화 데이터를 표시하기에 충분한 대회 기록이 없습니다${evo&&evo.points.length===1?` (현재 1건 — 2건 이상부터 변화 추이가 표시됩니다)`:""}.</div>`;
   }
   const allPoints = evo.points;
+  // spec (전면수정 Phase 2): 그래프 위에 "반복적으로 부족하게 나오는 스테이션"을 바로 확인할 수 있게
+  // — Station → Run Fatigue 섹션의 반복성 판정(<40% 일시적 · 40~59% 관찰 · ≥60% 반복 패턴 · ≥80%
+  // 강한 반복 패턴, 표본 4개 미만이면 실발생 3회 이상) 기준을 그대로 재사용한다. "부족"의 기준은
+  // 이 시스템의 기존 등급 컷(점수<60 = 개선 필요, peerScoreBand와 동일)을 그대로 쓴다.
+  const weaknessRepetitionHtml = (()=>{
+    const rows = DNA_EVOLUTION_ITEMS.map(it=>{
+      const measured = allPoints.filter(p=>p.scores[it.key]!=null);
+      if(measured.length<2) return null;
+      const weakOccurrences = measured.filter(p=>p.scores[it.key]<60).length;
+      if(weakOccurrences===0) return null;
+      const ratio = weakOccurrences/measured.length;
+      const pattern = ratio>=0.8||(measured.length<4&&weakOccurrences>=3) ? {circle:"🔴",label:"강한 반복 패턴"}
+        : ratio>=0.6 ? {circle:"🟢",label:"반복 패턴"}
+        : ratio>=0.4 ? {circle:"🟡",label:"관찰"} : {circle:"⚪",label:"일시적"};
+      return { key:it.key, label:it.label, occurrences:weakOccurrences, total:measured.length, ratio, pattern };
+    }).filter(Boolean).sort((a,b)=> b.ratio-a.ratio || b.occurrences-a.occurrences);
+    if(!rows.length) return "";
+    return `<div style="margin-bottom:14px;">
+      <div class="eyebrow gray" style="margin-bottom:6px;">🔁 반복적으로 부족하게 나오는 스테이션</div>
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        ${rows.map(r=>`<div class="row-between" style="font-size:12.5px;"><span>${r.pattern.circle} ${escapeHtml(r.label)}</span><span class="mono" style="color:var(--gray-dim);">${r.occurrences}/${r.total}회 · ${r.pattern.label}</span></div>`).join("")}
+      </div>
+      <p class="reason-line" style="margin-top:6px;color:var(--gray-dim);">점수 60점 미만(개선 필요 등급)으로 나온 대회 비율 기준입니다 — ⚪ 일시적(&lt;40%) · 🟡 관찰(40~59%) · 🟢 반복 패턴(≥60%) · 🔴 강한 반복 패턴(≥80%, 표본 4개 미만이면 실발생 3회 이상).</p>
+    </div>`;
+  })();
   const shown = DNA_EVO_SHOW_ALL ? allPoints : allPoints.slice(-DNA_EVO_RECENT_COUNT);
   const tab = DNA_EVO_TAB;
   const selector = `<div class="hstack" style="gap:6px;flex-wrap:wrap;margin-bottom:12px;">
@@ -13767,7 +14317,7 @@ function dnaEvolutionSectionHtml(){
     ? `<div class="hstack" style="margin-top:10px;"><span class="chip" id="dna-evo-show-all">최근 ${DNA_EVO_RECENT_COUNT}개 대회 표시 중 — 전체 ${allPoints.length}개 보기 →</span></div>`
     : (DNA_EVO_SHOW_ALL && allPoints.length>DNA_EVO_RECENT_COUNT ? `<div class="hstack" style="margin-top:10px;"><span class="chip" id="dna-evo-show-all">전체 ${allPoints.length}개 표시 중 — 최근만 보기 →</span></div>` : "");
 
-  return `${head}${selector}${chartHtml}${legend}${detailHtml}${changeSummaryHtml}${rangeNote}`;
+  return `${head}${weaknessRepetitionHtml}${selector}${chartHtml}${legend}${detailHtml}${changeSummaryHtml}${rangeNote}`;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -13939,7 +14489,7 @@ function renderRoadmap(wrap){
   const phaseColor={Base:"var(--gray)",Build:"var(--amber)",Peak:"var(--orange)",Taper:"var(--green)"};
   wrap.innerHTML = `
     <div><div class="eyebrow">ENGINE OUTPUT · RACE ROADMAP</div><h1 class="page-title">레이스까지의 로드맵</h1></div>
-    ${!blocks? `<div class="card"><div class="empty-note">프로필 페이지에서 목표 대회 날짜를 입력하면 Base/Build/Peak/Taper 로드맵이 자동 생성됩니다.</div></div>` : `
+    ${!blocks? `<div class="card"><div class="empty-note">목표 설정 페이지에서 목표 대회 날짜를 입력하면 Base/Build/Peak/Taper 로드맵이 자동 생성됩니다.</div></div>` : `
     <div class="grid grid-4">
       ${blocks.map(b=>`
         <div class="card" style="border-top:3px solid ${phaseColor[b.phase]};">
@@ -14018,8 +14568,38 @@ function renderModel(wrap){
 }
 // "아카이브" 탭 — 주간 훈련계획 페이지에 있던 "능력 요약"/"훈련 우선순위(상세)"를 그대로 옮긴 것.
 // 주간 훈련계획은 실제 이번 주 세션만 보여주는 데 집중하고, 이 상세 진단은 참고용 아카이브로 이동.
+// spec (전면수정 Phase 1): 훈련 추천 기능(주간 훈련계획/레이스 로드맵/훈련 기록)이 나중으로
+// 미뤄지면서, 이 셋과 그 입력값인 고정 스케줄(박스)·회복 주기 설정도 메인 네비게이션에서 빼서
+// 여기로 옮겼다 — 기능은 삭제되지 않고 계속 그대로 동작하며, 여기서만 접근한다.
 function renderModelArchiveTab(wrap){
-  wrap.innerHTML = `<p class="lead" style="margin:0 0 14px;">주간 훈련계획 페이지에 있던 "능력 요약"과 "훈련 우선순위(상세)"를 이곳으로 옮겼습니다 — 계산 로직은 변경되지 않았습니다.</p>${trainingPriorityAndAbilitySummaryHtml()}`;
+  wrap.innerHTML = `
+    <p class="lead" style="margin:0 0 14px;">주간 훈련계획 페이지에 있던 "능력 요약"과 "훈련 우선순위(상세)"를 이곳으로 옮겼습니다 — 계산 로직은 변경되지 않았습니다.</p>
+    ${trainingPriorityAndAbilitySummaryHtml()}
+    <div class="divider" style="margin:20px 0;"></div>
+    <div class="card">
+      <h2 class="section-title">아카이브된 페이지 바로가기</h2>
+      <p class="lead" style="margin:6px 0 12px;">훈련 추천 기능이 나중으로 미뤄지면서 메인 메뉴에서 뺀 페이지들입니다 — 기능은 그대로 남아있습니다.</p>
+      <div class="hstack" style="gap:8px;flex-wrap:wrap;">
+        <button class="btn sm secondary" id="arch-goto-training">훈련 기록</button>
+        <button class="btn sm secondary" id="arch-goto-plan">주간 훈련계획</button>
+        <button class="btn sm secondary" id="arch-goto-roadmap">레이스 로드맵</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 class="section-title">고정 스케줄 (박스)</h2>
+      <p class="lead" style="margin:6px 0 12px;">주간 훈련계획을 만들 때 박스(크로스핏) 고정 세션을 반영하기 위한 설정입니다.</p>
+      <div id="arch-box-schedule"></div>
+    </div>
+    <div class="card">
+      <h2 class="section-title">회복 주기 · 예측 설정</h2>
+      <div id="arch-deload-settings"></div>
+    </div>
+  `;
+  wrap.querySelector("#arch-goto-training")?.addEventListener("click",()=>{ CURRENT_PAGE="training"; renderAll(); });
+  wrap.querySelector("#arch-goto-plan")?.addEventListener("click",()=>{ CURRENT_PAGE="plan"; renderAll(); });
+  wrap.querySelector("#arch-goto-roadmap")?.addEventListener("click",()=>{ CURRENT_PAGE="roadmap"; renderAll(); });
+  renderProfileScheduleTab(wrap.querySelector("#arch-box-schedule"));
+  renderProfileSettingsTab(wrap.querySelector("#arch-deload-settings"));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -14535,7 +15115,22 @@ function renderAccount(wrap){
         <div id="sb-status" style="margin-top:10px;"></div>
       `}
     </div>
+
+    <div class="card">
+      <div style="font-size:13px; font-weight:700; margin-bottom:4px;">예측 민감도</div>
+      <p class="lead" style="margin:0 0 10px;">훈련 데이터의 변화가 예상 경기 기록에 얼마나 빠르게 반영될지 설정합니다.</p>
+      <div class="hstack" style="gap:8px; flex-wrap:wrap;">
+        ${Object.entries(SENSITIVITY_META).map(([key,meta])=>`
+          <div class="chip ${STATE.settings.predictionSensitivity===key?"on":""}" data-sensitivity="${key}" style="padding:9px 16px; font-size:12.5px; cursor:pointer;">
+            ${meta.label}${key==="recommended"?" ⭐":""}
+          </div>`).join("")}
+      </div>
+      <p class="lead" style="margin-top:8px;">${escapeHtml(SENSITIVITY_META[STATE.settings.predictionSensitivity]?.desc || "")}</p>
+    </div>
   `;
+  wrap.querySelectorAll("[data-sensitivity]").forEach(chip=>chip.addEventListener("click",()=>{
+    STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
+  }));
   wrap.querySelectorAll("[data-account-tab]").forEach(t=>t.addEventListener("click",()=>{ ACCOUNT_UI_MODE=t.dataset.accountTab; renderAll(); }));
   wrap.querySelector("#sb-signin")?.addEventListener("click",async ()=>{
     const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value;
