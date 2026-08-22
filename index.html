@@ -1144,7 +1144,9 @@ function gatherSegmentCandidatesV3(seg, ctx){
     } else {
       // 10K TT가 아예 없으면, 보유한 다른 거리(예: 5K) 러닝 기록 중 가장 최근 것을 같은 "+30초/km"
       // 규칙으로 환산해 참고용 신호로 쓴다 (trainingLog 신뢰도 0.5로, 10K 기반 추정보다 낮게 취급됨).
-      const otherTt=(STATE.trainingLog||[]).filter(l=>l.type==="tt" && l.distanceKm>0 && l.avgPaceSecKm)
+      // spec: 10K 이하 거리만 사용 — 하프마라톤 등 장거리는 페이스 특성이 달라 +30초/km 환산이
+      // 부정확해지므로 제외한다.
+      const otherTt=(STATE.trainingLog||[]).filter(l=>l.type==="tt" && l.distanceKm>0 && l.distanceKm<=10 && l.avgPaceSecKm)
         .sort((a,b)=>b.date.localeCompare(a.date))[0];
       if(otherTt) add(Number(otherTt.avgPaceSecKm)+30, otherTt.date, "trainingLog", null,
         `${otherTt.distanceKm}km TT + 30초/km (10K TT 없어 다른 거리 기록으로 환산 — 참고용)`);
@@ -1621,7 +1623,10 @@ function strengthSessionsNear(centerDate, windowDays=21){
 // (stationTests / trainingLog) without any invented conversion factor. Each test raises confidence
 // ONLY for the index it actually measures (see calcIndexConfidence below), never a blanket upgrade.
 const QUICK_TEST_OPTIONS = [
-  { key:"run1km", label:"1km Run TT", unit:"1km", isRunning:true },
+  { key:"run1km", label:"1km Run TT", unit:"1km", isRunning:true, distanceKm:1 },
+  { key:"run3km", label:"3km Run TT", unit:"3km", isRunning:true, distanceKm:3 },
+  { key:"run5km", label:"5km Run TT", unit:"5km", isRunning:true, distanceKm:5 },
+  { key:"run10km", label:"10km Run TT", unit:"10km", isRunning:true, distanceKm:10 },
   { key:"ski", label:"SkiErg 1000m", unit:"1000m" },
   { key:"row", label:"Row 1000m", unit:"1000m" },
   { key:"sledPush", label:"Sled Push", unit:"50m" },
@@ -7236,9 +7241,16 @@ function queryDerivedBenchmark(division, gender, ageBand, segment){
 }
 function filterExternalRaceDb(group){
   const { gender, ageGroup, division } = group;
+  // Mixed Doubles is a team category: the peer pool is the Mixed team pool,
+  // not the athlete's individual sex. A female user competing in Mixed must
+  // therefore NOT filter real Mixed rows by gender=female.
+  const isMixedDivision = normalizeRaceDivision(division)==="Mixed Doubles";
   return EXTERNAL_RACE_DB.filter(r=>{
     if(r.analysis_valid===false) return false; // RAW is preserved in EXTERNAL_RACE_DB; only ANALYSIS-valid rows feed DNA/Peer/Podium
-    if(gender && r.gender!==gender) return false;
+    if(isMixedDivision){
+      if(normalizeRaceDivision(r.division)!=="Mixed Doubles") return false;
+      if(r.gender && String(r.gender).toLowerCase()!=="mixed") return false;
+    } else if(gender && r.gender!==gender) return false;
     if(ageGroup && r.age_group!==ageGroup) return false;
     if(division && r.division!==division) return false;
     // event/date/country: only filter when the record actually has a value AND it differs — an
@@ -7262,8 +7274,21 @@ function segmentDbField(seg){
 // exists anywhere in that chain does this fall through to EXTERNAL_RACE_DB (spec §2, unchanged) and
 // finally the illustrative PEER_SEGMENTS model — no more "30 real participants or illustrative", since
 // a pre-aggregated ASIA/Global row with its own sample_n now outranks that check entirely.
+// Mixed Doubles peer rows are TEAM-level (gender=MIXED).
+// Keep that peer pool intact, but when an athlete has station share data,
+// derive a gender-specific PERSONAL station benchmark from the Mixed team distribution.
+// The factor is centered on the existing DOUBLES_GENDER_MULT so the Mixed average itself is preserved.
+function mixedAthleteGenderFactor(gender){
+  const g=String(gender||"").toLowerCase();
+  const femaleMult=DOUBLES_GENDER_MULT;
+  const avg=(1+femaleMult)/2;
+  return g==="female" ? femaleMult/avg : 1/avg;
+}
+
 function queryPeerSegmentStats(seg, group){
   const { gender, ageGroup, division } = group;
+  const mixedPersonalMode = normalizeRaceDivision(division)==="Mixed Doubles" &&
+    seg.kind==="station" && group.mixedPersonalMode===true && !!group.athleteGender;
 
   // Newly uploaded official HYROX results are the first real-data source for Race DNA.
   // Once the exact gender/age-group/division segment has >= MIN_REAL_SAMPLE rows,
@@ -7271,13 +7296,22 @@ function queryPeerSegmentStats(seg, group){
   // benchmark. This means adding a new race CSV can actually change the DNA percentile/impact.
   const matched = filterExternalRaceDb(group);
   const field = segmentDbField(seg);
-  const realValues = matched.map(r=>r[field]).filter(v=>v!=null);
+  // Supabase/CSV payloads can contain numeric-looking strings. DNA math must never let
+  // one non-numeric value turn the SD/Z-score into NaN while the mean still renders.
+  const realValues = matched.map(r=>Number(r[field])).filter(v=>Number.isFinite(v) && v>0);
   if(realValues.length>=MIN_REAL_SAMPLE){
-    const realMean=mean(realValues);
+    let realMean=mean(realValues);
     const variance=mean(realValues.map(v=>(v-realMean)*(v-realMean)));
-    const realSd = variance!=null && variance>0 ? Math.sqrt(variance) : realMean*SD_PCT[seg.kind];
+    let realSd = (Number.isFinite(variance) && variance>0)
+      ? Math.sqrt(variance)
+      : (Number.isFinite(realMean) && realMean>0 ? realMean*SD_PCT[seg.kind] : null);
+    if(mixedPersonalMode){
+      const f=0.5*mixedAthleteGenderFactor(group.athleteGender);
+      realMean*=f;
+      if(realSd!=null) realSd*=f;
+    }
     return { mean:realMean, sd:realSd, n:realValues.length, isReal:true,
-      source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})`,
+      source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준`:``}`,
       benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length };
   }
 
@@ -7292,10 +7326,13 @@ function queryPeerSegmentStats(seg, group){
   const benchGender = deriveBenchmarkGender(division);
   const derivedKey = seg.key==="roxzone" ? "transition" : seg.key;
   const derived = queryDerivedBenchmark(division, benchGender, ageBand, derivedKey);
-  if(derived && derived.p50){
-    const sd = derived.p50 * SD_PCT[seg.kind];
-    return { mean:derived.p50, sd, n:derived.sample_n||null, isReal:true,
-      source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})`,
+  const derivedP50 = derived ? Number(derived.p50) : null;
+  if(Number.isFinite(derivedP50) && derivedP50>0){
+    let benchmarkMean=derivedP50;
+    if(mixedPersonalMode) benchmarkMean*=0.5*mixedAthleteGenderFactor(group.athleteGender);
+    const sd = benchmarkMean * SD_PCT[seg.kind];
+    return { mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
+      source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준`:``}`,
       benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null };
   }
 
@@ -7306,6 +7343,7 @@ function queryPeerSegmentStats(seg, group){
     const menMean = seg.base * PEER_CALIBRATION_SCALE * 1.0 * divMultD * am;
     const womenMean = seg.base * PEER_CALIBRATION_SCALE * DOUBLES_GENDER_MULT * divMultD * am;
     illustrativeMean = (menMean+womenMean)/2;
+    if(mixedPersonalMode) illustrativeMean = (gender==="female" ? womenMean : menMean) * 0.5;
   } else {
     const gm = (division==="Open Doubles" || division==="Pro Doubles")
       ? (gender==="female" ? DOUBLES_GENDER_MULT : 1.0)
@@ -7730,20 +7768,26 @@ function computePooledDnaSegment(seg, poolEntries, goalDiv, baseDivision){
     const c = resolveDnaSegmentContribution(seg, e.race);
     if(!c) return null;
     const sourceDivision = c.division || normalizeRaceDivision(e.race.division) || e.race.division;
-    const comparisonSec = (c.isDoublesRace && c.teamTime!=null) ? c.teamTime : c.sec;
+    const mixedPersonalMode = sourceDivision==="Mixed Doubles" && seg.kind==="station" && c.hasShareData;
+    const comparisonSec = mixedPersonalMode ? c.sec : ((c.isDoublesRace && c.teamTime!=null) ? c.teamTime : c.sec);
     if(comparisonSec==null) return null;
     const groupFilters = {
-      gender: STATE.profile.gender==="female" ? "female":"male",
+      // Mixed rows remain the peer pool; athleteGender only controls the personal station benchmark.
+      gender: sourceDivision==="Mixed Doubles" ? "mixed" : (STATE.profile.gender==="female" ? "female":"male"),
+      athleteGender: STATE.profile.gender,
+      mixedPersonalMode,
       ageGroup: getAgeGroup(Number(STATE.profile.age)),
       division: sourceDivision,
       event:null, date:null, country: STATE.profile.country || null,
     };
     const stats = queryPeerSegmentStats(seg, groupFilters);
-    const z = stats.peerSd ? (stats.mean-comparisonSec)/stats.sd : null;
-    const percentile = z!=null ? clamp(normalCdf(z)*100,0.5,99.5) : null;
+    const actualNum=Number(comparisonSec), meanNum=Number(stats.mean), sdNum=Number(stats.sd);
+    const z = Number.isFinite(actualNum) && Number.isFinite(meanNum) && Number.isFinite(sdNum) && sdNum>0
+      ? (meanNum-actualNum)/sdNum : null;
+    const percentile = Number.isFinite(z) ? clamp(normalCdf(z)*100,0.5,99.5) : null;
     return { ...c, weight:e.weight, tier:e.tier, sourceDivision,
-      rawSec:comparisonSec, sec:comparisonSec, comparisonSec,
-      peerMean:stats.mean, peerSd:stats.sd, peerN:stats.n, peerIsReal:stats.isReal,
+      rawSec:actualNum, sec:actualNum, comparisonSec:actualNum,
+      peerMean:Number.isFinite(meanNum)?meanNum:null, peerSd:Number.isFinite(sdNum)?sdNum:null, peerN:stats.n, peerIsReal:stats.isReal,
       benchmarkSource:stats.benchmarkSource, sampleN:stats.sampleN,
       z, percentile, timeLoss:comparisonSec-stats.mean };
   }).filter(Boolean);
@@ -7756,14 +7800,23 @@ function computePooledDnaSegment(seg, poolEntries, goalDiv, baseDivision){
         benchmarkDivision:null, benchmarkSource:null, sampleN:null, confidence:"none", comparisonMode:"source-division" } };
   }
 
-  const totalW = contributions.reduce((s,c)=>s+c.weight,0) || 1;
-  const pooledActual = contributions.reduce((s,c)=>s+c.comparisonSec*c.weight,0)/totalW;
-  const peerMean = contributions.reduce((s,c)=>s+(c.peerMean??0)*c.weight,0)/totalW;
-  const peerSd = contributions.reduce((s,c)=>s+(c.peerSd??0)*c.weight,0)/totalW;
-  const z = contributions.every(c=>c.z!=null) ? contributions.reduce((s,c)=>s+c.z*c.weight,0)/totalW : null;
-  const percentileVals = contributions.filter(c=>c.percentile!=null);
+  const totalW = contributions.reduce((s,c)=>s+Number(c.weight||0),0) || 1;
+  const pooledActual = contributions.reduce((s,c)=>s+Number(c.comparisonSec||0)*Number(c.weight||0),0)/totalW;
+  const meanVals = contributions.filter(c=>Number.isFinite(c.peerMean));
+  const meanW = meanVals.reduce((s,c)=>s+Number(c.weight||0),0) || 1;
+  const peerMean = meanVals.length ? meanVals.reduce((s,c)=>s+c.peerMean*Number(c.weight||0),0)/meanW : null;
+  const sdVals = contributions.filter(c=>Number.isFinite(c.peerSd) && c.peerSd>0);
+  const sdW = sdVals.reduce((s,c)=>s+Number(c.weight||0),0) || 1;
+  const peerSd = sdVals.length ? sdVals.reduce((s,c)=>s+c.peerSd*Number(c.weight||0),0)/sdW : null;
+  // A missing Z in one historical contribution must not erase valid Z/percentile
+  // values from the other contributions. Renormalize over the valid contributions.
+  const zVals = contributions.filter(c=>Number.isFinite(c.z));
+  const zW = zVals.reduce((s,c)=>s+Number(c.weight||0),0) || 1;
+  const z = zVals.length ? zVals.reduce((s,c)=>s+c.z*Number(c.weight||0),0)/zW : null;
+  const percentileVals = contributions.filter(c=>Number.isFinite(c.percentile));
+  const percentileW = percentileVals.reduce((s,c)=>s+Number(c.weight||0),0) || 1;
   const percentile = percentileVals.length
-    ? percentileVals.reduce((s,c)=>s+c.percentile*c.weight,0)/percentileVals.reduce((s,c)=>s+c.weight,0)
+    ? percentileVals.reduce((s,c)=>s+c.percentile*Number(c.weight||0),0)/percentileW
     : null;
   const timeLoss = contributions.reduce((s,c)=>s+(c.timeLoss??0)*c.weight,0)/totalW;
   const sourceWeights={};
@@ -7823,17 +7876,20 @@ function computeDnaSegmentsForRace(race){
   if(!race) return null;
   const profile=STATE.profile;
   const ageGroup=getAgeGroup(Number(profile.age));
-  const gender = profile.gender==="female" ? "female":"male";
   const raceDiv = normalizeRaceDivision(race.division) || profile.division;
+  // Mixed Doubles is team-level: compare against Mixed teams regardless of the athlete's sex.
+  const gender = raceDiv==="Mixed Doubles" ? "mixed" : (profile.gender==="female" ? "female":"male");
   const division = DIVISIONS.includes(raceDiv) ? raceDiv : (DIVISIONS.includes(profile.division) ? profile.division : "Open");
   const groupFilters = { gender, ageGroup, division, event:null, date:null, country:profile.country||null };
   const segments = PEER_SEGMENTS.map(seg=>{
-    const stats=queryPeerSegmentStats(seg,groupFilters);
+    const shareAvailable = race?.share?.[seg.key]!=null && race?.share?.[seg.key]!=="" && Number.isFinite(Number(race.share[seg.key]));
+    const stats=queryPeerSegmentStats(seg,{...groupFilters, athleteGender:profile.gender, mixedPersonalMode:raceDiv==="Mixed Doubles" && seg.kind==="station" && shareAvailable});
     const contribution=resolveDnaSegmentContribution(seg,race);
     if(!contribution) return { ...seg, actual:null, peerMean:stats.mean, peerSd:stats.sd, peerN:stats.n,
       peerIsReal:stats.isReal, benchmarkSource:stats.benchmarkSource, sampleN:stats.sampleN,
       basis:null,z:null,percentile:null,star:null,timeLoss:null,contribution:null };
-    const comparisonSec=(contribution.isDoublesRace && contribution.teamTime!=null) ? contribution.teamTime : contribution.sec;
+    const mixedPersonalMode = raceDiv==="Mixed Doubles" && seg.kind==="station" && contribution.hasShareData;
+    const comparisonSec=mixedPersonalMode ? contribution.sec : ((contribution.isDoublesRace && contribution.teamTime!=null) ? contribution.teamTime : contribution.sec);
     const z=stats.sd ? (stats.mean-comparisonSec)/stats.sd : null;
     const percentile=z!=null ? clamp(normalCdf(z)*100,0.5,99.5) : null;
     return { ...seg, actual:comparisonSec, peerMean:stats.mean, peerSd:stats.sd, peerN:stats.n,
@@ -7944,36 +8000,36 @@ function computePeerAnalysisUncached(forceNoFilter){
   // Doubles→Singles conversion uses; Run/Transition never get share-adjusted. The benchmark comparison
   // group is always the athlete's configured (goal) Division — the real actual seconds themselves are
   // NEVER rescaled by a whole-race Division-workload multiplier (that's Prediction's job, not DNA's).
-  // P0 fix (Base/Goal/Source separation): three DISTINCT axes, never conflated —
-  //   Base Division   = STATE.profile.division (athlete's registered/competing division)
-  //   Goal Division   = STATE.profile.goalDivision || Base Division (what DNA/Prediction benchmark against)
-  //   Source Division = each pooled race's OWN race.division (where the "actual" numbers came from)
-  // Previously this read STATE.profile.division directly, so whenever a Goal Division was set that
-  // differed from the Base Division (e.g. Base=Pro Doubles / Goal=Pro), Race DNA silently benchmarked
-  // against the BASE Division instead of the Goal Division the athlete actually configured.
-  // spec (전면수정 Phase 2 - 완전 분리): Race DNA의 비교 Division은 profile.division("기준" 필드)도
-  // profile.goalDivision(목표)도 전혀 사용하지 않는다 — 실제로 보유한 대회 기록 중 가장 최근 기록의
-  // Division을 그대로 쓴다 (deriveDnaActualDivision()). "내 위치 확인"이 목적이므로, 아직 도달하지
-  // 않은 목표 Division이나 별도로 설정된 기준값이 여기 섞여 들어오면 안 된다.
-  // spec (전면수정 Phase 2 - 완전 분리): Race DNA의 비교 Division은 profile.division("기준" 필드)도
-  // profile.goalDivision(목표)도 전혀 사용하지 않는다 — 실제로 보유한 대회 기록의 Division을 그대로
-  // 쓴다. 특정 경기를 선택했을 때는(activeRaceFilter) 그 "선택한 경기"의 Division을 기준으로 삼고,
-  // "전체"일 때만 가장 최근 기록의 Division(deriveDnaActualDivision())을 쓴다 — 이전에는 경기를
-  // 선택해도 항상 가장 최근 기록 기준으로 고정되어 "다른 기록을 클릭해도 기준 Division이 안 바뀌는"
-  // 버그가 있었다.
+  // Race DNA는 "목표 Division에서 내가 얼마나 잘할까?"가 아니라
+  // "내가 실제로 뛴 Division에서 동조건 참가자 대비 어디인가?"를 보여준다.
+  // 따라서 profile.goalDivision은 Race DNA 비교군을 절대 결정하지 않는다.
+  //
+  // 우선순위
+  //  1) 특정 경기를 선택했다면 → 그 경기의 실제 Division
+  //  2) 전체 보기라면 → 프로필의 실제/기준 Division에 실제 경기 기록이 있으면 그 Division
+  //  3) 그마저 없으면 → 가장 최근 실제 경기의 Division
+  //  4) 해당 Division 기록이 전혀 없을 때만 gatherPooledDnaRaces()의 fallback
+  //
+  // 핵심: Base=Mixed Doubles + Goal=Pro Doubles + Mixed 실제 기록 보유
+  //       → Race DNA는 반드시 Mixed Doubles peer sample과 비교한다.
   const chosenRaceForFilter = activeRaceFilter ? STATE.races.find(r=>r && r.id===activeRaceFilter) : null;
-  // Default Race DNA benchmark group follows the configured Base Division.
-  // Only an explicitly selected race changes the comparison Division.
-  // This prevents adding a newer Mixed Doubles race from silently switching a
-  // Pro Doubles athlete's entire DNA comparison group to MIXED.
-  // DNA benchmark division is NEVER a Goal/Prediction setting.
-  // When a race is explicitly selected, compare that race against its own real Division.
-  // In "전체" mode, each pooled race is compared against its own real Division independently.
+  const allDnaRaces = [...STATE.races].filter(r=>r&&r.date)
+    .sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  const profileActualDivision = normalizeRaceDivision(STATE.profile.division) || STATE.profile.division || null;
+  const profileDivisionHasRace = profileActualDivision
+    ? allDnaRaces.some(r=>(normalizeRaceDivision(r.division)||r.division)===profileActualDivision)
+    : false;
   const selectedDivision = chosenRaceForFilter
     ? (normalizeRaceDivision(chosenRaceForFilter.division) || chosenRaceForFilter.division)
     : null;
-  const baseDivision = selectedDivision;
-  const goalDiv = selectedDivision || null;
+  const actualDivisionForDna = selectedDivision
+    || (profileDivisionHasRace ? profileActualDivision : deriveDnaActualDivision())
+    || null;
+  // baseDivision remains the athlete's actual/base setting for metadata.
+  // goalDiv is deliberately named for compatibility with the existing pooled-DNA helpers,
+  // but in this function it means "DNA comparison Division", NEVER goalDivision.
+  const baseDivision = profileActualDivision || actualDivisionForDna;
+  const goalDiv = actualDivisionForDna;
   // 특정 경기가 선택되어 있으면(DNA_RACE_FILTER) 그 경기 하나만 weight=1로 사용 — 없으면 기존과
   // 동일하게 최근 대회들을 recency-weighted로 pooling한다.
   let pool;
@@ -8789,13 +8845,15 @@ function raceStrip(race){
 // spec (전면수정 Phase 1/3): 목표 설정 메뉴에는 목표 설정만 남긴다 — 기록 예측/Division 전환 예측은
 // 훈련 추천 계열(훈련 기록/주간 훈련계획/레이스 로드맵)과 함께 메인 네비게이션에서 빼서 모델 설명 >
 // 아카이브 탭으로 옮겼다 — 기능은 삭제되지 않고 계속 접근 가능하다.
+// 대시보드 페이지 전체도 같은 원칙으로 메인 네비게이션(Overview)에서 빼서 모델 설명 > 대시보드 탭으로
+// 옮겼다 — 기능/로직은 그대로이며 여기서만 접근한다.
+// 러닝 능력치 탭도 메인 네비게이션에서 뺐다 — Quick Calibration Test에 3/5/10km Run TT가 추가되어
+// 대부분의 러닝 기록 입력은 그쪽으로 옮겨간다. renderRunning()과 STATE.running 필드, 그리고 10K TT
+// 모달의 "수정하러 가기" 딥링크(CURRENT_PAGE="running")는 그대로 남겨둬서 기존 데이터·로직이 깨지지
+// 않는다.
 const NAV = [
-  { group:"Overview", items:[
-    { id:"dashboard", label:"대시보드", ico:"◆" },
-  ]},
   { group:"Data Input", items:[
     { id:"races", label:"HYROX 대회 기록", ico:"2" },
-    { id:"running", label:"러닝 능력치", ico:"3" },
     { id:"strength", label:"테스트 · 시뮬레이션", ico:"4" },
   ]},
   { group:"Engine Output", items:[
@@ -12427,16 +12485,6 @@ function renderQuickTestTab(wrap){
         <tbody>${[...STATE.stationTests].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr><td style="white-space:nowrap;">${t.date}</td>${STATIONS.map(s=>`<td class="num mono" style="white-space:nowrap;">${t.values[s.key]||"—"}</td>`).join("")}<td style="white-space:nowrap;"><span class="list-remove" data-del-st="${t.id}">✕</span></td></tr>`).join("")}</tbody></table></div>`
         : `<div class="empty-note">Quick Test 기록이 없습니다 — 위에서 추가해보세요</div>`}
     </div>
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">예측에 실제 반영되는 값</h2></div>
-      <p class="lead" style="margin:6px 0 12px;">14일 이내 기록은 그대로 사용합니다. 14일이 지나면 심폐 스테이션(Ski/Row/Burpee)은 최근 러닝 페이스 추세로 최대 ±5%까지, 근력·그립 스테이션(Sled/Carry/Lunge/Wall Ball)은 최근 웨이트 세션 빈도 변화로 최대 ±2%까지만 보정합니다 — 근거 데이터가 없으면 아예 보정하지 않습니다.</p>
-      <table><thead><tr><th>스테이션</th><th class="num">사용값</th><th class="num">경과일</th><th>상태</th></tr></thead><tbody>
-        ${STATIONS.map(s=>{ const m=getStationDataMeta()[s.key];
-          if(!m) return `<tr><td>${s.label}</td><td class="num mono" colspan="3" style="color:var(--gray-dim);">데이터 없음</td></tr>`;
-          const badge = m.isFresh ? `<span class="badge elite">최신</span>` : m.adjusted ? `<span class="badge med">보정됨 (${m.adjustPct>=0?"+":""}${round1(m.adjustPct*100)}%)</span>` : `<span class="badge crit">오래됨 · 그대로 사용</span>`;
-          return `<tr><td>${s.label}</td><td class="num mono">${m.value}</td><td class="num mono">${m.ageDays}일</td><td>${badge}</td></tr>`; }).join("")}
-      </tbody></table>
-    </div>
   `;
   wrap.querySelector("#qt-add").addEventListener("click",()=>{
     const key=wrap.querySelector("#qt-key").value;
@@ -12446,9 +12494,10 @@ function renderQuickTestTab(wrap){
     if(!parseTimeToSec(timeStr)){ statusEl.style.color="var(--red)"; statusEl.textContent="기록을 mm:ss 형식으로 입력해주세요."; return; }
     const opt=QUICK_TEST_OPTIONS.find(o=>o.key===key);
     if(opt.isRunning){
-      const sec=parseTimeToSec(timeStr);
-      STATE.trainingLog.push({ id:uid(), date, type:"tt", distanceKm:1, durationMin:round1(sec/60),
-        avgPaceSecKm:sec, intensityRpe:null, painFlag:false, note:"Quick Calibration Test (1km TT)", source:"manual" });
+      const totalSec=parseTimeToSec(timeStr);
+      const distanceKm=opt.distanceKm||1;
+      STATE.trainingLog.push({ id:uid(), date, type:"tt", distanceKm, durationMin:round1(totalSec/60),
+        avgPaceSecKm:round1(totalSec/distanceKm), intensityRpe:null, painFlag:false, note:`Quick Calibration Test (${opt.label})`, source:"manual" });
     } else {
       STATE.stationTests.push({ id:uid(), date, values:{ [key]:timeStr }, source:"quick" });
     }
@@ -13775,6 +13824,7 @@ function dnaUserDataCompositionBanner(analysis){
   // spec (전면수정 Phase 2): Race DNA는 이제 기준(Base) Division 기준으로 계산되므로, 이 배너도
   // Base Division을 표시한다 (목표 Division이 아님 — 목표 기준 비교는 예측/목표 페이지 담당).
   const baseDiv = uc.baseDivision || analysis.userDataComposition?.baseDivision || STATE.profile.division;
+  const comparisonDiv = uc.goalDivision || analysis.goalDivision || baseDiv;
   const divLabel = (arr)=> arr && arr.length===1 ? arr[0] : (arr||[]).join("/");
   const raceCountLabel = `최근 ${uc.raceCount}개 경기 반영`;
   // P1: "Race Weight"(경기 전체 가중치 — 이 배너에 표시되는 값, 대회 하나가 전체 DNA에서 차지하는
@@ -13791,7 +13841,7 @@ function dnaUserDataCompositionBanner(analysis){
   if(!analysis.raceDivisionMismatch){
     return `<div class="card tight" style="background:var(--surface2);border-left:3px solid var(--green);">
       <div class="eyebrow" style="color:var(--green);">🟢 REAL USER DATA</div>
-      <div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(baseDiv)} 실제 경기 · ${raceCountLabel}${uc.raceCount>1?` (최근일수록 높은 가중치 60/30/10%)`:""}</div>
+      <div style="font-size:12.5px;color:var(--gray);margin-top:4px;">${escapeHtml(comparisonDiv)} 실제 경기 · ${raceCountLabel}${uc.raceCount>1?` (최근일수록 높은 가중치 60/30/10%)`:""}</div>
       ${weightNote}
     </div>`;
   }
@@ -13802,9 +13852,9 @@ function dnaUserDataCompositionBanner(analysis){
     compositionLine = `${escapeHtml(divLabel(uc.tierDivisions))} 100%`;
   }
   return `<div class="card tight" style="background:rgba(255,176,32,.08);border-left:3px solid var(--amber);">
-    <div class="eyebrow" style="color:var(--amber);">⚠️ ${escapeHtml(baseDiv)} 실제 기록이 없어 최근 실제 경기 기록을 기반으로 DNA를 계산했습니다</div>
+    <div class="eyebrow" style="color:var(--amber);">⚠️ ${escapeHtml(baseDiv)} 실제 기록이 부족해 가장 가까운 실제 경기 기록으로 DNA를 계산했습니다</div>
     <div style="font-size:12.5px;color:var(--white);margin-top:6px;">${compositionLine} · ${raceCountLabel}</div>
-    <div style="font-size:11px;color:var(--gray-dim);margin-top:2px;">최근 경기일수록 높은 가중치가 적용됩니다(60/30/10%). Race DNA는 기준(Base) Division 기준으로 계산되며, 목표 Division 설정과는 별개입니다.</div>
+    <div style="font-size:11px;color:var(--gray-dim);margin-top:2px;">실제 기록이 있는 Division을 우선하며, 필요한 경우에만 Division fallback을 사용합니다. 목표 Division 설정은 Race DNA 비교군을 바꾸지 않습니다.</div>
     ${weightNote}
   </div>`;
 }
@@ -13857,9 +13907,9 @@ function renderPeer(wrap){
   const typeLabel = typeCombo.insufficient ? "데이터 수집 중"
     : typeCombo.balanced ? "⚖️ 균형형"
     : typeCombo.types.map(t=>`${t.emoji} ${t.label}`).join(" + ");
-  const typeOneLiner = typeCombo.insufficient ? "구간 기록이 더 쌓이면 나만의 Race DNA 유형이 표시됩니다."
+  const typeOneLiner = typeCombo.insufficient ? "현재 보유한 실제 경기 기록을 바탕으로 한 참고 분류입니다."
     : strengthsTop3.length ? `${strengthsTop3.slice(0,2).map(s=>s.label).join("·")}이(가) ${improvementTop3.length?`강점이며, ${improvementTop3[0].label}에서 기록 손실이 발생하는 유형입니다.`:"뚜렷한 강점으로 나타납니다."}`
-    : "";
+    : "현재 기록에서는 한 축이 뚜렷하게 우세하지 않아 균형형으로 분류됩니다.";
 
   wrap.innerHTML = `
     <div><div class="eyebrow">ENGINE OUTPUT · PEER COMPARISON</div><h1 class="page-title">Race DNA</h1></div>
@@ -13872,7 +13922,7 @@ function renderPeer(wrap){
         </select>
       </div>
     </div>` : ""}
-    <p class="lead">비교 그룹: <b style="color:var(--orange)">Asia · ${group.gender==="female"?"Female":"Male"} · ${group.ageGroup} · ${group.division}</b>. ${
+    <p class="lead">비교 그룹: <b style="color:var(--orange)">Asia · ${group.gender==="female"?"Female":"Male"} · ${group.ageGroup} · ${group.division==="ACTUAL_RACE_DIVISIONS"?"실제 경기 Division별":group.division}</b>. ${
       dataSource.totalSegmentCount>0 && dataSource.realSegmentCount===dataSource.totalSegmentCount
         ? `실제 참가자 결과 DB 기반 비교입니다 (${dataSource.realSegmentCount}/${dataSource.totalSegmentCount}개 구간 모두 실제 데이터 ${MIN_REAL_SAMPLE}건 이상).`
         : dataSource.realSegmentCount>0
@@ -14044,13 +14094,18 @@ const RACE_DNA_TYPE_AXES = [
 // data AND a real, meaningful standout (score>=60 "양호" and clearly above the athlete's own average
 // across axes). Never forces a classification on thin data (spec §1/§8: "근거가 부족하면 단정하지
 //마세요") — returns insufficient:true instead, and the UI shows "데이터 수집 중".
-const RACE_DNA_MIN_SEGMENTS_FOR_TYPE = 10;
+// Race DNA 유형은 "실제 peer 표본이 30건 이상인가"와 별개의 문제다.
+// 실제 경기 기록/Reference Estimate로 축 점수가 계산됐다면, 표본이 얇다는 이유만으로
+// 전체 유형을 "데이터 수집 중"으로 숨기지 않는다. 근거가 너무 얇을 때만 보류한다.
+const RACE_DNA_MIN_SEGMENTS_FOR_TYPE = 8;
+const RACE_DNA_MIN_AXES_FOR_TYPE = 3;
 function raceDnaTypeCombo(strengthIdx, dataSource){
   if(!dataSource || dataSource.totalSegmentCount < RACE_DNA_MIN_SEGMENTS_FOR_TYPE) return { insufficient:true };
   const vals = RACE_DNA_TYPE_AXES.map(ax=>({ ...ax, score:strengthIdx[ax.key] })).filter(a=>a.score!=null);
-  if(vals.length<4) return { insufficient:true };
+  if(vals.length < RACE_DNA_MIN_AXES_FOR_TYPE) return { insufficient:true };
   const avg = mean(vals.map(v=>v.score));
-  const qualifying = vals.filter(v=>v.score>=60 && (v.score-avg)>=8).sort((a,b)=>(b.score-avg)-(a.score-avg));
+  const qualifying = vals.filter(v=>v.score>=60 && (v.score-avg)>=8)
+    .sort((a,b)=>(b.score-avg)-(a.score-avg));
   if(!qualifying.length) return { insufficient:false, types:[], balanced:true };
   return { insufficient:false, types:qualifying.slice(0,2), balanced:false };
 }
@@ -14574,6 +14629,7 @@ function renderModel(wrap){
   wrap.innerHTML = `
     <div><div class="eyebrow">EXPLAINABLE MODEL</div><h1 class="page-title">모델 설명</h1></div>
     <div class="tabs">
+      <div class="tab ${MODEL_TAB==="dashboard"?"active":""}" data-model-tab="dashboard">대시보드</div>
       <div class="tab ${MODEL_TAB==="model"?"active":""}" data-model-tab="model">모델 설명</div>
       <div class="tab ${MODEL_TAB==="rules"?"active":""}" data-model-tab="rules">Rule Engine</div>
       <div class="tab ${MODEL_TAB==="plan"?"active":""}" data-model-tab="plan">훈련계획 (코치 사고 과정)</div>
@@ -14586,13 +14642,20 @@ function renderModel(wrap){
   `;
   wrap.querySelectorAll("[data-model-tab]").forEach(t=>t.addEventListener("click",()=>{ MODEL_TAB=t.dataset.modelTab; renderAll(); }));
   const body=wrap.querySelector("#model-tab-body");
-  if(MODEL_TAB==="rules") renderRules(body);
+  if(MODEL_TAB==="dashboard") renderModelDashboardTab(body);
+  else if(MODEL_TAB==="rules") renderRules(body);
   else if(MODEL_TAB==="plan") renderModelPlanningTab(body);
   else if(MODEL_TAB==="dna") renderModelDnaImportTab(body);
   else if(MODEL_TAB==="podium") renderModelPodiumBasisTab(body);
   else if(MODEL_TAB==="prediction") renderModelPredictionBasisTab(body);
   else if(MODEL_TAB==="archive") renderModelArchiveTab(body);
   else renderModelExplainTab(body);
+}
+// "대시보드" 탭 — 메인 네비게이션(Overview)에 있던 대시보드 페이지 전체를 그대로 옮긴 것.
+// renderDashboard()는 원래도 wrap 인자만 받아 그 안에 렌더링하는 구조라, 컨테이너만 모델설명 탭
+// 바디로 바뀌었을 뿐 내부 로직·이벤트 바인딩은 전혀 손대지 않았다.
+function renderModelDashboardTab(wrap){
+  renderDashboard(wrap);
 }
 // "아카이브" 탭 — 주간 훈련계획 페이지에 있던 "능력 요약"/"훈련 우선순위(상세)"를 그대로 옮긴 것.
 // 주간 훈련계획은 실제 이번 주 세션만 보여주는 데 집중하고, 이 상세 진단은 참고용 아카이브로 이동.
@@ -14624,6 +14687,17 @@ function renderModelArchiveTab(wrap){
       <h2 class="section-title">회복 주기 · 예측 설정</h2>
       <div id="arch-deload-settings"></div>
     </div>
+    <div class="card">
+      <div style="font-size:13px; font-weight:700; margin-bottom:4px;">예측 민감도</div>
+      <p class="lead" style="margin:0 0 10px;">훈련 데이터의 변화가 예상 경기 기록에 얼마나 빠르게 반영될지 설정합니다.</p>
+      <div class="hstack" style="gap:8px; flex-wrap:wrap;">
+        ${Object.entries(SENSITIVITY_META).map(([key,meta])=>`
+          <div class="chip ${STATE.settings.predictionSensitivity===key?"on":""}" data-sensitivity="${key}" style="padding:9px 16px; font-size:12.5px; cursor:pointer;">
+            ${meta.label}${key==="recommended"?" ⭐":""}
+          </div>`).join("")}
+      </div>
+      <p class="lead" style="margin-top:8px;">${escapeHtml(SENSITIVITY_META[STATE.settings.predictionSensitivity]?.desc || "")}</p>
+    </div>
   `;
   wrap.querySelector("#arch-goto-training")?.addEventListener("click",()=>{ CURRENT_PAGE="training"; renderAll(); });
   wrap.querySelector("#arch-goto-plan")?.addEventListener("click",()=>{ CURRENT_PAGE="plan"; renderAll(); });
@@ -14632,6 +14706,9 @@ function renderModelArchiveTab(wrap){
   wrap.querySelector("#arch-goto-division")?.addEventListener("click",()=>{ CURRENT_PAGE="division"; renderAll(); });
   renderProfileScheduleTab(wrap.querySelector("#arch-box-schedule"));
   renderProfileSettingsTab(wrap.querySelector("#arch-deload-settings"));
+  wrap.querySelectorAll("[data-sensitivity]").forEach(chip=>chip.addEventListener("click",()=>{
+    STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
+  }));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -14762,6 +14839,17 @@ function renderModelPredictionBasisTab(wrap){
       <div class="kv"><span class="k">Forecast Adjustment (4주)</span><span class="v">${fmtTime(p4.predicted)} − ${fmtTime(p0.predicted)} = ${p4.predicted-p0.predicted>=0?"+":""}${round1(p4.predicted-p0.predicted)}초</span></div>
       <div class="divider" style="margin:10px 0;"></div>
       <p class="lead">계산식: <span class="mono">현재(0주) = Current Anchor (미래 요소 미적용)</span> · <span class="mono">N주 후 = Anchor×(1−Confidence) + ModelPrediction×Confidence + Bias Calibration</span>. Anchor는 최근 실제 대회 기록/Segment 모델 중 데이터 신뢰도가 높은 쪽(실제 기록 보호 로직 포함), ModelPrediction은 ΔHPI×k(Tier2 상한 포함) 기반 원시 계산값입니다. Confidence는 단순 입력 개수가 아니라 항목별 중요도 가중합으로 계산합니다. 범위 폭도 Race Execution Index뿐 아니라 이 신뢰도에 반비례해 넓어지거나 좁아집니다.</p>
+    </div>
+
+    <div class="card">
+      <div class="row-between"><h2 class="section-title">예측에 실제 반영되는 값</h2></div>
+      <p class="lead" style="margin:6px 0 12px;">14일 이내 기록은 그대로 사용합니다. 14일이 지나면 심폐 스테이션(Ski/Row/Burpee)은 최근 러닝 페이스 추세로 최대 ±5%까지, 근력·그립 스테이션(Sled/Carry/Lunge/Wall Ball)은 최근 웨이트 세션 빈도 변화로 최대 ±2%까지만 보정합니다 — 근거 데이터가 없으면 아예 보정하지 않습니다.</p>
+      <table><thead><tr><th>스테이션</th><th class="num">사용값</th><th class="num">경과일</th><th>상태</th></tr></thead><tbody>
+        ${STATIONS.map(s=>{ const m=getStationDataMeta()[s.key];
+          if(!m) return `<tr><td>${s.label}</td><td class="num mono" colspan="3" style="color:var(--gray-dim);">데이터 없음</td></tr>`;
+          const badge = m.isFresh ? `<span class="badge elite">최신</span>` : m.adjusted ? `<span class="badge med">보정됨 (${m.adjustPct>=0?"+":""}${round1(m.adjustPct*100)}%)</span>` : `<span class="badge crit">오래됨 · 그대로 사용</span>`;
+          return `<tr><td>${s.label}</td><td class="num mono">${m.value}</td><td class="num mono">${m.ageDays}일</td><td>${badge}</td></tr>`; }).join("")}
+      </tbody></table>
     </div>
   `;
 }
@@ -15147,22 +15235,7 @@ function renderAccount(wrap){
         <div id="sb-status" style="margin-top:10px;"></div>
       `}
     </div>
-
-    <div class="card">
-      <div style="font-size:13px; font-weight:700; margin-bottom:4px;">예측 민감도</div>
-      <p class="lead" style="margin:0 0 10px;">훈련 데이터의 변화가 예상 경기 기록에 얼마나 빠르게 반영될지 설정합니다.</p>
-      <div class="hstack" style="gap:8px; flex-wrap:wrap;">
-        ${Object.entries(SENSITIVITY_META).map(([key,meta])=>`
-          <div class="chip ${STATE.settings.predictionSensitivity===key?"on":""}" data-sensitivity="${key}" style="padding:9px 16px; font-size:12.5px; cursor:pointer;">
-            ${meta.label}${key==="recommended"?" ⭐":""}
-          </div>`).join("")}
-      </div>
-      <p class="lead" style="margin-top:8px;">${escapeHtml(SENSITIVITY_META[STATE.settings.predictionSensitivity]?.desc || "")}</p>
-    </div>
   `;
-  wrap.querySelectorAll("[data-sensitivity]").forEach(chip=>chip.addEventListener("click",()=>{
-    STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
-  }));
   wrap.querySelectorAll("[data-account-tab]").forEach(t=>t.addEventListener("click",()=>{ ACCOUNT_UI_MODE=t.dataset.accountTab; renderAll(); }));
   wrap.querySelector("#sb-signin")?.addEventListener("click",async ()=>{
     const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value;
