@@ -12122,12 +12122,16 @@ function bindHyroxNameSearch(wrap){
   });
   if(!HYROX_SEARCH_DB){
     ensureHyroxSearchDb().then(()=>{
+      // This card is shared by both the 기록(myrecord) page and the races input page — re-render
+      // on whichever one is actually showing, not just "races", or the other page's card stays
+      // stuck showing "연결하는 중…" even after the connection finishes in the background.
+      const onHostPage = CURRENT_PAGE==="races" || CURRENT_PAGE==="myrecord";
       if(HYROX_DB_QUERY && HYROX_DB_QUERY.trim().length>=2){
         searchHyroxByName(HYROX_DB_QUERY,20).then(r=>{
           HYROX_DB_RESULTS=r;
-          if(CURRENT_PAGE==="races") renderAll();
+          if(onHostPage) renderAll();
         });
-      } else if(CURRENT_PAGE==="races") renderAll();
+      } else if(onHostPage) renderAll();
     }).catch(e=>{
       const st=wrap.querySelector("#hyrox-db-status");
       if(st){ st.style.color="var(--red)"; st.textContent="Supabase 백데이터 연결 실패: "+(e.message||e); }
