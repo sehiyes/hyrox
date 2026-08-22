@@ -7802,25 +7802,24 @@ function computeDnaSegmentsForRace(race){
   };
   // Calculation order (spec §1), same whether the source is illustrative or a real DB:
   //   내 기록 → 동일 그룹 평균/SD (queryPeerSegmentStats) → z-score → percentile → time loss
+  // spec (Race DNA P0 fix): 개인/팀 기록 분리 로직(resolveDnaSegmentContribution)을 여기서도 그대로
+  // 재사용한다 — 이전에는 이 함수(DNA Evolution/반복성 체크에 쓰임)가 resolveOfficialSegment()를 직접
+  // 호출해서 Doubles Station의 팀 기록을 어떤 share 보정도 없이 그대로 "내 기록"으로 썼다. 이제
+  // Doubles share 보정(내 담당 몫만 반영)과 "share 없으면 제외" 규칙이 DNA 전 영역에서 일관되게
+  // 적용된다.
   const segments = PEER_SEGMENTS.map(seg=>{
     // peerMean/peerSd now flow through the queryPeerSegmentStats() seam (spec §7/①/⑯) — ASIA/Global
     // derived benchmark first, same resolver Prediction uses, illustrative model only as final fallback.
     const stats = queryPeerSegmentStats(seg, groupFilters);
     const { mean:peerMean, sd:peerSd, n:peerN, isReal:peerIsReal, benchmarkSource, sampleN } = stats;
-    // doc9 §30-2/§30-7/TEST-07: DNA's "actual" now comes ONLY from this specific official race —
-    // resolveOfficialSegment() has no Simulation/trainingLog fallback tier, so changing Simulation data
-    // can never move a DNA percentile/Z-score. (Prediction's own segment model, below/elsewhere, keeps
-    // using the full resolveSegment() hierarchy including Simulation — that's a deliberately different,
-    // separate question: "current estimated ability" vs. DNA's "position among real HYROX finishers".)
-    const slEntry = toSegmentListEntry(seg);
-    const resolved = slEntry ? resolveOfficialSegment(slEntry, race) : null;
-    const actual = resolved && resolved.sec!=null ? resolved.sec : null;
-    const basis = resolved ? resolved.basis : null;
-    if(actual==null) return { ...seg, actual:null, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z:null, percentile:null, star:null, timeLoss:null };
+    const contribution = resolveDnaSegmentContribution(seg, race);
+    const actual = contribution ? contribution.sec : null;
+    const basis = contribution ? (contribution.adjustmentApplied ? "actual-share-adjusted" : "actual") : null;
+    if(actual==null) return { ...seg, actual:null, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z:null, percentile:null, star:null, timeLoss:null, contribution:null };
     const z = (peerMean-actual)/peerSd;
     const percentile = clamp(normalCdf(z)*100, 0.5, 99.5);
     const timeLoss = actual-peerMean;
-    return { ...seg, actual, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z, percentile, star:starRating(z), timeLoss };
+    return { ...seg, actual, peerMean, peerSd, peerN, peerIsReal, benchmarkSource, sampleN, basis, z, percentile, star:starRating(z), timeLoss, contribution };
   });
   return { group:{gender,ageGroup,division}, race, segments };
 }
