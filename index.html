@@ -7686,17 +7686,12 @@ function resolveDnaSegmentContribution(seg, race){
     return { teamTime:resolved.sec, sharePct:Number(sharePctRaw), workloadAdjustedTime:personalSec, sec:personalSec,
       adjustmentApplied:true, hasShareData:true, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
   }
-  // spec (Race DNA P0 fix): Doubles Station인데 개인 담당 비율(sharePct)이 없으면, 팀 전체 기록을
-  // 개인 기록으로 잘못 해석해서 쓰면 안 된다 — 임의로 50%를 가정하지도 않는다. 이 Station은 이
-  // 경기에서 DNA 계산 대상에서 완전히 제외(null)한다 — computePooledDnaSegment()가 null을
-  // filter(Boolean)으로 걸러내므로, 같은 경기의 다른 Run/Station 기여분은 그대로 정상 반영된다.
-  if(isDoublesRace && canShare && !hasShare){
-    return null;
-  }
-  // 여기 도달하는 경우는 항상 Doubles가 아니거나(Run/Transition은 원래 공유 개념 자체가 없음),
-  // Singles 경기라 팀/개인 구분이 필요 없는 경우뿐이다.
-  return { teamTime: null, sharePct:null, workloadAdjustedTime:null, sec:resolved.sec,
-    adjustmentApplied:false, hasShareData:true, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
+  // spec (Race DNA — team-record comparison): the primary DNA percentile is always TEAM time vs TEAM
+  // benchmark for Doubles stations (see computePooledDnaSegment/computeDnaSegmentsForRace). A missing
+  // personal share% only means we can't show the auxiliary "개인 몫" breakdown for this station — it
+  // must NOT drop the station from DNA entirely, since we already have the team time we need to score it.
+  return { teamTime: isDoublesRace ? resolved.sec : null, sharePct:null, workloadAdjustedTime:null, sec:resolved.sec,
+    adjustmentApplied:false, hasShareData:false, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
 }
 
 // One segment, pooled across whichever of the candidate races actually HAVE that segment's data —
