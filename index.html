@@ -7860,15 +7860,23 @@ function raceDataCompleteness(race){
   if(parseTimeToSec(race.transition)!=null) n++;
   return n; // 0..17
 }
+// spec (전면수정 Phase 2 - 완전 분리): Race DNA의 비교 Division은 STATE.profile.division(프로필의
+// "기준" 필드)도, STATE.profile.goalDivision(목표)도 아니라 — 실제로 보유한 대회 기록 중 가장 최근
+// 기록의 Division에서 그대로 뽑는다. "내가 실제로 보유한 기록의 Division"이라는 요구사항을 그대로
+// 코드로 옮긴 것 — 목표 설정과 완전히 무관하게 동작한다.
+function deriveDnaActualDivision(){
+  const races=[...STATE.races].filter(r=>r&&r.date).sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  if(!races.length) return null;
+  return normalizeRaceDivision(races[0].division) || races[0].division;
+}
 function pickDnaRace(){
   const races = STATE.races.filter(r=>r && r.date);
   if(!races.length) return { race:null, exactMatch:false };
-  // spec (전면수정 Phase 2): Race DNA는 "지금 내 위치가 어디인가"를 보여주는 페이지이므로, 목표
-  // Division이 아니라 실제 수행 중인 기준(Base) Division 기준으로 비교 그룹을 정한다 — 목표
-  // Division으로 계산하면 아직 도달하지 않은 목표 기준과 비교하게 되어 "내 위치 확인"이라는 목적과
-  // 어긋난다. (목표 Division 기준 비교는 예측/목표 페이지에서 별도로 제공된다.)
-  const baseDivision = STATE.profile.division;
-  const goalDivision = baseDivision;
+  // Race DNA는 "지금 내 위치가 어디인가"를 보여주는 페이지이므로, 목표(Goal) Division도 프로필의
+  // "기준" 필드도 아니라 실제 보유 기록의 Division 기준으로 비교 그룹을 정한다 — 목표 Division
+  // 기준 비교는 예측/목표 페이지에서 별도로 제공된다.
+  const goalDivision = deriveDnaActualDivision() || STATE.profile.division;
+  const baseDivision = goalDivision;
   const goalDiv = normalizeRaceDivision(goalDivision) || goalDivision;
   const goalIsMixed = String(goalDiv||"").includes("Mixed");
   const isMixedRace = r=>String(normalizeRaceDivision(r.division)||r.division||"").includes("Mixed");
@@ -7929,12 +7937,12 @@ function computePeerAnalysisUncached(forceNoFilter){
   // Previously this read STATE.profile.division directly, so whenever a Goal Division was set that
   // differed from the Base Division (e.g. Base=Pro Doubles / Goal=Pro), Race DNA silently benchmarked
   // against the BASE Division instead of the Goal Division the athlete actually configured.
-  // spec (전면수정 Phase 2): Race DNA의 비교 그룹은 목표(Goal) Division이 아니라 실제 수행 중인
-  // 기준(Base) Division으로 계산한다 — "내 위치 확인"이 목적이므로 아직 도달하지 않은 목표 Division
-  // 기준으로 벤치마크하면 안 된다. (goalDivision 변수명은 하위 함수 호출부와의 호환을 위해 유지하되
-  // 실제 값은 baseDivision을 그대로 쓴다.)
-  const baseDivision = STATE.profile.division;
-  const goalDivision = baseDivision;
+  // spec (전면수정 Phase 2 - 완전 분리): Race DNA의 비교 Division은 profile.division("기준" 필드)도
+  // profile.goalDivision(목표)도 전혀 사용하지 않는다 — 실제로 보유한 대회 기록 중 가장 최근 기록의
+  // Division을 그대로 쓴다 (deriveDnaActualDivision()). "내 위치 확인"이 목적이므로, 아직 도달하지
+  // 않은 목표 Division이나 별도로 설정된 기준값이 여기 섞여 들어오면 안 된다.
+  const goalDivision = deriveDnaActualDivision() || STATE.profile.division;
+  const baseDivision = goalDivision;
   const goalDiv = normalizeRaceDivision(goalDivision) || goalDivision;
   // 특정 경기가 선택되어 있으면(DNA_RACE_FILTER) 그 경기 하나만 weight=1로 사용 — 없으면 기존과
   // 동일하게 최근 대회들을 recency-weighted로 pooling한다.
@@ -13112,15 +13120,14 @@ function renderGoal(wrap){
     <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">목표 설정</h1></div>
     <div class="card">
       <div class="grid grid-3">
-        ${field("기준 Division (실제 수행 중인 Division)", `<select id="goal-base-division">${DIVISIONS.map(d=>`<option value="${d}" ${p.division===d?"selected":""}>${d}</option>`).join("")}</select>`)}
-        ${field("목표 Division (기준과 다르게 설정 가능)", `<select id="goal-target-division">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select>`)}
+        ${field("목표 Division", `<select id="goal-target-division">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select>`)}
         ${field("목표 기록 (h:mm:ss)", `<input id="goal-time" placeholder="1:24:00" value="${escapeHtml(p.targetTime)}">`)}
+        ${field("목표 대회 날짜 (YYYY-MM-DD)", `<input id="goal-date" type="text" inputmode="numeric" placeholder="2026-10-04" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(p.targetDate)}">`)}
       </div>
       <div class="grid grid-3" style="margin-top:14px;">
-        ${field("목표 대회 날짜 (YYYY-MM-DD)", `<input id="goal-date" type="text" inputmode="numeric" placeholder="2026-10-04" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(p.targetDate)}">`)}
         ${field("연령대 (Age Group)", `<select id="goal-age-group">${AGE_GROUPS.map(a=>`<option value="${a}" ${effectiveGoalAgeGroup===a?"selected":""}>${a}</option>`).join("")}</select>`)}
       </div>
-      <p class="reason-line" style="margin-top:8px;">연령대는 벤치마크·DNA 비교(peer comparison)에 사용됩니다 — 포디움 페이지의 연령대 설정과 같은 값을 공유합니다.</p>
+      <p class="reason-line" style="margin-top:8px;">이 연령대는 목표/포디움 계산에만 사용됩니다 — Race DNA는 실제 나이에서 자동 산출된 연령대를 별도로 사용하며, 여기서 설정한 값과 무관합니다.</p>
       ${divisionBase(effectiveGoalDiv)!==divisionBase(p.division) ? `<div class="reason-line" style="margin-top:10px;color:var(--orange);">🟠 목표 Division이 현재 수행 Division과 다릅니다.<br>현재 기록은 목표 Division(${effectiveGoalDiv})의 workload 기준으로 환산한 뒤 목표 기록과 비교합니다 — Division 전환 예측(${p.division} → ${effectiveGoalDiv}) 결과를 사용하며, ${p.division} 기록을 그대로 목표 계산에 쓰지 않습니다.<br><span style="color:var(--gray-dim);">현재 예상 기록 = Division 전환 후 현재 능력 추정 (오류가 아니라 Cross-Division 예측입니다)</span></div>` : ""}
       <div style="margin-top:12px;"><button class="btn sm" id="goal-save">저장</button></div>
     </div>
@@ -13237,14 +13244,8 @@ function renderGoal(wrap){
   // page, see save handler below), so partner-visibility toggling only needs to react to nothing here
   // — it's set once at render time from p.division below and doesn't change without a full re-render.
   wrap.querySelector("#goal-save").addEventListener("click",()=>{
-    // bug fix (found on review): this used to also write STATE.profile.division from a "기준
-    // Division" select, silently overwriting the athlete's actual/base division every time a GOAL was
-    // saved — exactly the root cause of the Mixed-1:09-leaking-into-Open-goal report. profile.division
-    // is never written by this handler anymore; only goalDivision is.
-    // 기준 Division도 이 페이지에서 변경할 수 있다. 단, 저장 순서가 중요하다: 목표 Division을
-    // "기준과 같으면 빈 문자열"로 저장하는 규칙이 있으므로 새 기준값을 먼저 확정한 뒤 비교한다.
-    const baseSel=wrap.querySelector("#goal-base-division");
-    if(baseSel && baseSel.value) STATE.profile.division = baseSel.value;
+    // spec (전면수정 Phase 2): 이 페이지는 이제 목표 관련 값만 다룬다 — 기준(Base) Division은 여기서
+    // 더 이상 설정하지 않는다 (DNA/기준값과 완전히 분리).
     const goalDivSelected=wrap.querySelector("#goal-target-division").value;
     // stored as "" when it matches the base division, so getGoalAwareBaseline()'s "unset -> same as
     // base" default stays meaningful even if the athlete's base division is ever changed elsewhere
