@@ -66,7 +66,7 @@ button{font-family:inherit;}
 
 /* ---------- MAIN ---------- */
 .main{flex:1; min-width:0; padding:56px 34px 60px; background:var(--bg);}
-.page{display:none; flex-direction:column; gap:18px; max-width:1180px;}
+.page{display:none; flex-direction:column; gap:18px; max-width:1180px; overflow-x:hidden;}
 .page.active{display:flex;}
 .eyebrow{font-family:var(--font-mono); font-size:10.5px; letter-spacing:2px; text-transform:uppercase; color:var(--orange); font-weight:600;}
 .eyebrow.gray{color:var(--gray-dim);}
@@ -74,9 +74,10 @@ h1.page-title{font-family:var(--font-display); font-size:32px; font-weight:800; 
 h2.section-title{font-family:var(--font-display); font-size:22px; font-weight:800; margin:0; letter-spacing:.3px;}
 p.lead{font-size:12.5px; color:var(--gray); margin:0; line-height:1.6; max-width:640px;}
 
-.card{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px;}
+.card{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px; min-width:0;}
 .card.tight{padding:14px 16px;}
-.grid{display:grid; gap:14px;}
+.grid{display:grid; gap:14px; min-width:0;}
+.grid > *{min-width:0;}
 .grid-2{grid-template-columns:repeat(2,1fr);}
 .grid-3{grid-template-columns:repeat(3,1fr);}
 .grid-4{grid-template-columns:repeat(4,1fr);}
@@ -1135,6 +1136,18 @@ function gatherSegmentCandidatesV3(seg, ctx){
       const pr=computePersonalRunToTenKRatio();
       if(pr) add(Number(tt.avgPaceSecKm)*pr.ratio, tt.date, "trainingLog", null,
         `10K TT × 개인 보정비 ${Math.round(pr.ratio*100)/100} (paired n=${pr.n})`);
+      // spec (전면수정 Phase 3): 개인 보정비를 계산할 만큼 페어 데이터(HYROX 실측+10K TT)가 없을 때는
+      // "10K TT pace + 30초/km"라는 기본 규칙으로 대체한다 — 대회 기록이 하나도 없어도 Finish Time을
+      // 낼 수 있게 하는 최소 fallback.
+      else add(Number(tt.avgPaceSecKm)+30, tt.date, "trainingLog", null,
+        `10K TT + 30초/km (개인 보정비 데이터 부족 — 기본 규칙 적용)`);
+    } else {
+      // 10K TT가 아예 없으면, 보유한 다른 거리(예: 5K) 러닝 기록 중 가장 최근 것을 같은 "+30초/km"
+      // 규칙으로 환산해 참고용 신호로 쓴다 (trainingLog 신뢰도 0.5로, 10K 기반 추정보다 낮게 취급됨).
+      const otherTt=(STATE.trainingLog||[]).filter(l=>l.type==="tt" && l.distanceKm>0 && l.avgPaceSecKm)
+        .sort((a,b)=>b.date.localeCompare(a.date))[0];
+      if(otherTt) add(Number(otherTt.avgPaceSecKm)+30, otherTt.date, "trainingLog", null,
+        `${otherTt.distanceKm}km TT + 30초/km (10K TT 없어 다른 거리 기록으로 환산 — 참고용)`);
     }
   }
 
@@ -7588,46 +7601,6 @@ function gatherPooledDnaRaces(goalDiv){
   }
   return {entries:[],exactMatch:false,tierUsed:null,blended:false,tierDivisions:null,secondaryDivisions:null};
 }
-// spec (전면수정 Phase 2): 상세분석의 Strength Index(7축 레이더 + 구간별 퍼센타일/등급 표)는 "전체
-// 대회 선택" 상태일 때 최근 대회 recency-weighted pool(최대 3개, 60/30/10%)이 아니라, 보유한 모든
-// 유효 대회를 동일 가중치로 단순평균한다 — "전체 대회에서 평균적으로 나는 어느 정도인가"를 보는
-// 지표이기 때문. 퍼센타일/등급 산출 방식(computePooledDnaSegment) 자체는 그대로 재사용하고,
-// pool의 구성(전체 · 동일가중치)만 다르다. 특정 경기를 선택한 경우는 이 함수를 쓰지 않는다(그 경기
-// 하나만의 실제 데이터를 그대로 보여주는 게 맞다).
-function gatherAllRacesEqualWeightPool(goalDiv){
-  const allRaces = [...STATE.races].filter(r=>r&&r.date);
-  if(!allRaces.length) return { entries:[] };
-  const athleteGender=STATE.profile.gender;
-  const entries = allRaces.map(race=>{
-    const sourceDiv=normalizeRaceDivision(race.division)||race.division;
-    const conversion=dnaDivisionPath(goalDiv,sourceDiv,athleteGender);
-    return { race, weight:1/allRaces.length, tier:0, sourceDivision:sourceDiv, conversion };
-  });
-  return { entries };
-}
-function computeStrengthIndexAllRacesAvg(goalDiv, baseDivision){
-  const pool = gatherAllRacesEqualWeightPool(goalDiv);
-  if(!pool.entries.length) return null;
-  const segments = PEER_SEGMENTS.map(seg=>computePooledDnaSegment(seg, pool.entries, goalDiv, baseDivision));
-  const byKey=k=>segments.find(s=>s.key===k);
-  const runSegs = segments.filter(s=>s.kind==="run" && s.actual!=null);
-  const stationSegs = segments.filter(s=>s.kind==="station" && s.actual!=null);
-  const roxzone = byKey("roxzone");
-  const runningC = avgPctWithConf(runSegs.map(s=>s.key), byKey);
-  const stationsC = avgPctWithConf(stationSegs.map(s=>s.key), byKey);
-  const powerC = avgPctWithConf(["sledPush","sledPull","lunge"], byKey);
-  const engineC = avgPctWithConf(["ski","row","burpee"], byKey);
-  const gripC = avgPctWithConf(["carry","sledPull"], byKey);
-  const earlyC = avgPctWithConf(["ski","sledPush"], byKey);
-  const lateC = avgPctWithConf(["lunge","wallball"], byKey);
-  const fatigueResistance = (earlyC.value!=null&&lateC.value!=null) ? clamp(100-(earlyC.value-lateC.value),0,100) : null;
-  const fatigueResConf = (earlyC.value!=null&&lateC.value!=null) ? { count:earlyC.count+lateC.count, total:4,
-    confidence: (earlyC.confidence==="none"||lateC.confidence==="none")?"none":(earlyC.count+lateC.count<4?"medium":"high") } : { count:0,total:4,confidence:"none" };
-  const strengthIdx = { running:runningC.value, stations:stationsC.value, transition:roxzone?.percentile, power:powerC.value, engine:engineC.value, grip:gripC.value, fatigueResistance };
-  const strengthIdxConfidence = { running:runningC, stations:stationsC, transition:{count:roxzone?.percentile!=null?1:0,total:1,confidence:roxzone?.confidence||"none"},
-    power:powerC, engine:engineC, grip:gripC, fatigueResistance:fatigueResConf };
-  return { segments, strengthIdx, strengthIdxConfidence, raceCount: pool.entries.length };
-}
 
 // Resolves ONE race's contribution to ONE segment — reuses resolveOfficialSegment() for the raw
 // official value unchanged, then (Doubles STATION segments only — never Run/Transition, per spec)
@@ -7649,8 +7622,17 @@ function resolveDnaSegmentContribution(seg, race){
     return { teamTime:resolved.sec, sharePct:Number(sharePctRaw), workloadAdjustedTime, sec:workloadAdjustedTime,
       adjustmentApplied:true, hasShareData:true, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
   }
-  return { teamTime: isDoublesRace? resolved.sec : null, sharePct:null, workloadAdjustedTime:null, sec:resolved.sec,
-    adjustmentApplied:false, hasShareData:!isDoublesRace, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
+  // spec (Race DNA P0 fix): Doubles Station인데 개인 담당 비율(sharePct)이 없으면, 팀 전체 기록을
+  // 개인 기록으로 잘못 해석해서 쓰면 안 된다 — 임의로 50%를 가정하지도 않는다. 이 Station은 이
+  // 경기에서 DNA 계산 대상에서 완전히 제외(null)한다 — computePooledDnaSegment()가 null을
+  // filter(Boolean)으로 걸러내므로, 같은 경기의 다른 Run/Station 기여분은 그대로 정상 반영된다.
+  if(isDoublesRace && canShare && !hasShare){
+    return null;
+  }
+  // 여기 도달하는 경우는 항상 Doubles가 아니거나(Run/Transition은 원래 공유 개념 자체가 없음),
+  // Singles 경기라 팀/개인 구분이 필요 없는 경우뿐이다.
+  return { teamTime: null, sharePct:null, workloadAdjustedTime:null, sec:resolved.sec,
+    adjustmentApplied:false, hasShareData:true, isDoublesRace, division:sourceDivision, date:race.date, raceName:race.name||race.date };
 }
 
 // One segment, pooled across whichever of the candidate races actually HAVE that segment's data —
@@ -8755,10 +8737,9 @@ function raceStrip(race){
 /* ---------------------------------------------------------------------- */
 // MY HYROX(기록/DNA/목표)와 Account는 히든메뉴에서 제외한다 — 하단 탭 등 다른 진입점으로만
 // 접근한다. 페이지 자체는 살아 있으므로 CURRENT_PAGE로 이동하는 기존 경로는 그대로 동작한다.
-// spec (전면수정 Phase 1): 목표설정/기록예측/Division전환 예측을 "목표 설정" 한 페이지로 일원화하고
-// (내부 탭으로 계속 접근 가능 — renderGoalPage 참고), 근력·훈련추천이 필요한 페이지(훈련 기록/주간
-// 훈련계획/레이스 로드맵)는 훈련 추천 기능 자체가 나중으로 미뤄져서 메인 네비게이션에서 뺀다 —
-// 기능은 삭제되지 않고 모델 설명 > 아카이브 탭에서 계속 접근 가능하다.
+// spec (전면수정 Phase 1/3): 목표 설정 메뉴에는 목표 설정만 남긴다 — 기록 예측/Division 전환 예측은
+// 훈련 추천 계열(훈련 기록/주간 훈련계획/레이스 로드맵)과 함께 메인 네비게이션에서 빼서 모델 설명 >
+// 아카이브 탭으로 옮겼다 — 기능은 삭제되지 않고 계속 접근 가능하다.
 const NAV = [
   { group:"Overview", items:[
     { id:"dashboard", label:"대시보드", ico:"◆" },
@@ -8836,7 +8817,7 @@ function renderAll(){
     myrecord: renderMyRecordPage, mydna: renderMyDnaPage, mygoal: renderMyGoalPage,
     dashboard: renderDashboard, profile: renderProfile, races: renderRaces, running: renderRunning,
     strength: renderStrength, training: renderTraining,
-    goal: renderGoalPage, prediction: renderPrediction, division: renderDivision, peer: renderPeer, rules: renderRules, plan: renderPlan, roadmap: renderRoadmap, model: renderModel,
+    goal: renderGoal, prediction: renderPrediction, division: renderDivision, peer: renderPeer, rules: renderRules, plan: renderPlan, roadmap: renderRoadmap, model: renderModel,
     account: renderAccount,
   };
   (renderers[CURRENT_PAGE]||renderMyRecordPage)(wrap);
@@ -13089,25 +13070,9 @@ function computeCategoryGapDetail(plan, k){
   const realisticSec = segs.reduce((s,x)=>s+x.realisticSec,0);
   return { currentSec, targetSec, neededSec, conservativeSec, realisticSec };
 }
-// spec (전면수정 Phase 1 — 일원화): 목표 설정 / 기록 예측 / Division 전환 예측을 별도 페이지로 흩어
-// 두지 않고 "목표 설정" 한 페이지 안의 탭으로 합친다. 각 탭의 계산 로직·렌더 함수(renderGoal/
-// renderPrediction/renderDivision)는 그대로 두고, 이 wrapper가 탭 전환만 담당한다.
-let GOAL_TAB = "goal";
-function renderGoalPage(wrap){
-  wrap.innerHTML = `
-    <div class="tabs">
-      <div class="tab ${GOAL_TAB==="goal"?"active":""}" data-goal-page-tab="goal">목표 설정</div>
-      <div class="tab ${GOAL_TAB==="prediction"?"active":""}" data-goal-page-tab="prediction">기록 예측</div>
-      <div class="tab ${GOAL_TAB==="division"?"active":""}" data-goal-page-tab="division">Division 전환</div>
-    </div>
-    <div id="goal-page-tab-body"></div>
-  `;
-  wrap.querySelectorAll("[data-goal-page-tab]").forEach(t=>t.addEventListener("click",()=>{ GOAL_TAB=t.dataset.goalPageTab; renderAll(); }));
-  const body=wrap.querySelector("#goal-page-tab-body");
-  if(GOAL_TAB==="prediction") renderPrediction(body);
-  else if(GOAL_TAB==="division") renderDivision(body);
-  else renderGoal(body);
-}
+// spec (전면수정 Phase 3): 기록 예측/Division 전환도 훈련추천 계열과 마찬가지로 메인 네비게이션에서
+// 빼서 모델 설명 > 아카이브 탭으로 옮겼다 — "목표 설정" 메뉴에는 이제 목표 설정 하나만 남는다.
+// 렌더 함수(renderPrediction/renderDivision) 자체는 그대로 남아 아카이브에서 계속 호출된다.
 function renderGoal(wrap){
   const p=STATE.profile;
   const plan = STATE.profile.targetTime ? computeGoalPlan() : null;
@@ -13794,6 +13759,18 @@ function dnaUserDataCompositionBanner(analysis){
     ${weightNote}
   </div>`;
 }
+// spec (Race DNA P0 fix §5): 화면에 "팀 기록 / 개인 workload 환산 기록 / 실제 개인 기록"을 명확히
+// 구분해서 보여준다. contributions[]는 computePooledDnaSegment()가 채워둔 그대로(각 경기별
+// adjustmentApplied/teamTime/workloadAdjustedTime)를 그대로 읽는다 — 새 계산을 만들지 않는다.
+function dnaContributionCompositionLabel(seg){
+  const contribs = seg.contributions || [];
+  if(!contribs.length) return null;
+  const adjusted = contribs.filter(c=>c.adjustmentApplied);
+  const direct = contribs.filter(c=>!c.adjustmentApplied);
+  if(adjusted.length && direct.length) return { text:"실제 개인 기록 + 개인 workload 환산 기록(Doubles share 적용) 혼합", adjusted };
+  if(adjusted.length) return { text:"개인 workload 환산 기록 (Doubles share 적용)", adjusted };
+  return { text:"실제 개인 기록", adjusted:[] };
+}
 function renderPeer(wrap){
   const allRacesForFilter = STATE.races.filter(r=>r&&r.date).sort((a,b)=>String(b.date).localeCompare(String(a.date)));
   const analysis=computePeerAnalysis();
@@ -13805,12 +13782,10 @@ function renderPeer(wrap){
     return;
   }
   const { group, segments, impactList, strengthIdx, interpretation, totalLossSec, race, dataSource } = analysis;
-  // spec (전면수정 Phase 2): "전체" 선택 시(DNA_RACE_FILTER===null) 상세분석의 Strength Index(7축
-  // 레이더 + 구간별 퍼센타일/등급 표)는 최근 대회 가중평균(analysis.strengthIdx)이 아니라, 보유한
-  // 모든 유효 대회를 동일 가중치로 단순평균한 값을 쓴다. 특정 경기를 선택했을 때는 그 경기 그대로.
-  const detailStrength = DNA_RACE_FILTER
-    ? { strengthIdx, segments, strengthIdxConfidence: analysis.strengthIdxConfidence }
-    : (computeStrengthIndexAllRacesAvg(analysis.goalDivision, analysis.baseDivision) || { strengthIdx, segments, strengthIdxConfidence: analysis.strengthIdxConfidence });
+  // spec (전면수정 Phase 4 — 계산 기준 통일): Radar/구간별 퍼센타일 표를 별도의 "전체 경기 단순평균"
+  // 방식으로 다시 계산하지 않는다 — 나의 Race DNA/Station별 수행력/Radar/강점·약점/DNA 유형이 전부
+  // 같은 analysis(같은 segments/strengthIdx)를 그대로 바라본다.
+  const detailStrength = { strengthIdx, segments, strengthIdxConfidence: analysis.strengthIdxConfidence };
   const realSegs = segments.filter(s=>s.actual!=null && s.peerIsReal);
   const raceDnaFullyReal = dataSource.totalSegmentCount>0 && dataSource.realSegmentCount===dataSource.totalSegmentCount;
   const raceDnaMinN = realSegs.length ? Math.min(...realSegs.map(s=>s.peerN)) : null;
@@ -13896,6 +13871,9 @@ function renderPeer(wrap){
             <div class="row-between"><span style="font-size:13px;font-weight:700;">${s.label}</span><span class="mono" style="font-size:12px;color:${band.color};">${score!=null?`${score}점 · ${band.label}`:"데이터 부족"}</span></div>
             <div class="bar-track" style="margin-top:6px;"><div class="bar-fill" style="width:${score!=null?clamp(score,2,100):0}%;background:${band.color};"></div></div>
             ${s.actual!=null? `<div style="font-size:11px;color:var(--gray-dim);margin-top:4px;">내 현재 수행력 ${fmtTime(s.actual)}${s.basis?` (${s.basis})`:""} · 동일 그룹 기준 ${fmtTime(s.peerMean)} · <span style="color:${s.timeLoss>=0?'var(--red)':'var(--green)'};">${s.timeLoss>=0?"+":"-"}${fmtTime(Math.abs(s.timeLoss))}</span></div>` : ""}
+            ${(()=>{ const comp=dnaContributionCompositionLabel(s); if(!comp) return ""; 
+              const adjDetail = comp.adjusted.length ? comp.adjusted.map(c=>`${escapeHtml(c.raceName||c.date||"")}: 팀 ${fmtTime(c.teamTime)} → 개인 환산 ${fmtTime(c.workloadAdjustedTime)} (share ${Math.round((c.sharePct||0)*100)}%)`).join(" · ") : "";
+              return `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">기록 구성: ${escapeHtml(comp.text)}${adjDetail?`<br>${adjDetail}`:""}</div>`; })()}
             <div style="font-size:10.5px;color:var(--gray-dim);margin-top:3px;">비교 그룹(기준 Division 기준): ${escapeHtml(deriveBenchmarkGender(group.division))} · ${escapeHtml(deriveAgeBand(STATE.profile.age)||"전연령")} · ${escapeHtml(group.division)} · Source=${escapeHtml(srcLabel)}${s.sampleN?` · n=${s.sampleN}`:""}${s.debug&&s.debug.actualSource&&s.debug.sourceDivision&&(Array.isArray(s.debug.sourceDivision)?s.debug.sourceDivision.join(","):s.debug.sourceDivision)!==group.division ? ` · 실제 기록 출처: ${escapeHtml(s.debug.actualSource)}` : ""}</div>
             ${s.personalHistory? `<div style="font-size:10.5px;color:var(--gray-dim);margin-top:2px;">개인 경기 ${s.personalHistory.n}회 · 최근 ${fmtTime(s.personalHistory.latest)} · 최고 ${fmtTime(s.personalHistory.best)} · 중앙값 ${fmtTime(s.personalHistory.median)}</div>` : ""}
           </div>`;
@@ -13922,7 +13900,7 @@ function renderPeer(wrap){
       ${PEER_DETAIL_OPEN ? `
       <div style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
-        <p class="reason-line" style="margin-top:4px;color:var(--gray-dim);">${DNA_RACE_FILTER ? "선택한 경기 1건 기준입니다." : `보유한 모든 유효 대회(${detailStrength.raceCount||1}건)를 동일 가중치로 단순평균한 값입니다 — 최근 대회 가중치(60/30/10%)는 적용되지 않습니다.`}</p>
+        <p class="reason-line" style="margin-top:4px;color:var(--gray-dim);">${DNA_RACE_FILTER ? "선택한 경기 1건 기준입니다." : "위 \"나의 Race DNA\"와 동일한 기준(최근 대회 가중평균)입니다."}</p>
         ${svgRadarGeneric(radarItems, 280, "#5C8CFF")}
         ${detailStrength.strengthIdxConfidence ? `<div style="display:flex;flex-direction:column;gap:4px;margin-top:10px;">
           ${Object.entries({running:"Running",stations:"Stations",transition:"Transition",power:"Power",engine:"Engine",grip:"Grip",fatigueResistance:"Fatigue Res."}).map(([k,label])=>{
@@ -13937,7 +13915,7 @@ function renderPeer(wrap){
 
       <div class="divider" style="margin:16px 0;"></div>
       <div class="eyebrow gray">구간별 퍼센타일/등급 · Z-score</div>
-      <p class="lead" style="margin:2px 0 8px;">🟢 REAL PEER DATA(${MIN_REAL_SAMPLE}건↑ 실측) · 🟡 REFERENCE ESTIMATE(예시 기준값)${DNA_RACE_FILTER ? "" : " · 전체 대회 단순평균 기준"}</p>
+      <p class="lead" style="margin:2px 0 8px;">🟢 REAL PEER DATA(${MIN_REAL_SAMPLE}건↑ 실측) · 🟡 REFERENCE ESTIMATE(예시 기준값)</p>
       ${(() => {
         const detailSegments = detailStrength.segments;
         const runSegsForTable = detailSegments.filter(s=>s.kind==="run" && s.actual!=null);
@@ -14584,6 +14562,8 @@ function renderModelArchiveTab(wrap){
         <button class="btn sm secondary" id="arch-goto-training">훈련 기록</button>
         <button class="btn sm secondary" id="arch-goto-plan">주간 훈련계획</button>
         <button class="btn sm secondary" id="arch-goto-roadmap">레이스 로드맵</button>
+        <button class="btn sm secondary" id="arch-goto-prediction">기록 예측</button>
+        <button class="btn sm secondary" id="arch-goto-division">Division 전환</button>
       </div>
     </div>
     <div class="card">
@@ -14599,6 +14579,8 @@ function renderModelArchiveTab(wrap){
   wrap.querySelector("#arch-goto-training")?.addEventListener("click",()=>{ CURRENT_PAGE="training"; renderAll(); });
   wrap.querySelector("#arch-goto-plan")?.addEventListener("click",()=>{ CURRENT_PAGE="plan"; renderAll(); });
   wrap.querySelector("#arch-goto-roadmap")?.addEventListener("click",()=>{ CURRENT_PAGE="roadmap"; renderAll(); });
+  wrap.querySelector("#arch-goto-prediction")?.addEventListener("click",()=>{ CURRENT_PAGE="prediction"; renderAll(); });
+  wrap.querySelector("#arch-goto-division")?.addEventListener("click",()=>{ CURRENT_PAGE="division"; renderAll(); });
   renderProfileScheduleTab(wrap.querySelector("#arch-box-schedule"));
   renderProfileSettingsTab(wrap.querySelector("#arch-deload-settings"));
 }
