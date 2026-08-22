@@ -7284,6 +7284,13 @@ function queryPeerSegmentStats(seg, group){
   const { gender, ageGroup, division } = group;
   const mixedPersonalMode = normalizeRaceDivision(division)==="Mixed Doubles" &&
     seg.kind==="station" && group.mixedPersonalMode===true && !!group.athleteGender;
+  // Personal-share fraction actually worked by the athlete on this station (e.g. 0.3 for a 30% share).
+  // Falls back to an even 50/50 split only if the caller didn't supply the real share — but every
+  // current caller does supply it whenever mixedPersonalMode is true, so this is a defensive default,
+  // not the expected path. Without this, comparing a share-adjusted actual time against a benchmark
+  // that always assumes a 50% split made any share below 50% look artificially great (and any share
+  // above 50% look artificially bad), regardless of true fitness.
+  const mixedShare = mixedPersonalMode ? clamp(Number(group.mixedSharePct ?? 0.5), 0.05, 0.95) : 0.5;
 
   // Newly uploaded official HYROX results are the first real-data source for Race DNA.
   // Once the exact gender/age-group/division segment has >= MIN_REAL_SAMPLE rows,
@@ -7301,12 +7308,12 @@ function queryPeerSegmentStats(seg, group){
       ? Math.sqrt(variance)
       : (Number.isFinite(realMean) && realMean>0 ? realMean*SD_PCT[seg.kind] : null);
     if(mixedPersonalMode){
-      const f=0.5*mixedAthleteGenderFactor(group.athleteGender);
+      const f=mixedShare*mixedAthleteGenderFactor(group.athleteGender);
       realMean*=f;
       if(realSd!=null) realSd*=f;
     }
     return { mean:realMean, sd:realSd, n:realValues.length, isReal:true,
-      source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준`:``}`,
+      source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
       benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length };
   }
 
@@ -7324,10 +7331,10 @@ function queryPeerSegmentStats(seg, group){
   const derivedP50 = derived ? Number(derived.p50) : null;
   if(Number.isFinite(derivedP50) && derivedP50>0){
     let benchmarkMean=derivedP50;
-    if(mixedPersonalMode) benchmarkMean*=0.5*mixedAthleteGenderFactor(group.athleteGender);
+    if(mixedPersonalMode) benchmarkMean*=mixedShare*mixedAthleteGenderFactor(group.athleteGender);
     const sd = benchmarkMean * SD_PCT[seg.kind];
     return { mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
-      source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준`:``}`,
+      source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
       benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null };
   }
 
@@ -7338,7 +7345,7 @@ function queryPeerSegmentStats(seg, group){
     const menMean = seg.base * PEER_CALIBRATION_SCALE * 1.0 * divMultD * am;
     const womenMean = seg.base * PEER_CALIBRATION_SCALE * DOUBLES_GENDER_MULT * divMultD * am;
     illustrativeMean = (menMean+womenMean)/2;
-    if(mixedPersonalMode) illustrativeMean = (group.athleteGender==="female" ? womenMean : menMean) * 0.5;
+    if(mixedPersonalMode) illustrativeMean = (group.athleteGender==="female" ? womenMean : menMean) * mixedShare;
   } else {
     const gm = (division==="Open Doubles" || division==="Pro Doubles")
       ? (gender==="female" ? DOUBLES_GENDER_MULT : 1.0)
@@ -7763,14 +7770,16 @@ function computePooledDnaSegment(seg, poolEntries, goalDiv, baseDivision){
     const c = resolveDnaSegmentContribution(seg, e.race);
     if(!c) return null;
     const sourceDivision = c.division || normalizeRaceDivision(e.race.division) || e.race.division;
-    const mixedPersonalMode = sourceDivision==="Mixed Doubles" && seg.kind==="station" && c.hasShareData;
-    const comparisonSec = mixedPersonalMode ? c.sec : ((c.isDoublesRace && c.teamTime!=null) ? c.teamTime : c.sec);
+    // Doubles (Mixed included): the primary DNA percentile is always TEAM time vs TEAM benchmark.
+    // Personal share is shown separately as auxiliary info (dnaContributionCompositionLabel) and
+    // never changes the score — a smaller/larger personal share should not make the score look
+    // artificially better or worse.
+    const comparisonSec = (c.isDoublesRace && c.teamTime!=null) ? c.teamTime : c.sec;
     if(comparisonSec==null) return null;
     const groupFilters = {
       // Mixed rows remain the peer pool; athleteGender only controls the personal station benchmark.
       gender: sourceDivision==="Mixed Doubles" ? "mixed" : (STATE.profile.gender==="female" ? "female":"male"),
       athleteGender: STATE.profile.gender,
-      mixedPersonalMode,
       ageGroup: getAgeGroup(Number(STATE.profile.age)),
       division: sourceDivision,
       event:null, date:null, country: STATE.profile.country || null,
@@ -7877,14 +7886,14 @@ function computeDnaSegmentsForRace(race){
   const division = DIVISIONS.includes(raceDiv) ? raceDiv : (DIVISIONS.includes(profile.division) ? profile.division : "Open");
   const groupFilters = { gender, ageGroup, division, event:null, date:null, country:profile.country||null };
   const segments = PEER_SEGMENTS.map(seg=>{
-    const shareAvailable = race?.share?.[seg.key]!=null && race?.share?.[seg.key]!=="" && Number.isFinite(Number(race.share[seg.key]));
-    const stats=queryPeerSegmentStats(seg,{...groupFilters, athleteGender:profile.gender, mixedPersonalMode:raceDiv==="Mixed Doubles" && seg.kind==="station" && shareAvailable});
+    const stats=queryPeerSegmentStats(seg,{...groupFilters, athleteGender:profile.gender});
     const contribution=resolveDnaSegmentContribution(seg,race);
     if(!contribution) return { ...seg, actual:null, peerMean:stats.mean, peerSd:stats.sd, peerN:stats.n,
       peerIsReal:stats.isReal, benchmarkSource:stats.benchmarkSource, sampleN:stats.sampleN,
       basis:null,z:null,percentile:null,star:null,timeLoss:null,contribution:null };
-    const mixedPersonalMode = raceDiv==="Mixed Doubles" && seg.kind==="station" && contribution.hasShareData;
-    const comparisonSec=mixedPersonalMode ? contribution.sec : ((contribution.isDoublesRace && contribution.teamTime!=null) ? contribution.teamTime : contribution.sec);
+    // Doubles (Mixed included): the primary DNA percentile is always TEAM time vs TEAM benchmark.
+    // Personal share is shown separately as auxiliary info and never changes the score.
+    const comparisonSec=(contribution.isDoublesRace && contribution.teamTime!=null) ? contribution.teamTime : contribution.sec;
     const z=stats.sd ? (stats.mean-comparisonSec)/stats.sd : null;
     const percentile=z!=null ? clamp(normalCdf(z)*100,0.5,99.5) : null;
     return { ...seg, actual:comparisonSec, peerMean:stats.mean, peerSd:stats.sd, peerN:stats.n,
