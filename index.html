@@ -9853,8 +9853,8 @@ function renderMyDnaPage(wrap){
       `;
       wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{
         CURRENT_PAGE="peer";
-        PEER_DETAIL_OPEN=true;
-        window.__DNA_DETAIL_SCROLL_TO_OPEN=true;
+        PEER_DETAIL_OPEN=false;
+        delete window.__DNA_DETAIL_SCROLL_TO_OPEN;
         renderAll();
       });
       wrap.querySelector("#mydna-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
@@ -13725,7 +13725,7 @@ function renderPeer(wrap){
       <div style="font-size:14px;font-weight:700;margin-top:14px;">Race DNA를 준비하고 있어요</div>
       <div class="reason-line" style="margin-top:6px;">동일 성별 · 정확한 연령대 · Division의 실제 참가자 데이터를 분석합니다.</div>
     </div>`;
-  setTimeout(()=>{
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
     if(token!==DNA_PEER_RENDER_TOKEN || CURRENT_PAGE!=="peer") return;
     let analysis;
     try { analysis=memoPure("peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length), ()=>computePeerAnalysis()); }
@@ -13740,7 +13740,7 @@ function renderPeer(wrap){
     window.__DNA_PEER_ANALYSIS_TOKEN = token;
     window.__DNA_PEER_ANALYSIS_RESULT = analysis;
     renderPeerResult(wrap, analysis, allRacesForFilter, token);
-  },50);
+  }));
   return;
 }
 
@@ -13790,7 +13790,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">최근 경기</option>
+          <option value="">전체 (최근 경기 가중 평균)</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
@@ -13942,15 +13942,14 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
     }));
   }
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{
-    const y=window.scrollY||window.pageYOffset||0;
-    PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN;
-    window.__DNA_DETAIL_RESTORE_Y=y;
+    if(PEER_DETAIL_OPEN){
+      PEER_DETAIL_OPEN=false;
+      renderAll();
+      return;
+    }
+    PEER_DETAIL_OPEN=true;
+    window.__DNA_DETAIL_SCROLL_TO_OPEN=true;
     renderAll();
-    requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      const restore=Number(window.__DNA_DETAIL_RESTORE_Y||0);
-      window.scrollTo(0,restore);
-      delete window.__DNA_DETAIL_RESTORE_Y;
-    }));
   });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
   wrap.querySelectorAll("[data-dna-evo-tab]").forEach(el=>el.addEventListener("click",()=>{ DNA_EVO_TAB=el.dataset.dnaEvoTab; renderAll(); }));
