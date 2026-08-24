@@ -8801,6 +8801,11 @@ function initDateTextMasking(){
 
 let _lastRenderedPage = null;
 function renderAll(){
+  // Preserve the exact viewport for in-page controls. Re-rendering replaces #main's DOM,
+  // so iOS can otherwise jump/focus back to the top even when CURRENT_PAGE is unchanged.
+  const pageBeforeRender = _lastRenderedPage;
+  const scrollBeforeRender = window.scrollY || window.pageYOffset || 0;
+  const samePageRender = (CURRENT_PAGE === pageBeforeRender);
   // PERF: keep pure-engine cache across page navigation.
   // State-changing paths call persist()/persistNow(), which invalidate the cache.
   // Clearing it on every render made the large Race DNA peer analysis recompute
@@ -8835,10 +8840,23 @@ function renderAll(){
     wrap.insertAdjacentHTML("afterbegin", renderLoggedOutDataWarning());
     wrap.querySelector("#logout-warning-goto-account")?.addEventListener("click",()=>{ CURRENT_PAGE="account"; renderAll(); });
   }
-  // bug fix: this used to scroll to top on EVERY renderAll() call, including same-page in-place
-  // toggles (e.g. "전체 분석 보기") that call renderAll() just to update a bit of UI state — only
-  // reset scroll when the page identity actually changed (real navigation).
-  if(CURRENT_PAGE !== _lastRenderedPage) window.scrollTo(0,0);
+  // Real navigation starts at the top. Same-page controls must keep the exact viewport
+  // the user was looking at; restore after the new DOM has painted (important on iOS Safari).
+  const pageChanged = (CURRENT_PAGE !== pageBeforeRender);
+  if(!pageChanged && samePageRender){
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      // Detail-open has an intentional destination: the newly opened detail section.
+      if(window.__DNA_DETAIL_SCROLL_TO_OPEN){
+        const detailStart=document.getElementById("peer-detail-content");
+        if(detailStart) detailStart.scrollIntoView({behavior:"auto",block:"start"});
+        delete window.__DNA_DETAIL_SCROLL_TO_OPEN;
+        return;
+      }
+      window.scrollTo(0,scrollBeforeRender);
+    }));
+  }else if(pageChanged){
+    window.scrollTo(0,0);
+  }
   _lastRenderedPage = CURRENT_PAGE;
 }
 // doc12 §3: 로그인하지 않은 상태에서는 이 앱의 로컬 저장소가 브라우저/플랫폼의 임시 저장 공간이라,
@@ -13870,7 +13888,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
         <div class="qbtn" id="peer-detail-toggle" style="flex:1;min-width:150px;">${PEER_DETAIL_OPEN?"− 상세 분석 접기":"+ 상세 분석 보기"}</div>
       </div>
       ${PEER_DETAIL_OPEN ? `
-      <div style="margin-top:16px;">
+      <div id="peer-detail-content" style="margin-top:16px;">
         <div class="eyebrow gray">Strength Index (7축, ${raceDnaFullyReal?"동일그룹 퍼센타일 기반":"실제/예시 혼합"}) — 내부 계산값, HPI/Prediction/Training Engine에서 사용</div>
         <p class="reason-line" style="margin-top:4px;color:var(--gray-dim);">${DNA_RACE_FILTER ? "선택한 경기 1건 기준입니다." : "위 \"나의 Race DNA\"와 동일한 기준(최근 대회 가중평균)입니다."}</p>
         ${svgRadarGeneric(radarItems, 280, "#5C8CFF")}
@@ -13934,13 +13952,6 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
     </div>
   `;
   wrap.querySelector("#dna-race-filter")?.addEventListener("change",(e)=>{ DNA_RACE_FILTER=e.target.value||null; renderAll(); });
-  if(window.__DNA_DETAIL_SCROLL_TO_OPEN){
-    delete window.__DNA_DETAIL_SCROLL_TO_OPEN;
-    requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      const detail=wrap.querySelector("#peer-detail-toggle");
-      if(detail) detail.scrollIntoView({behavior:"auto",block:"start"});
-    }));
-  }
   wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{
     if(PEER_DETAIL_OPEN){
       PEER_DETAIL_OPEN=false;
