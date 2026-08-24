@@ -2561,6 +2561,15 @@ function getBaselineTime(hpiResult){
 const UPV4_SEGMENTS = [
   "runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"
 ];
+// UPV4 내부 segment 이름(bbj/farmers/lunges/wallBalls)은 실제 데이터가 저장되는 키
+// (STATIONS[].key: burpee/carry/lunge/wallball — race.stations, race.share, 벤치마크
+// 테이블 등 앱 전역에서 공통으로 쓰는 이름)와 다르다. 이 하나의 매핑을 모든 조회 지점
+// (upv4SegmentValue/upv4GetContribution/getRaceOnlyBenchmarkSegmentSec)이 공유해서,
+// 이름이 어긋나 실제 기록을 못 찾는 문제가 한 곳에서만 관리되도록 한다.
+const UPV4_SEGMENT_TO_STATION_KEY = {
+  ski:"ski", sledPush:"sledPush", sledPull:"sledPull", bbj:"burpee",
+  row:"row", farmers:"carry", lunges:"lunge", wallBalls:"wallball"
+};
 
 const UPV4_RECENCY_BANDS = [
   { maxMonths: 6,  weight: 1.00 },
@@ -2684,20 +2693,18 @@ function getUnifiedContributionPrior(gender, division, segment){
 function upv4GetContribution(race, gender, segment){
   if(!upv4IsDoubles(race?.division) || segment==="runTotal") return 1;
 
-  const direct =
-    race?.athleteContribution ??
-    race?.myContribution ??
-    race?.doublesContribution ??
-    race?.contribution;
-
-  if(typeof direct==="number" && Number.isFinite(direct)){
-    return Math.min(1,Math.max(0,direct));
-  }
-
-  const map = race?.stationContributions || race?.doublesStationContributions;
-  const raw = map && (map[segment] ?? map[segment==="runTotal"?"total":segment]);
-  if(typeof raw==="number" && Number.isFinite(raw)){
-    return Math.min(1,Math.max(0,raw));
+  // bug fix: this used to look for race.athleteContribution/myContribution/doublesContribution/
+  // contribution and race.stationContributions/doublesStationContributions — none of which the
+  // app ever writes anywhere. The real per-station 개인 수행 비율(%) input (HYROX 대회 기록 폼의
+  // "개인 수행 비율" 필드) is saved to race.share, keyed by STATIONS[].key (e.g. "burpee", not
+  // the UPV4 internal name "bbj"), as a 0-100 percentage. Because of this, a Doubles athlete who
+  // carefully filled in their real share% for every station was still silently defaulted to a
+  // flat 50/50 guess. Reading race.share here (mapped through the same UPV4_SEGMENT_TO_STATION_KEY
+  // table used elsewhere) makes real user-entered share data actually reach the prediction engine.
+  const stationKey = UPV4_SEGMENT_TO_STATION_KEY[segment] || segment;
+  const sharePct = race?.share?.[stationKey];
+  if(sharePct!=null && sharePct!=="" && !isNaN(Number(sharePct))){
+    return Math.min(1,Math.max(0,Number(sharePct)/100));
   }
 
   const prior = getUnifiedContributionPrior(gender, race?.division, segment);
@@ -2838,12 +2845,13 @@ function upv4SegmentValue(race, segment){
     // Never inject the full race time into RUN_TOTAL when run splits are missing.
     return vals.length ? vals.reduce((a,b)=>a+b,0) : null;
   }
-  const stationMap={
-    ski:"ski",sledPush:"sledPush",sledPull:"sledPull",bbj:"bbj",row:"row",
-    farmers:"farmers",lunges:"lunges",wallBalls:"wallBalls",roxzone:"roxzone"
-  };
-  const key=stationMap[segment];
   if(segment==="roxzone") return parseTimeToSec(race?.transition);
+  // bug fix: this used to map segment -> itself (e.g. bbj -> "bbj"), but race.stations is
+  // keyed by STATIONS[].key (burpee/carry/lunge/wallball), never by the UPV4 internal names
+  // (bbj/farmers/lunges/wallBalls). That mismatch meant Burpee/Farmers Carry/Sandbag Lunge/
+  // Wall Ball could never find their real race data here — silently treated as "no data" for
+  // every athlete, even ones who had actually recorded those 4 stations.
+  const key=UPV4_SEGMENT_TO_STATION_KEY[segment]||segment;
   const st=race?.stations?.[key];
   return parseTimeToSec(st);
 }
@@ -2900,8 +2908,13 @@ function resolveUnifiedPerformance(goalDivision, options={}){
       const recency=upv4RecencyWeight(race.date);
       const completeness=typeof raceDataCompleteness==="function"
         ? Math.max(0.25,raceDataCompleteness(race)/17) : 1;
+      // bug fix: same dead-field issue as upv4GetContribution() — checks the actual storage
+      // field (race.share, mapped via UPV4_SEGMENT_TO_STATION_KEY) instead of fields the app
+      // never writes, so a real user-entered share% now correctly earns full confidence.
+      const stationKeyForConf = UPV4_SEGMENT_TO_STATION_KEY[segment] || segment;
+      const hasRealShare = race?.share?.[stationKeyForConf]!=null && race.share[stationKeyForConf]!=="" && !isNaN(Number(race.share[stationKeyForConf]));
       const contributionConfidence = upv4IsDoubles(source) && segment!=="runTotal"
-        ? (race?.athleteContribution!=null || race?.myContribution!=null || race?.doublesContribution!=null ? 1 : 0.75)
+        ? (hasRealShare ? 1 : 0.75)
         : 1;
 
       /*
@@ -2962,7 +2975,10 @@ function auditUnifiedPerformanceV4(goalDivision){
 /* segment falls back to the target benchmark.                             */
 /* ---------------------------------------------------------------------- */
 function getRaceOnlyBenchmarkSegmentSec(goalDiv, segment){
-  const segMap={runTotal:"runTotal",ski:"ski",sledPush:"sledPush",sledPull:"sledPull",bbj:"bbj",row:"row",farmers:"farmers",lunges:"lunges",wallBalls:"wallBalls",roxzone:"roxzone"};
+  // bug fix: same UPV4-name vs STATIONS-key mismatch as upv4SegmentValue() above — getSegmentBenchmarkSec()
+  // expects STATIONS[].key (burpee/carry/lunge/wallball), not the UPV4 internal names, so this fallback
+  // silently returned null for those 4 stations whenever the real-data lookup above also failed.
+  const segMap={runTotal:"runTotal", roxzone:"roxzone", ...UPV4_SEGMENT_TO_STATION_KEY};
   const key=segMap[segment]||segment;
   if(key==="runTotal"){
     const vals=RUN_KEYS.map(k=>runLegBenchmarkSec(RUN_KEYS.indexOf(k)).sec).filter(v=>v!=null);
