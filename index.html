@@ -7070,19 +7070,18 @@ function queryDerivedBenchmark(division, gender, ageBand, segment){
   return null;
 }
 let _peerDbFilterCache = new Map();
-let _peerDbGroupIndex = null;
-// PERF: DNA가 같은 성별·연령·Division·segment 조합을 여러 번 조회할 때
-// 대규모 DB를 매번 filter()로 다시 순회하지 않도록 인덱스/통계를 캐시합니다.
-// 계산식/결과는 기존과 동일하고, 반복 조회만 줄입니다.
+// PERF: DNA peer DB filter results are indexed once and reused. Inclusion rules remain identical
+// to the previous filter; this only avoids repeatedly scanning the 11만+ row participant DB.
 let _peerSegmentStatsCache = new Map();
+let _peerDbGroupIndex = null;
 function buildPeerDbGroupIndex(){
   if(_peerDbGroupIndex) return _peerDbGroupIndex;
   const idx=new Map();
   for(const r of EXTERNAL_RACE_DB){
     if(!r || r.analysis_valid===false) continue;
-    const d=normalizeRaceDivision(r.division)||r.division||"";
-    const g=String(r.gender||"").toLowerCase();
-    const a=r.age_group||"";
+    const d=r.division==null?"":String(r.division);
+    const g=r.gender==null?"":String(r.gender);
+    const a=r.age_group==null?"":String(r.age_group);
     const key=d+"|"+g+"|"+a;
     let arr=idx.get(key); if(!arr){arr=[]; idx.set(key,arr);} arr.push(r);
   }
@@ -7104,18 +7103,30 @@ function filterExternalRaceDb(group){
   const { gender, ageGroup, division } = group;
   const isMixedDivision = normalizeRaceDivision(division)==="Mixed Doubles";
   const idx=buildPeerDbGroupIndex();
-  let candidates;
+  let candidates=[];
+  const d=normalizeRaceDivision(division)||division||"";
+  const a=ageGroup==null?"":String(ageGroup);
   if(isMixedDivision){
-    candidates=idx.get((normalizeRaceDivision(division)||division||"")+"|mixed|"+(ageGroup||"")) || [];
+    // Preserve the old Mixed rule: normalized division must be Mixed Doubles, and gender is
+    // either explicitly mixed (case-insensitive) or blank. We inspect only the small index-key
+    // set here, never the full participant row array.
+    for(const [key,rows] of idx){
+      const parts=key.split("|");
+      if(normalizeRaceDivision(parts[0])!=="Mixed Doubles" || parts[2]!==a) continue;
+      const rg=String(parts[1]||"").toLowerCase();
+      if(!rg || rg==="mixed") candidates.push(...rows);
+    }
   }else{
-    candidates=idx.get((normalizeRaceDivision(division)||division||"")+"|"+(gender||"")+"|"+(ageGroup||"")) || [];
+    const g=gender==null?"":String(gender);
+    // Preserve the old non-Mixed rule: division/gender/age are exact matches.
+    candidates=idx.get(d+"|"+g+"|"+a)||[];
   }
-  const result = (group.event||group.country) ? candidates.filter(r=>{
+  const result=(group.event||group.country) ? candidates.filter(r=>{
     if(group.event && r.event && r.event!==group.event) return false;
     if(group.country && r.country && r.country!==group.country) return false;
     return true;
   }) : candidates;
-  _peerDbFilterCache.set(cacheKey, result);
+  _peerDbFilterCache.set(cacheKey,result);
   return result;
 }
 function exactDnaPeerGroupCount(group){
@@ -9793,9 +9804,7 @@ function renderMyDnaPage(wrap){
   setTimeout(()=>{
     if(token!==MY_DNA_RENDER_TOKEN || CURRENT_PAGE!=="mydna") return;
     try{
-      const _dnaCacheKey="peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length);
-      const peer=PURE_CACHE.has(_dnaCacheKey) ? PURE_CACHE.get(_dnaCacheKey) : computePeerAnalysis(true);
-      if(!PURE_CACHE.has(_dnaCacheKey)) PURE_CACHE.set(_dnaCacheKey, peer);
+      const peer=memoPure("peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length), ()=>computePeerAnalysis(true));
       const dnaScores=buildRaceOnlyDnaScores(peer);
       const hasRace = !!(STATE.races||[]).find(r=>r&&r.date);
       const strengths = peer ? buildStrengthsTop3(peer.segments).slice(0,3).map(s=>({label:s.label,reason:s.desc})) : [];
@@ -9845,11 +9854,11 @@ function renderMyDnaPage(wrap){
       wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{
         const restoreY=window.scrollY||window.pageYOffset||0;
         CURRENT_PAGE="peer";
-        window.__DNA_DETAIL_RESTORE_Y = restoreY;
+        window.__DNA_DETAIL_RESTORE_Y=restoreY;
         renderAll();
         requestAnimationFrame(()=>requestAnimationFrame(()=>{
           const y=Number(window.__DNA_DETAIL_RESTORE_Y||0);
-          window.scrollTo({top:y,left:0,behavior:"instant"});
+          window.scrollTo(0,y);
           delete window.__DNA_DETAIL_RESTORE_Y;
         }));
       });
@@ -13786,7 +13795,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">최근 경기</option>
+          <option value="">전체 (최근 경기 가중 평균)</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
