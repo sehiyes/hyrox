@@ -349,7 +349,6 @@ const BENCH = {
 
 const WEEKDAYS = ["월","화","수","목","금","토","일"];
 
-const INDEX_WEIGHTS = { running:0.25, engine:0.20, strengthEnd:0.20, skill:0.15, recovery:0.00, raceExec:0.20 };
 const INDEX_META = {
   running:    { label:"Running Index",              emoji:"🏃", friendly:"러닝 능력",
                 oneLiner:"HYROX 8km 러닝을 빠르고 안정적으로 유지하는 능력",
@@ -363,151 +362,6 @@ const INDEX_META = {
   skill:      { label:"HYROX Skill Index",           emoji:"🎯", friendly:"HYROX 기술·효율",
                 oneLiner:"Wall Ball·동작 효율·전환 등 기술적인 경기 수행 능력",
                 why:"Wall Ball·전환 효율은 기술/경기운영 숙련도를 나타냅니다." },
-  recovery:   { label:"Recovery Index",              emoji:"🔋", friendly:"회복 상태",
-                oneLiner:"훈련 후 피로를 회복하고 다음 훈련을 소화할 수 있는 상태",
-                why:"회복 상태는 훈련을 실제 퍼포먼스로 전환하는 승수 역할을 합니다." },
-  raceExec:   { label:"Race Execution Index",        emoji:"⏱️", friendly:"레이스 운영",
-                oneLiner:"페이스 배분·전환 속도·후반 페이스 유지 등 경기 운영 능력",
-                why:"페이싱 균일성·전환속도는 실전 경기운영 능력을 나타냅니다." },
-};
-// score -> user-facing status band (spec: NOT a percentile/ranking — a read of this system's own
-// 0-100 ability score, explicitly labeled as such wherever it's shown next to real percentile data).
-function indexStatusBand(score){
-  if(score==null) return { label:"데이터 부족", color:"var(--gray-dim)" };
-  if(score>=90) return { label:"매우 강점", color:"var(--green)" };
-  if(score>=80) return { label:"강점", color:"var(--green)" };
-  if(score>=70) return { label:"양호", color:"var(--low)" };
-  if(score>=60) return { label:"개선 여지", color:"var(--amber)" };
-  return { label:"주요 개선 영역", color:"var(--red)" };
-}
-
-const PHASES = ["Base","Build","Peak","Taper"];
-const PHASE_RATIO = {
-  Base:  { run:40, strength:30, wod:15, recovery:15, goal:"Aerobic base + Strength + 낮은 피로도의 HYROX exposure 유지" },
-  Build: { run:35, strength:25, wod:25, recovery:15, goal:"Threshold 향상 + HYROX 특이성 도입 + Brick 비중 증가" },
-  Peak:  { run:25, strength:20, wod:35, recovery:20, goal:"Race-pace Brick + Simulation + 페이싱 정교화" },
-  Taper: { run:15, strength:10, wod:10, recovery:65, goal:"Volume 감소 + 짧은 race-specific 자극 유지" },
-};
-
-/* ---------------------------------------------------------------------- */
-/* 1. UTILS                                                                */
-/* ---------------------------------------------------------------------- */
-const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-const round1=(v)=>Math.round(v*10)/10;
-const uid=()=>Math.random().toString(36).slice(2,10);
-const todayISO=()=>new Date().toISOString().slice(0,10);
-const daysBetween=(a,b)=>Math.round((new Date(b)-new Date(a))/86400000);
-const weeksBetween=(a,b)=>daysBetween(a,b)/7;
-
-function fmtTime(totalSec){
-  if(totalSec==null||isNaN(totalSec))return "--:--";
-  totalSec=Math.round(totalSec);
-  const h=Math.floor(totalSec/3600), m=Math.floor((totalSec%3600)/60), s=totalSec%60;
-  if(h>0)return `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
-  return `${m}:${String(s).padStart(2,"0")}`;
-}
-function parseTimeToSec(str){
-  if(str===undefined||str===null||str==="")return null;
-  const parts=String(str).split(":").map(Number);
-  if(parts.some((p)=>isNaN(p)))return null;
-  if(parts.length===3)return parts[0]*3600+parts[1]*60+parts[2];
-  if(parts.length===2)return parts[0]*60+parts[1];
-  return Number(parts[0]);
-}
-function fmtPace(secPerKm){
-  if(secPerKm==null||isNaN(secPerKm))return "--:--/km";
-  return fmtTime(secPerKm)+"/km";
-}
-// lower-is-better normalization: score = (benchmark/actual)*100, capped [0,100]
-function scoreLowerBetter(actual, benchmark){
-  if(!actual||actual<=0||!benchmark)return null;
-  return clamp((benchmark/actual)*100,0,100);
-}
-// higher-is-better normalization: score = (actual/target)*100, capped [0,100]
-function scoreHigherBetter(actual, target){
-  if(actual==null||!target)return null;
-  return clamp((actual/target)*100,0,100);
-}
-function weightedAvg(pairs){ // [[score,weight], ...] ignoring nulls, renormalizing weights
-  const valid=pairs.filter(p=>p[0]!=null && !isNaN(p[0]));
-  if(!valid.length)return null;
-  const wsum=valid.reduce((s,p)=>s+p[1],0);
-  return valid.reduce((s,p)=>s+p[0]*p[1],0)/wsum;
-}
-function mean(arr){ arr=arr.filter(v=>v!=null&&!isNaN(v)); return arr.length? arr.reduce((a,b)=>a+b,0)/arr.length : null; }
-// linear-interpolation percentile (0..1), used by the event-based Podium benchmark below — a single
-// very fast/slow event never dominates since it's one data point among many events, not a raw row.
-function percentileOf(arr, p){
-  const a=arr.filter(v=>v!=null&&!isNaN(v)).sort((x,y)=>x-y);
-  if(!a.length) return null;
-  if(a.length===1) return a[0];
-  const idx=(a.length-1)*p;
-  const lo=Math.floor(idx), hi=Math.ceil(idx);
-  if(lo===hi) return a[lo];
-  return a[lo] + (a[hi]-a[lo])*(idx-lo);
-}
-function medianOf(arr){ return percentileOf(arr, 0.5); }
-function stdev(arr){
-  arr=arr.filter(v=>v!=null&&!isNaN(v));
-  if(arr.length<2)return 0;
-  const m=mean(arr); return Math.sqrt(mean(arr.map(v=>(v-m)**2)));
-}
-function escapeHtml(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-
-/* ---------------------------------------------------------------------- */
-/* 2. STORAGE (persistent, artifact-safe: window.storage w/ in-memory fallback) */
-/* ---------------------------------------------------------------------- */
-const MEM_FALLBACK = {};
-let storageWarned = false;
-/* BUG FIX — "업로드 이력이 매번 사라짐"
- *
- * window.storage 는 이 앱이 Claude artifact 안에서 실행될 때만 존재하는 API다.
- * GitHub Pages / 자체 호스팅 / file:// 로 열면 window.storage 가 아예 없어서,
- * 아래 두 함수가 전부 MEM_FALLBACK(= 단순 자바스크립트 객체)으로 떨어졌다.
- * MEM_FALLBACK 은 페이지를 새로고침하면 통째로 사라진다.
- *
- * STATE(hps:state:v1)는 로그인 시 Supabase user_data 로 따로 동기화되기 때문에
- * 살아남았지만, 업로드 이력(hps:hyroxUploadLog:v1)은 Supabase 동기화 대상이
- * 아니라서 새로고침 때마다 초기화됐던 것이다.
- *
- * 그래서 localStorage 계층을 중간에 추가한다:
- *   window.storage  (있으면 최우선)  ->  localStorage  ->  MEM_FALLBACK
- * localStorage 는 용량 한도(~5MB)가 있으므로 실패해도 절대 던지지 않고,
- * 그 경우 기존처럼 MEM_FALLBACK 으로 세션 내에서만 유지된다.
- */
-const LS_PREFIX = "hps:ls:";
-function lsGet(key){
-  try{
-    if(typeof localStorage==="undefined") return undefined;
-    const raw=localStorage.getItem(LS_PREFIX+key);
-    return raw==null? undefined : JSON.parse(raw);
-  }catch(e){ return undefined; }
-}
-function lsSet(key, value){
-  try{
-    if(typeof localStorage==="undefined") return false;
-    localStorage.setItem(LS_PREFIX+key, JSON.stringify(value));
-    return true;
-  }catch(e){
-    // QuotaExceededError 등 — EXTERNAL_RACE_DB 처럼 큰 데이터는 여기서 실패할 수 있다.
-    // 실패해도 조용히 넘어간다 (MEM_FALLBACK 과 Supabase 동기화가 각각 제 역할을 한다).
-    if(!lsSet._warned){ console.warn("localStorage 저장 실패(세션 내 데이터는 유지됩니다):", e?.name||e); lsSet._warned=true; }
-    return false;
-  }
-}
-const StorageService = {
-  async get(key, fallback){
-    try{
-      if(window.storage && window.storage.get){
-        const r = await window.storage.get(key, false);
-        return r ? JSON.parse(r.value) : fallback;
-      }
-    }catch(e){ /* key not found or storage unavailable */ }
-    if(key in MEM_FALLBACK) return MEM_FALLBACK[key];
-    const fromLs = lsGet(key);
-    if(fromLs!==undefined){ MEM_FALLBACK[key]=fromLs; return fromLs; }
-    return fallback;
-  },
   async set(key, value){
     MEM_FALLBACK[key]=value;
     let persisted=false;
@@ -1020,8 +874,8 @@ function freshnessWeight(days){
   if(days==null || !isFinite(days)) return 0;
   return Math.pow(0.5, Math.max(0,days)/FRESHNESS_HALFLIFE_DAYS);
 }
-// 데이터 종류별 신뢰도 (공식기록 > 개별테스트 > 시뮬레이션 > 훈련로그)
-const SOURCE_TRUST_V3 = { race:1.0, test:0.8, simulation:0.7, trainingLog:0.5 };
+// 데이터 종류별 신뢰도 (공식기록 > 개별테스트 > 시뮬레이션)
+const SOURCE_TRUST_V3 = { race:1.0, test:0.8, simulation:0.7 };
 // 다른 Division 기록: workload 변환을 거쳤더라도 보조 signal이므로 감쇠한다.
 const CROSS_DIVISION_TRUST = 0.6;
 // Division 개념 자체가 없는 데이터(Quick Test / 훈련로그). 선수 프로필 Division의
@@ -2481,42 +2335,6 @@ function getCurrentPerformanceBaseline(hpiResult, division){
 }
 
 
-function defaultWeeklyGrowth(phase){
-  return { Base:0.8, Build:0.5, Peak:0.2, Taper:0.0 }[phase] || 0.3;
-}
-function currentPhase(){
-  const target=STATE.profile.targetDate;
-  if(!target) return "Build";
-  const wksLeft=weeksBetween(todayISO(), target);
-  if(wksLeft<0) return "Taper";
-  if(wksLeft<=1.5) return "Taper";
-  if(wksLeft<=4) return "Peak";
-  if(wksLeft<=8) return "Build";
-  return "Base";
-}
-// spec §18: "같은 Base 단계라도 Week 1~4의 내용이 실제로 달라져야 한다" — a 4-week microcycle
-// (Adaptation → Volume → Specificity → Deload/Consolidation) inside whichever phase is active.
-// Deliberately STATELESS (no stored "phase start date") so it fits this app's existing philosophy —
-// currentPhase() itself is purely a function of today vs targetDate, never a stored value — by
-// anchoring the count to the FIXED phase-boundary wksLeft thresholds already used in currentPhase()
-// above (8/4/1.5). Direction matters: Build/Peak/Taper each have a fixed UPPER wksLeft boundary that
-// marks their start, so elapsed = (that boundary − current wksLeft) grows as wksLeft counts down
-// toward race day. Base has no upper bound at all, so it's anchored the other way — elapsed =
-// (current wksLeft − the Build boundary) — so elapsed still shrinks toward 0 as wksLeft counts down
-// toward Build, and the microcycle still cycles forward in real time (mod 4) for however long Base lasts.
-const WEEK_IN_PHASE_ANCHOR_WKSLEFT = { Base:8, Build:8, Peak:4, Taper:1.5 };
-const WEEK_IN_PHASE_CYCLE_LABEL = { 1:"Adaptation", 2:"Volume", 3:"Specificity", 4:"Deload / Consolidation" };
-function computeWeekInPhase(){
-  const phase = currentPhase();
-  const dRace = daysToRace();
-  if(dRace==null) return { phase, weekInPhase:1, cycleLabel:WEEK_IN_PHASE_CYCLE_LABEL[1], weeksToRace:null };
-  const wksLeft = Math.max(0, dRace/7);
-  const anchorWksLeft = WEEK_IN_PHASE_ANCHOR_WKSLEFT[phase] ?? 8;
-  const rawElapsed = phase==="Base" ? (wksLeft-anchorWksLeft) : (anchorWksLeft-wksLeft);
-  const weeksElapsedInPhase = Math.max(0, Math.floor(rawElapsed));
-  const weekInPhase = (weeksElapsedInPhase % 4) + 1; // 1..4, repeating
-  return { phase, weekInPhase, cycleLabel: WEEK_IN_PHASE_CYCLE_LABEL[weekInPhase], weeksToRace: wksLeft };
-}
 function daysToRace(){
   if(!STATE.profile.targetDate) return null;
   return daysBetween(todayISO(), STATE.profile.targetDate);
@@ -2634,9 +2452,6 @@ function predictTime(hpiResult, horizonWeeks=0){
   };
 }
 
-function fatiguePenaltySeconds(fatigueScore){
-  return fatigueScore>70 ? ((fatigueScore-70)/10)*0.01 : 0;
-}
 
 /* ---------------------------------------------------------------------- */
 /* 5b-2. V3 — SEGMENT-BASED RACE PERFORMANCE MODEL                         */
@@ -3720,16 +3535,16 @@ function getPersonalSegmentHistory(seg){
 }
 // PEER_SEGMENTS' "roxzone" key vs SEGMENT_LIST's "transition" key refer to the same segment — see the
 // Prediction-baseline key-mapping fix above. This bridges PEER_SEGMENTS entries into resolveSegment()'s
-// SEGMENT_LIST-keyed lookup so DNA reuses the EXACT SAME Race actual > Station test > Training log
+// SEGMENT_LIST-keyed lookup so DNA reuses the EXACT SAME Race actual > Station test
 // hierarchy the Prediction engine already implements (spec ⑦/⑯), instead of a second copy of that logic.
 function toSegmentListEntry(peerSeg){
   const key = peerSeg.key==="roxzone" ? "transition" : peerSeg.key;
   return SEGMENT_LIST.find(s=>s.key===key) || null;
 }
 // doc9 §30-2/§30-7/TEST-07: DNA/Peer percentile must reflect "실제 HYROX 선수 집단에서 본인의 위치" —
-// the athlete's OWN value must come from an official race split ONLY, never Simulation or trainingLog.
-// resolveSegment() (used everywhere else — Prediction, Station Priority, Training Plan) deliberately
-// DOES fall through to Simulation/trainingLog when official data is stale or missing, because those
+// the athlete's OWN value must come from an official race split ONLY, never Simulation or Quick Test.
+// resolveSegment() (used everywhere else — Prediction, Station Priority, Prediction) deliberately
+// DOES fall through to Simulation/Quick Test when official data is stale or missing, because those
 // engines answer "what can this athlete do right now"; DNA answers a different question ("where do I
 // rank among real HYROX finishers"), so it needs its own, strictly official-only resolver — reading
 // directly from the specific race object computePeerAnalysis is already analyzing, with NO fallback
@@ -4978,34 +4793,6 @@ function simulateGoal(baseTotalSec, runPaceImproveSecPerKm, stationImprovements)
 /* ---------------------------------------------------------------------- */
 /* 10. SVG CHART HELPERS (dependency-free)                                 */
 /* ---------------------------------------------------------------------- */
-function svgRadar(indices, size=280){
-  const keys=Object.keys(INDEX_WEIGHTS);
-  const n=keys.length; const cx=size/2, cy=size/2, r=size*0.36;
-  const angle=(i)=> -Math.PI/2 + i*(2*Math.PI/n);
-  const rings=[0.25,0.5,0.75,1];
-  let grid="";
-  rings.forEach(f=>{
-    const pts=keys.map((k,i)=>{ const a=angle(i); return `${cx+Math.cos(a)*r*f},${cy+Math.sin(a)*r*f}`; }).join(" ");
-    grid+=`<polygon points="${pts}" fill="none" stroke="#28282C" stroke-width="1"/>`;
-  });
-  keys.forEach((k,i)=>{ const a=angle(i); grid+=`<line x1="${cx}" y1="${cy}" x2="${cx+Math.cos(a)*r}" y2="${cy+Math.sin(a)*r}" stroke="#28282C" stroke-width="1"/>`; });
-  const dataPts=keys.map((k,i)=>{ const a=angle(i); const v=clamp((indices[k].score??0)/100,0,1); return `${cx+Math.cos(a)*r*v},${cy+Math.sin(a)*r*v}`; }).join(" ");
-  let labels="";
-  keys.forEach((k,i)=>{
-    const a=angle(i); const lx=cx+Math.cos(a)*(r+26), ly=cy+Math.sin(a)*(r+26);
-    const anchor = Math.abs(Math.cos(a))<0.3? "middle" : (Math.cos(a)>0? "start":"end");
-    const score=indices[k].score;
-    labels+=`<text x="${lx}" y="${ly-3}" text-anchor="${anchor}" font-family="Pretendard, sans-serif" font-size="10" fill="#9497A0">${INDEX_META[k].friendly}</text>`;
-    labels+=`<text x="${lx}" y="${ly+9}" text-anchor="${anchor}" font-family="JetBrains Mono" font-size="11" font-weight="700" fill="#FF5A1F">${score!=null?round1(score):"—"}</text>`;
-  });
-  return `<svg viewBox="0 0 ${size} ${size}" width="100%" height="${size}">
-    ${grid}
-    <polygon points="${dataPts}" fill="rgba(255,90,31,.22)" stroke="#FF5A1F" stroke-width="2"/>
-    ${keys.map((k,i)=>{ const a=angle(i); const v=clamp((indices[k].score??0)/100,0,1); return `<circle cx="${cx+Math.cos(a)*r*v}" cy="${cy+Math.sin(a)*r*v}" r="3" fill="#FF5A1F"/>`; }).join("")}
-    ${labels}
-  </svg>`;
-}
-
 // generic N-axis radar: items = [{label, score(0-100)}]
 function svgRadarGeneric(items, size=280, color="#FF5A1F"){
   const n=items.length; const cx=size/2, cy=size/2, r=size*0.36;
@@ -5264,63 +5051,6 @@ function bindInputs(root){
 /*      — always takes priority over anything derived here. See the       */
 /*      "Actual > Self-Reported > Estimated" ordering used throughout.     */
 /* ---------------------------------------------------------------------- */
-const QUICK_ACTIVITIES = [
-  { key:"running",     label:"🏃 Running" },
-  { key:"hyrox",        label:"🔥 HYROX" },
-  { key:"strength",    label:"🏋️ Strength" },
-  { key:"conditioning",label:"💪 Conditioning" },
-  { key:"hybrid",       label:"🔀 Hybrid" },
-  { key:"row",          label:"🚣 Row" },
-  { key:"ski",          label:"🎿 SkiErg" },
-  { key:"recovery",     label:"🧘 Recovery" },
-  { key:"other",        label:"기타" },
-];
-// running/row/ski are distance-based (no duration preset — pace matters more than time);
-// hyrox/strength/conditioning/hybrid are duration-based. Both kinds support "직접입력" (free entry)
-// since fixed presets can't cover every distance/duration (e.g. 4km, 8km, 35분).
-const QUICK_AMOUNTS = {
-  running:      ["5km","10km"],
-  hyrox:         ["30분","45분","60분","90분"],
-  strength:     ["30분","45분","60분"],
-  conditioning: ["30분","45분","60분"],
-  hybrid:        ["30분","45분","60분"],
-  row:           ["5km","10km"],
-  ski:           ["2km","5km"],
-  recovery:      ["가볍게","보통","충분히"],
-  other:         ["짧게","보통","길게"],
-};
-const AMOUNT_KIND = { running:"distance", row:"distance", ski:"distance", hyrox:"duration", strength:"duration", conditioning:"duration", hybrid:"duration", recovery:"category", other:"category" };
-const RUN_SUBTYPE_OPTIONS = [ {key:"easy",label:"이지런"},{key:"interval",label:"인터벌"},{key:"long",label:"롱런"},{key:"tt",label:"TT"} ];
-const RUN_SUBTYPE_TO_TYPE = { easy:"run", interval:"interval", long:"long", tt:"tt" };
-const PB_DISTANCE_OPTIONS = [ {key:"5k",label:"5K",field:"pb5k"},{key:"10k",label:"10K",field:"pb10k"},{key:"half",label:"하프마라톤",field:"pbHalf"} ];
-const STRENGTH_PB_LIFT_OPTIONS = [ {key:"squat",label:"Squat (kg)"},{key:"deadlift",label:"Deadlift (kg)"},{key:"bench",label:"Bench (kg)"},{key:"pullup",label:"Pull-up (최대 횟수)"} ];
-const FEELING_OPTIONS = [
-  { key:"fresh",      label:"👍 여유 있음" },
-  { key:"ok",         label:"🙂 괜찮음" },
-  { key:"normal",     label:"😐 보통" },
-  { key:"tired",      label:"😵 피곤함" },
-  { key:"exhausted",  label:"🥵 매우 피곤함" },
-];
-const STATION_RATING_OPTIONS = [
-  { key:"confident", label:"😎", score:0 },
-  { key:"ok",        label:"🙂", score:20 },
-  { key:"normal",    label:"😐", score:40 },
-  { key:"hard",      label:"😵", score:70 },
-  { key:"very_hard", label:"💀", score:90 },
-];
-
-// ---- data status: what categories of ACTUAL data currently exist ----
-
-
-// ---- Coach Level: Basic (race data only) -> Personal (simple info added) -> Advanced (Garmin / sustained log) ----
-
-// ---- Guidance message — tailored to exactly which data categories are present/missing,
-// so the dashboard nudges the person toward whatever would move their Coach Level forward next.
-
-
-// ---- Personalization progress — informational only, never fed back into HPI/prediction math ----
-
-
 // ---- Fitness Profile survey → derived categorical levels (never a fabricated time/split) ----
 function runningCapacityFromProfile(){
   const fp=STATE.profile.fitnessProfile;
@@ -5354,257 +5084,6 @@ function stationLimitationLabel(key){
 // ---- modal plumbing (bottom-sheet on mobile, centered on desktop) ----
 function closeModal(){ document.getElementById("modal-overlay")?.classList.remove("show"); }
 function openModal(){ document.getElementById("modal-overlay")?.classList.add("show"); }
-
-// ---- "오늘 운동 기록" quick log (target: 10-20s to complete) ----
-// Writes directly into the unified trainingLog (source:"quick"/"manual") so it shows up on the
-// 훈련 기록 tab and feeds HPI/count-based signals like a manual entry does. Vague categorical
-// amounts (짧게/보통/길게/가볍게/충분히) are NOT converted into a fabricated number — only explicit
-// "N분"/"Nkm" choices (preset or 직접입력 free-entry), or the optional pace-pair field, become
-// numeric fields.
-const PACE_RELEVANT_ACTIVITIES = ["running","row","ski"];
-// ---- draft persistence across true page reloads (spec: mobile OS can reload/suspend a backgrounded
-// tab when switching to another app — in-memory-only draft variables like QL_DRAFT/RC_PREFILL don't
-// survive that, only STATE (via StorageService) does. These write the in-progress draft to
-// localStorage on every change so a reload restores exactly what was being typed. Drafts older than
-// 12h are treated as stale and ignored, not resurrected.) ----
-function saveLocalDraft(key, value){ try{ localStorage.setItem(`hps:draft:${key}`, JSON.stringify({ value, savedAt:Date.now() })); }catch(e){} }
-function loadLocalDraft(key, maxAgeMs=1000*60*60*12){
-  try{
-    const raw=localStorage.getItem(`hps:draft:${key}`);
-    if(!raw) return null;
-    const parsed=JSON.parse(raw);
-    if(!parsed || parsed.value==null) return null;
-    if(Date.now()-parsed.savedAt > maxAgeMs) return null;
-    return parsed.value;
-  }catch(e){ return null; }
-}
-function clearLocalDraft(key){ try{ localStorage.removeItem(`hps:draft:${key}`); }catch(e){} }
-
-let QL_DRAFT=null;
-// resolves the effective amount string, expanding "custom" (직접입력) into "Xkm"/"X분" so the
-// rest of the pipeline (parseQuickAmount, notes, pace-pair detection) can treat it identically
-// to a preset choice
-function effectiveQuickAmount(entry){
-  if(entry.amount!=="custom") return entry.amount;
-  const kind=AMOUNT_KIND[entry.activity];
-  if(!entry.customAmountValue) return null;
-  if(kind==="distance") return `${entry.customAmountValue}km`;
-  if(kind==="duration") return `${entry.customAmountValue}분`;
-  return entry.customAmountValue;
-}
-function parseQuickAmount(entry){
-  let distanceKm=null, durationMin=null;
-  const amount=effectiveQuickAmount(entry);
-  if(amount){
-    if(/km$/.test(amount)){ const km=parseFloat(amount); distanceKm=isNaN(km)?null:km; }
-    else if(/분$/.test(amount)){ const min=parseInt(amount,10); durationMin=isNaN(min)?null:min; }
-  }
-  // optional complementary field the person can add so a real pace can be computed —
-  // only applied when it fills the metric the amount choice didn't already cover
-  if(distanceKm==null && entry.pairDistanceKm) distanceKm=Number(entry.pairDistanceKm)||null;
-  if(durationMin==null && entry.pairDurationMin) durationMin=Number(entry.pairDurationMin)||null;
-  return { distanceKm, durationMin };
-}
-const QUICK_TYPE_MAP = { running:"run", hyrox:"wod", strength:"strength", conditioning:"conditioning", hybrid:"hybrid", row:"wod", ski:"wod", recovery:"recovery", other:"wod" };
-// live preview while filling in the interval detail fields — same math used at submit time
-// (spec: 반복 페이스는 반복 구간 자체의 페이스만 의미해야 하고, 회복 구간은 포함하지 않음).
-function intervalPreviewCalc(d){
-  const distM=Number(d.intervalRepDistanceM), count=Number(d.intervalRepCount), repSec=parseTimeToSec(d.intervalRepTimeStr);
-  if(!distM || !count || !repSec) return null;
-  const workKm = (distM*count)/1000;
-  const workPaceSecKm = Math.round(repSec/(distM/1000));
-  return { workKm, workPaceSecKm };
-}
-
-function openQuickLogModal(){
-  const savedDraft = loadLocalDraft("quicklog");
-  QL_DRAFT = savedDraft || { date: todayISO(), activity:null, amount:null, customAmountValue:"", pairDistanceKm:"", pairDurationMin:"", rpe:null, feeling:null, detailOpen:false,
-    avgHr:"", maxHr:"", restingHr:"", firstHalfAvgHr:"", secondHalfAvgHr:"", painFlag:"", painArea:"", note:"",
-    runSubType:null, intervalRepDistanceM:"", intervalRepCount:"", intervalRepTimeStr:"", intervalRecoveryTimeStr:"", intervalRecoveryType:"jog",
-    pbAchieved:false, pbDistance:null, pbTime:"", ttDistance:null, ttTime:"",
-    strengthPbAchieved:false, strengthPbLift:null, strengthPbValue:"" };
-  if(!QL_DRAFT.date) QL_DRAFT.date = todayISO(); // backward-compat: drafts saved before the date field existed
-  renderQuickLogModal();
-  openModal();
-  // delegated on the panel itself (survives renderQuickLogModal's innerHTML rewrites) — one listener
-  // covers every field, including the several that don't trigger a re-render.
-  document.getElementById("modal-panel")?.addEventListener("change", ()=>saveLocalDraft("quicklog", QL_DRAFT));
-  if(savedDraft) showToast("이전에 작성 중이던 기록을 불러왔습니다");
-}
-function renderQuickLogModal(){
-  const panel=document.getElementById("modal-panel");
-  saveLocalDraft("quicklog", QL_DRAFT); // covers click-driven mutations (re-rendered immediately); the
-  // delegated "change" listener in openQuickLogModal covers the blur-driven text/number fields that don't re-render.
-  const _prevScrollTop=panel.scrollTop; // re-render on every field change (see below) would otherwise reset scroll to top
-  const amounts = QL_DRAFT.activity ? (QUICK_AMOUNTS[QL_DRAFT.activity]||[]) : [];
-  const kind = QL_DRAFT.activity ? AMOUNT_KIND[QL_DRAFT.activity] : null;
-  const showCustom = QL_DRAFT.amount==="custom" && (kind==="distance"||kind==="duration");
-  const showPacePair = QL_DRAFT.activity && PACE_RELEVANT_ACTIVITIES.includes(QL_DRAFT.activity) && effectiveQuickAmount(QL_DRAFT);
-  const effAmount = effectiveQuickAmount(QL_DRAFT);
-  const isDurationPicked = /분$/.test(effAmount||"");
-  const isDistancePicked = /km$/.test(effAmount||"");
-  const pairPreview = (()=>{
-    const parsed=parseQuickAmount(QL_DRAFT);
-    if(parsed.distanceKm && parsed.durationMin) return `페이스 ${fmtTime(Math.round((parsed.durationMin*60)/parsed.distanceKm))}/km 로 계산됩니다`;
-    return null;
-  })();
-  const d=QL_DRAFT;
-  panel.innerHTML = `
-    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏋️ 운동 기록</div><span class="modal-close" id="ql-close">✕</span></div>
-    <div style="font-size:11.5px;color:var(--gray);margin-bottom:4px;">10~20초면 충분해요 — 남긴 기록은 다음 훈련을 조정하는 데 참고됩니다.</div>
-    <div style="margin-top:10px;max-width:180px;">
-      <div style="font-size:12px;font-weight:700;margin-bottom:4px;">날짜 <span style="color:var(--gray-dim);font-weight:400;">(지난 훈련도 기록 가능)</span></div>
-      <input id="ql-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date||todayISO())}" placeholder="YYYY-MM-DD" style="max-width:180px;">
-    </div>
-    <div style="margin-top:14px;">
-      <div style="font-size:13px;font-weight:700;margin-bottom:2px;">오늘 무엇을 했나요?</div>
-      <div class="qbtn-grid">${QUICK_ACTIVITIES.map(a=>`<div class="qbtn ${QL_DRAFT.activity===a.key?"on":""}" data-ql-activity="${a.key}">${a.label}</div>`).join("")}</div>
-    </div>
-    ${QL_DRAFT.activity? `<div style="margin-top:16px;">
-      <div style="font-size:13px;font-weight:700;margin-bottom:2px;">얼마나 했나요?</div>
-      <div class="qbtn-grid">${amounts.map(a=>`<div class="qbtn ${QL_DRAFT.amount===a?"on":""}" data-ql-amount="${escapeHtml(a)}">${escapeHtml(a)}</div>`).join("")}${(kind==="distance"||kind==="duration")?`<div class="qbtn ${QL_DRAFT.amount==="custom"?"on":""}" data-ql-amount="custom">직접입력</div>`:""}</div>
-      ${showCustom? `<input id="ql-custom-amount" type="number" step="${kind==="distance"?"0.1":"1"}" placeholder="${kind==="distance"?"예: 4.2 (km)":"예: 35 (분)"}" value="${escapeHtml(QL_DRAFT.customAmountValue)}" style="max-width:160px;margin-top:8px;">` : ""}
-    </div>` : ""}
-    ${showPacePair? `<div style="margin-top:12px;">
-      ${isDurationPicked? `
-        <div style="font-size:11.5px;color:var(--gray);margin-bottom:5px;">거리는 얼마나 되나요? (선택 — 입력하면 페이스가 계산되어 훈련 지수에 반영됩니다)</div>
-        <input id="ql-pair-dist" type="number" step="0.1" placeholder="예: 6.2" value="${escapeHtml(QL_DRAFT.pairDistanceKm)}" style="max-width:160px;">
-      ` : isDistancePicked? `
-        <div style="font-size:11.5px;color:var(--gray);margin-bottom:5px;">시간은 얼마나 걸렸나요? (선택 — 입력하면 페이스가 계산되어 훈련 지수에 반영됩니다)</div>
-        <input id="ql-pair-dur" type="number" placeholder="예: 27" value="${escapeHtml(QL_DRAFT.pairDurationMin)}" style="max-width:160px;">
-      ` : ""}
-      ${pairPreview? `<div class="reason-line" style="margin-top:6px;color:var(--green);">${pairPreview}</div>` : ""}
-    </div>` : ""}
-    <div style="margin-top:16px;">
-      <div style="font-size:13px;font-weight:700;margin-bottom:2px;">오늘 얼마나 힘들었나요? (RPE)</div>
-      <div class="qbtn-grid">${Array.from({length:10},(_,i)=>i+1).map(n=>`<div class="qbtn ${QL_DRAFT.rpe===n?"on":""}" data-ql-rpe="${n}" style="min-width:32px;justify-content:center;">${n}</div>`).join("")}</div>
-    </div>
-    <div style="margin-top:16px;">
-      <div style="font-size:13px;font-weight:700;margin-bottom:2px;">운동 후 상태</div>
-      <div class="qbtn-grid">${FEELING_OPTIONS.map(f=>`<div class="qbtn ${QL_DRAFT.feeling===f.key?"on":""}" data-ql-feeling="${f.key}">${f.label}</div>`).join("")}</div>
-    </div>
-
-    <div style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px;">
-      <div class="qbtn" id="ql-detail-toggle" style="display:inline-flex;">${QL_DRAFT.detailOpen? "− 상세입력 닫기" : "+ 상세입력"}</div>
-      ${QL_DRAFT.detailOpen? `
-        <div style="margin-top:14px;">
-          ${d.activity==="running"? `
-            <div style="margin-bottom:14px;">
-              <div style="font-size:13px;font-weight:700;margin-bottom:6px;">러닝 종류</div>
-              <div class="qbtn-grid">${RUN_SUBTYPE_OPTIONS.map(o=>`<div class="qbtn ${d.runSubType===o.key?"on":""}" data-ql-runsub="${o.key}">${o.label}</div>`).join("")}</div>
-              ${d.runSubType==="interval"? `<div style="margin-top:8px;">
-                <div class="grid grid-4">
-                  ${field("반복 거리(m)", `<input id="ql-iv-dist" type="number" placeholder="400" value="${escapeHtml(d.intervalRepDistanceM)}">`)}
-                  ${field("반복 횟수", `<input id="ql-iv-count" type="number" placeholder="6" value="${escapeHtml(d.intervalRepCount)}">`)}
-                  ${field("반복 시간(mm:ss, 평균)", `<input id="ql-iv-reptime" placeholder="1:38" value="${escapeHtml(d.intervalRepTimeStr)}">`)}
-                  ${field("회복 시간(mm:ss, 평균)", `<input id="ql-iv-rectime" placeholder="1:30" value="${escapeHtml(d.intervalRecoveryTimeStr)}">`)}
-                </div>
-                <div style="margin-top:8px;">${field("회복 방식", `<select id="ql-iv-rectype"><option value="jog" ${d.intervalRecoveryType!=="rest"?"selected":""}>조깅 회복</option><option value="rest" ${d.intervalRecoveryType==="rest"?"selected":""}>정지 휴식</option></select>`)}</div>
-                ${(() => { const iv=intervalPreviewCalc(d); return iv? `<div class="reason-line" style="margin-top:8px;color:var(--green);">Work Volume ${round1(iv.workKm)}km · Interval Work Pace ${fmtTime(iv.workPaceSecKm)}/km (회복 구간 제외, 반복 구간만)</div>` : ""; })()}
-              </div>` : ""}
-              ${d.runSubType==="tt" ? `
-              <div style="margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--surface2);">
-                <div style="font-size:12.5px;font-weight:700;margin-bottom:7px;">🏃 TT 기록</div>
-                <div class="grid grid-2">
-                  ${field("거리", `<select id="ql-tt-distance">${RUN_TT_OPTIONS.map(o=>`<option value="${o.distanceKm}" ${Number(d.ttDistance)===o.distanceKm?"selected":""}>${o.label}</option>`).join("")}</select>`)}
-                  ${field("기록 (mm:ss)", `<input id="ql-tt-time" placeholder="예: 49:50" value="${escapeHtml(d.ttTime||"")}">`)}
-                </div>
-                <div class="data-tier-note">저장하면 Calibration의 Running TT 기록과 동일한 데이터로 연결됩니다. 5K/10K는 기존 Running PB에도 반영됩니다.</div>
-              </div>` : ""}
-              <div style="margin-top:10px;">
-                <label class="hstack" style="gap:7px;font-size:12.5px;color:var(--gray);cursor:pointer;">
-                  <input type="checkbox" id="ql-pb-toggle" ${d.pbAchieved?"checked":""} style="width:auto;"> PB 달성 🎉
-                </label>
-                ${d.pbAchieved? `
-                  <div class="grid grid-2" style="margin-top:8px;">
-                    ${field("어떤 거리 PB인가요?", `<select id="ql-pb-distance">${PB_DISTANCE_OPTIONS.map(o=>`<option value="${o.key}" ${d.pbDistance===o.key?"selected":""}>${o.label}</option>`).join("")}</select>`)}
-                    ${field("기록 (mm:ss 또는 h:mm:ss)", `<input id="ql-pb-time" placeholder="20:30" value="${escapeHtml(d.pbTime)}">`)}
-                  </div>
-                  <div class="data-tier-note">저장하면 러닝 능력치 페이지의 PB 기록이 이 값으로 자동 업데이트됩니다.</div>
-                ` : ""}
-              </div>
-            </div>
-          ` : ""}
-          ${d.activity==="strength"? `
-            <div style="margin-bottom:14px;">
-              <label class="hstack" style="gap:7px;font-size:12.5px;color:var(--gray);cursor:pointer;">
-                <input type="checkbox" id="ql-strength-pb-toggle" ${d.strengthPbAchieved?"checked":""} style="width:auto;"> 1RM PB 달성 🎉
-              </label>
-              ${d.strengthPbAchieved? `
-                <div class="grid grid-2" style="margin-top:8px;">
-                  ${field("종목", `<select id="ql-strength-pb-lift">${STRENGTH_PB_LIFT_OPTIONS.map(o=>`<option value="${o.key}" ${d.strengthPbLift===o.key?"selected":""}>${o.label}</option>`).join("")}</select>`)}
-                  ${field("기록", `<input id="ql-strength-pb-value" type="number" placeholder="예: 120" value="${escapeHtml(d.strengthPbValue)}">`)}
-                </div>
-                <div class="data-tier-note">저장하면 근력·스테이션 페이지의 1RM 기록이 이 값으로 자동 업데이트됩니다.</div>
-              ` : ""}
-            </div>
-          ` : ""}
-          <div class="grid grid-2">
-            ${field("평균 심박 (선택)", `<input id="qld-hr" type="number" placeholder="152" value="${escapeHtml(d.avgHr)}">`)}
-            ${field("최고 심박 (선택)", `<input id="qld-maxhr" type="number" placeholder="178" value="${escapeHtml(d.maxHr)}">`)}
-          </div>
-          <div class="grid grid-2" style="margin-top:10px;">
-            ${field("휴식 심박 (선택, 운동 직후 휴식 시)", `<input id="qld-restinghr" type="number" placeholder="65" value="${escapeHtml(d.restingHr)}">`)}
-            ${field("통증 여부 (선택)", `<select id="qld-pain"><option value="" ${d.painFlag!=="yes"?"selected":""}>없음</option><option value="yes" ${d.painFlag==="yes"?"selected":""}>있음</option></select>`)}
-          </div>
-          ${d.activity==="running" && d.runSubType!=="interval" ? `
-          <div class="grid grid-2" style="margin-top:10px;">
-            ${field("전반부 평균 심박 (선택, HR Drift 계산용)", `<input id="qld-hr-firsthalf" type="number" placeholder="예: 148" value="${escapeHtml(d.firstHalfAvgHr)}">`)}
-            ${field("후반부 평균 심박 (선택, HR Drift 계산용)", `<input id="qld-hr-secondhalf" type="number" placeholder="예: 156" value="${escapeHtml(d.secondHalfAvgHr)}">`)}
-          </div>
-          <p class="lead" style="margin:4px 0 0;font-size:10.5px;">둘 다 입력하면 동일 페이스 조건에서의 HR Drift(심박 상승률)가 계산됩니다. 비워두면 "데이터 부족"으로 표시되고 임의로 추정하지 않습니다.</p>
-          ` : ""}
-          <div class="grid grid-2" style="margin-top:10px;">
-            ${field("통증 부위 (선택)", `<input id="qld-painarea" placeholder="예: 왼쪽 무릎" value="${escapeHtml(d.painArea)}">`)}
-            ${field("메모", `<input id="qld-note" placeholder="선택사항" value="${escapeHtml(d.note)}">`)}
-          </div>
-        </div>
-      ` : ""}
-    </div>
-
-    <button class="btn" id="ql-save" style="width:100%;justify-content:center;margin-top:20px;" ${(!QL_DRAFT.activity || (QL_DRAFT.activity==="running" && QL_DRAFT.runSubType==="tt" ? (!QL_DRAFT.ttDistance || !QL_DRAFT.ttTime) : !QL_DRAFT.rpe))?"disabled":""}>기록 저장</button>
-  `;
-  panel.scrollTop=_prevScrollTop;
-  panel.querySelector("#ql-close").addEventListener("click", closeModal);
-  panel.querySelector("#ql-date")?.addEventListener("change",(e)=>{ QL_DRAFT.date=e.target.value; });
-  panel.querySelectorAll("[data-ql-activity]").forEach(b=>b.addEventListener("click",()=>{ QL_DRAFT.activity=b.dataset.qlActivity; QL_DRAFT.amount=null; QL_DRAFT.customAmountValue=""; QL_DRAFT.pairDistanceKm=""; QL_DRAFT.pairDurationMin=""; QL_DRAFT.runSubType=null; renderQuickLogModal(); }));
-  panel.querySelectorAll("[data-ql-amount]").forEach(b=>b.addEventListener("click",()=>{ QL_DRAFT.amount=b.dataset.qlAmount; QL_DRAFT.pairDistanceKm=""; QL_DRAFT.pairDurationMin=""; renderQuickLogModal(); }));
-  panel.querySelectorAll("[data-ql-rpe]").forEach(b=>b.addEventListener("click",()=>{ QL_DRAFT.rpe=Number(b.dataset.qlRpe); renderQuickLogModal(); }));
-  panel.querySelectorAll("[data-ql-feeling]").forEach(b=>b.addEventListener("click",()=>{ QL_DRAFT.feeling=b.dataset.qlFeeling; renderQuickLogModal(); }));
-  panel.querySelectorAll("[data-ql-runsub]").forEach(b=>b.addEventListener("click",()=>{ QL_DRAFT.runSubType=b.dataset.qlRunsub; renderQuickLogModal(); }));
-  panel.querySelector("#ql-custom-amount")?.addEventListener("change",(e)=>{ QL_DRAFT.customAmountValue=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-pair-dist")?.addEventListener("change",(e)=>{ QL_DRAFT.pairDistanceKm=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-pair-dur")?.addEventListener("change",(e)=>{ QL_DRAFT.pairDurationMin=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-detail-toggle")?.addEventListener("click",()=>{ QL_DRAFT.detailOpen=!QL_DRAFT.detailOpen; renderQuickLogModal(); });
-  panel.querySelector("#ql-iv-dist")?.addEventListener("change",(e)=>{ QL_DRAFT.intervalRepDistanceM=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-iv-count")?.addEventListener("change",(e)=>{ QL_DRAFT.intervalRepCount=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-iv-reptime")?.addEventListener("change",(e)=>{ QL_DRAFT.intervalRepTimeStr=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-iv-rectime")?.addEventListener("change",(e)=>{ QL_DRAFT.intervalRecoveryTimeStr=e.target.value; renderQuickLogModal(); });
-  panel.querySelector("#ql-iv-rectype")?.addEventListener("change",(e)=>{ QL_DRAFT.intervalRecoveryType=e.target.value; });
-  panel.querySelector("#ql-pb-toggle")?.addEventListener("change",(e)=>{ QL_DRAFT.pbAchieved=e.target.checked; if(!QL_DRAFT.pbDistance) QL_DRAFT.pbDistance="5k"; renderQuickLogModal(); });
-  panel.querySelector("#ql-tt-distance")?.addEventListener("change",(e)=>{ QL_DRAFT.ttDistance=e.target.value; });
-  panel.querySelector("#ql-tt-time")?.addEventListener("change",(e)=>{ QL_DRAFT.ttTime=e.target.value; });
-  panel.querySelector("#ql-pb-distance")?.addEventListener("change",(e)=>{ QL_DRAFT.pbDistance=e.target.value; });
-  panel.querySelector("#ql-pb-time")?.addEventListener("change",(e)=>{ QL_DRAFT.pbTime=e.target.value; });
-  panel.querySelector("#ql-strength-pb-toggle")?.addEventListener("change",(e)=>{ QL_DRAFT.strengthPbAchieved=e.target.checked; if(!QL_DRAFT.strengthPbLift) QL_DRAFT.strengthPbLift="squat"; renderQuickLogModal(); });
-  panel.querySelector("#ql-strength-pb-lift")?.addEventListener("change",(e)=>{ QL_DRAFT.strengthPbLift=e.target.value; });
-  panel.querySelector("#ql-strength-pb-value")?.addEventListener("change",(e)=>{ QL_DRAFT.strengthPbValue=e.target.value; });
-  panel.querySelector("#qld-hr")?.addEventListener("change",(e)=>{ QL_DRAFT.avgHr=e.target.value; });
-  panel.querySelector("#qld-maxhr")?.addEventListener("change",(e)=>{ QL_DRAFT.maxHr=e.target.value; });
-  panel.querySelector("#qld-restinghr")?.addEventListener("change",(e)=>{ QL_DRAFT.restingHr=e.target.value; });
-  panel.querySelector("#qld-hr-firsthalf")?.addEventListener("change",(e)=>{ QL_DRAFT.firstHalfAvgHr=e.target.value; });
-  panel.querySelector("#qld-hr-secondhalf")?.addEventListener("change",(e)=>{ QL_DRAFT.secondHalfAvgHr=e.target.value; });
-  panel.querySelector("#qld-pain")?.addEventListener("change",(e)=>{ QL_DRAFT.painFlag=e.target.value; });
-  panel.querySelector("#qld-painarea")?.addEventListener("change",(e)=>{ QL_DRAFT.painArea=e.target.value; });
-  panel.querySelector("#qld-note")?.addEventListener("change",(e)=>{ QL_DRAFT.note=e.target.value; });
-  panel.querySelector("#ql-save")?.addEventListener("click",()=>{
-    submitQuickLog(QL_DRAFT);
-    clearLocalDraft("quicklog");
-    closeModal();
-    showToast("오늘 운동 기록이 저장되었습니다");
-    renderAll();
-  });
-}
 
 // ---- Fitness Profile survey (Level-2 personalization without requiring any measured data) ----
 let FS_DRAFT=null;
@@ -5789,9 +5268,9 @@ function render10kFullListModal(){
   const panel=document.getElementById("modal-panel");
   const list=runningTtRecords().filter(l=>Number(l.distanceKm)===10);
   // 버그 수정: "러닝 능력치" 페이지에서 입력한 10K PB(STATE.running.pb10k)는 날짜가 없는 별도 필드라
-  // 위 trainingLog 목록에는 절대 나타나지 않았다 — 그래서 러닝 능력치에만 10K 기록을 적어둔 사람은
+  // 위 기존 기록 목록에는 절대 나타나지 않았다 — 그래서 러닝 능력치에만 10K 기록을 적어둔 사람은
   // "전체보기"를 눌러도 그 기록을 볼 수 없었다. 날짜가 없어 목록에 끼워 넣을 수는 없으니, 목록
-  // 맨 위에 출처를 명확히 표시한 별도 줄로 보여준다 (trainingLog의 실제 세션 기록과는 구분).
+  // 맨 위에 출처를 명확히 표시한 별도 줄로 보여준다 (성능 테스트 기록과는 구분).
   const pb10kSec = parseTimeToSec(STATE.running.pb10k || STATE.running.tt10k);
   const pbAlreadyInList = list.length>0;
   const pbRowHtml = (pb10kSec!=null && !pbAlreadyInList) ? `
@@ -5900,7 +5379,7 @@ function renderAnalysisProfileRequired(wrap, targetLabel="Race DNA") {
 }
 
 // Main Race DNA scores are now derived ONLY from the same peer/race segments shown
-// on the detailed Race DNA page. HPI, recovery, ACWR, training logs, HR, weight and 1RM
+// on the detailed Race DNA page. HPI, recovery, ACWR, HR, weight and 1RM
 // are deliberately not part of this display path.
 function buildRaceOnlyDnaScores(peer){
   if(!peer) return {running:null,engine:null,strengthEnd:null,skill:null,raceExec:null};
@@ -6249,7 +5728,6 @@ const SEGMENT_BASIS_META = {
   "actual":            { label:"실측",        cls:"elite" },
   "actual-adjusted":   { label:"실측(보정)",   cls:"low" },
   "actual-stale":      { label:"실측(오래됨)", cls:"med" },
-  "estimated-training-pace": { label:"훈련로그 추정", cls:"med" },
   "estimated-10k-calibrated": { label:"10K 보정 추정", cls:"med" },
   "benchmark-only":    { label:"Reference",   cls:"crit" },
 };
@@ -6527,14 +6005,6 @@ async function handleOcrFiles(fileList){
   OCR_STATE.status="idle"; OCR_STATE.warnings=[];
   renderAll();
 }
-async function handleTlOcrFiles(fileList){
-  const files=Array.from(fileList||[]).filter(f=>f.type && f.type.startsWith("image/"));
-  for(const f of files){
-    try{ const dataUrl=await fileToDataUrl(f); TL_OCR_STATE.images.push({ dataUrl }); }catch(e){ console.warn("training log ocr file read failed", e); }
-  }
-  TL_OCR_STATE.status="idle"; TL_OCR_STATE.warnings=[];
-  renderAll();
-}
 // Recognized-label → canonical field-key aliasing. Tolerant of OCR noise (missing spaces,
 // hyphens, stray punctuation) — labels are normalized before matching.
 function normalizeOcrLabel(s){
@@ -6651,309 +6121,6 @@ function ocrErrorText(e){
   try{ return JSON.stringify(e); }catch(_){ return String(e); }
 }
 /* ---------------------------------------------------------------------- */
-/* TRAINING LOG OCR — parallel pipeline to the Race OCR above, same        */
-/*     Tesseract/preprocessForOcr() infra reused, different label set      */
-/*     (Garmin/Strava/watch summary screens instead of HYROX results).     */
-/*     Extracted fields ALWAYS land in an editable draft first — never     */
-/*     saved directly — per spec: "내용은 사용자가 확인/수정한 후 저장".      */
-/* ---------------------------------------------------------------------- */
-function defaultTlOcrState(){ return { images:[], status:"idle", progress:0, warnings:[], rawText:"" }; }
-const TL_OCR_TYPE_KEYWORDS = {
-  run:["run","running","러닝","달리기","조깅","jogging"],
-  interval:["interval","인터벌"],
-  strength:["strength","weight training","weight","웨이트","근력","kettlebell","케틀벨","bench press","벤치프레스","squat","스쿼트","deadlift","데드리프트","total sets","total reps","세트","반복"],
-  wod:["wod","hyrox","crossfit","hiit","히트","circuit","서킷","workout"],
-  conditioning:["conditioning","컨디셔닝","cardio","카디오","rowing","row erg","로잉","skierg","ski erg","스키에르그","cycling","사이클링","사이클","bike","바이크"],
-  recovery:["recovery","회복","rest","휴식"]
-};
-function tlOcrGuessType(text){
-  const low=String(text||"").toLowerCase();
-  // Specific strength signals beat a generic "Workout" title.
-  const strengthSignals=TL_OCR_TYPE_KEYWORDS.strength;
-  if(strengthSignals.some(k=>low.includes(k.toLowerCase()))) return "strength";
-  if(TL_OCR_TYPE_KEYWORDS.wod.some(k=>low.includes(k.toLowerCase()))) return "wod";
-  if(TL_OCR_TYPE_KEYWORDS.interval.some(k=>low.includes(k.toLowerCase()))) return "interval";
-  if(TL_OCR_TYPE_KEYWORDS.run.some(k=>low.includes(k.toLowerCase()))) return "run";
-  if(TL_OCR_TYPE_KEYWORDS.conditioning.some(k=>low.includes(k.toLowerCase()))) return "conditioning";
-  if(TL_OCR_TYPE_KEYWORDS.recovery.some(k=>low.includes(k.toLowerCase()))) return "recovery";
-  return null;
-}
-
-// label -> field. These are intentionally broad because Garmin/Apple/Strava
-// screens put labels and values in different OCR orders.
-const TL_OCR_LABEL_MAP = {
-  distanceKm: ["distance","거리","킬로미터"],
-  durationMin: ["time","duration","moving time","elapsed time","총 시간","운동 시간","시간","소요시간","운동시간"],
-  avgPaceSecKm: ["avg pace","average pace","pace","평균 페이스","페이스"],
-  avgHr: ["avg hr","average hr","avg heart rate","average heart rate","평균 심박","평균심박","평균 심박수"],
-  maxHr: ["max hr","maximum hr","max heart rate","최대 심박","최고심박","최대 심박수"],
-  intensityRpe: ["rpe","perceived exertion","자각강도"]
-};
-function tlOcrParseNumber(str){ const m=String(str).match(/\d+(?:\.\d+)?/); return m ? parseFloat(m[0]) : null; }
-function tlOcrParseDuration(str){
-  const s=String(str||"").trim();
-  const hmsMatch=s.match(/\b(\d{1,2}):(\d{2}):(\d{2})\b/);
-  if(hmsMatch) return Math.round((Number(hmsMatch[1])*3600+Number(hmsMatch[2])*60+Number(hmsMatch[3]))/6)/10;
-  const msMatch=s.match(/\b(\d{1,3}):(\d{2})\b/);
-  if(msMatch) return Math.round((Number(msMatch[1])*60+Number(msMatch[2]))/6)/10;
-  const numMatch=s.match(/(\d+(?:\.\d*)?)\s*(?:min|mins|분)\b/i);
-  return numMatch ? parseFloat(numMatch[1]) : null;
-}
-function tlOcrParsePace(str){
-  const m=String(str||"").match(/\b(\d{1,2}):(\d{2})\b/);
-  return m ? Number(m[1])*60+Number(m[2]) : null;
-}
-function tlOcrNormalizeText(text){
-  return String(text||"")
-    .replace(/\u2019|\u2018/g,"'")
-    .replace(/\u2033/g,'"')
-    .replace(/\r/g,'\n')
-    .replace(/[ \t]+/g,' ');
-}
-
-// Extract every time-shaped value once. This is the important fallback for
-// screens where OCR returns ALL labels first and ALL values later, e.g.:
-//   총 시간 / 운동 시간 / 휴식 시간 / ... / 54:53 / 30:23 / 24:30
-function tlOcrTimeCandidates(text){
-  const out=[];
-  const t=tlOcrNormalizeText(text);
-  for(const m of t.matchAll(/\b(\d{1,2}:\d{2}:\d{2})\b/g)){
-    const minutes=tlOcrParseDuration(m[1]);
-    if(minutes!=null && minutes>0 && minutes<=720) out.push({text:m[1],minutes,index:m.index});
-  }
-  for(const m of t.matchAll(/\b(\d{1,3}:\d{2})\b/g)){
-    const minutes=tlOcrParseDuration(m[1]);
-    if(minutes!=null && minutes>0 && minutes<=720) out.push({text:m[1],minutes,index:m.index});
-  }
-  // Deduplicate exact OCR repeats.
-  return out.filter((x,i,a)=>a.findIndex(y=>y.text===x.text)===i);
-}
-function tlOcrPickDuration(text){
-  const t=tlOcrNormalizeText(text);
-  const candidates=tlOcrTimeCandidates(t);
-  if(!candidates.length) return null;
-
-  // 1) Explicit total-duration label, including OCR's label/value reversal.
-  const totalPatterns=[
-    /총\s*시간[^\d]{0,80}(\d{1,2}:\d{2}(?::\d{2})?)/i,
-    /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,80}총\s*시간/i,
-    /elapsed\s*time[^\d]{0,80}(\d{1,2}:\d{2}(?::\d{2})?)/i,
-    /(\d{1,2}:\d{2}(?::\d{2})?)[^\d]{0,80}elapsed\s*time/i,
-    /\btime\b[^\d]{0,80}(\d{1,2}:\d{2}(?::\d{2})?)/i
-  ];
-  for(const re of totalPatterns){
-    const m=t.match(re);
-    if(m){
-      const minutes=tlOcrParseDuration(m[1]);
-      if(minutes!=null) return {minutes,matchedText:m[1],confidence:"high"};
-    }
-  }
-
-  // 2) If several time values exist and labels are stacked separately,
-  //    the total session duration is normally the largest duration.
-  //    This correctly handles Garmin HIIT: 54:53 / 30:23 / 24:30.
-  candidates.sort((a,b)=>b.minutes-a.minutes);
-  return {minutes:candidates[0].minutes,matchedText:candidates[0].text,confidence:"medium"};
-}
-function tlOcrPickDate(text){
-  const t=String(text||"");
-  let m=t.match(/(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})/);
-  if(m) return `${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`;
-  m=t.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})/);
-  if(m) return `${m[3]}-${String(m[1]).padStart(2,"0")}-${String(m[2]).padStart(2,"0")}`;
-  m=t.match(/\b(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|September|Oct|October|Nov|November|Dec|December)\s+(\d{1,2}),?\s+(\d{4})\b/i);
-  if(m){
-    const names={jan:1,january:1,feb:2,february:2,mar:3,march:3,apr:4,april:4,may:5,jun:6,june:6,jul:7,july:7,aug:8,august:8,sep:9,september:9,oct:10,october:10,nov:11,november:11,dec:12,december:12};
-    const monthText=t.match(/\b(\w+)\s+\d{1,2},?\s+\d{4}\b/i)[1].toLowerCase();
-    return `${m[2]}-${String(names[monthText]).padStart(2,"0")}-${String(m[1]).padStart(2,"0")}`;
-  }
-  // Relative date is safe to resolve only when explicitly present.
-  if(/\byesterday\b|어제/i.test(t)){
-    const d=new Date(); d.setDate(d.getDate()-1); return d.toISOString().slice(0,10);
-  }
-  if(/\btoday\b|오늘/i.test(t)) return todayISO();
-  return null;
-}
-
-function parseTrainingLogOcrText(text){
-  const normalized=tlOcrNormalizeText(text);
-  const lines=normalized.split("\n").map(l=>l.trim()).filter(Boolean);
-  const fields={
-    date:tlOcrPickDate(normalized),
-    type:tlOcrGuessType(normalized),
-    distanceKm:null,
-    durationMin:null,
-    avgPaceSecKm:null,
-    avgHr:null,
-    maxHr:null,
-    intensityRpe:null
-  };
-  const warnings=[];
-
-  // ------------------------------------------------------------
-  // Duration: robust to both label->value and stacked label/value OCR.
-  // ------------------------------------------------------------
-  const duration=tlOcrPickDuration(normalized);
-  if(duration) fields.durationMin=duration.minutes;
-
-  // ------------------------------------------------------------
-  // Distance: label/value + bare unit fallback.
-  // ------------------------------------------------------------
-  let m=normalized.match(/distance[^\d]{0,40}(\d+(?:\.\d+)?)\s*(?:km|mi)?/i)
-      || normalized.match(/거리[^\d]{0,40}(\d+(?:\.\d+)?)\s*(?:km|킬로미터)?/i)
-      || normalized.match(/\b(\d+(?:\.\d+)?)\s*(km|킬로미터)\b/i);
-  if(m){
-    const n=parseFloat(m[1]);
-    if(Number.isFinite(n) && n>0 && n<1000) fields.distanceKm=n;
-  }
-
-  // ------------------------------------------------------------
-  // Pace. Avoid treating HIIT's duration values as pace unless a pace label
-  // actually exists.
-  // ------------------------------------------------------------
-  m=normalized.match(/(?:avg\.?\s*pace|average\s*pace|pace|평균\s*페이스|페이스)[^\d]{0,30}(\d{1,2})['’:]\s*(\d{2})/i);
-  if(m) fields.avgPaceSecKm=Number(m[1])*60+Number(m[2]);
-  if(fields.avgPaceSecKm==null && fields.distanceKm!=null && fields.durationMin!=null){
-    fields.avgPaceSecKm=Math.round((fields.durationMin*60)/fields.distanceKm);
-  }
-
-  // ------------------------------------------------------------
-  // HR. Two OCR layouts are supported:
-  //   label -> 151 bpm
-  //   labels stacked first -> 151 bpm / 190 bpm / 37 bpm later
-  // Never let a duration such as 54:53 become an HR value.
-  // ------------------------------------------------------------
-  const bpmValues=[...normalized.matchAll(/\b(\d{2,3})\s*bpm\b/gi)].map(x=>Number(x[1]));
-  const hasAvgHrLabel=/(?:avg\.?\s*heart\s*rate|average\s*heart\s*rate|평균\s*심박(?:수)?|평균심박)/i.test(normalized);
-  const hasMaxHrLabel=/(?:max\.?\s*heart\s*rate|maximum\s*heart\s*rate|최대\s*심박(?:수)?|최고심박)/i.test(normalized);
-  if(bpmValues.length){
-    if(hasAvgHrLabel) fields.avgHr=bpmValues[0];
-    if(hasMaxHrLabel) fields.maxHr=bpmValues.length>1?bpmValues[1]:bpmValues[0];
-  }else{
-    m=normalized.match(/(?:avg\.?\s*heart\s*rate|average\s*heart\s*rate|평균\s*심박(?:수)?|평균심박)[^\d:]{0,40}(\d{2,3})(?![:\d])/i);
-    if(m) fields.avgHr=Number(m[1]);
-    m=normalized.match(/(?:max\.?\s*heart\s*rate|maximum\s*heart\s*rate|최대\s*심박(?:수)?|최고심박)[^\d:]{0,40}(\d{2,3})(?![:\d])/i);
-    if(m) fields.maxHr=Number(m[1]);
-  }
-
-  // ------------------------------------------------------------
-  // RPE, if present.
-  // ------------------------------------------------------------
-  m=normalized.match(/(?:rpe|perceived\s*exertion|자각강도)[^\d]{0,20}(\d{1,2})/i);
-  if(m){ const n=Number(m[1]); if(n>=1 && n<=10) fields.intensityRpe=n; }
-
-  // If no explicit type was found, distance+pace is a safe run heuristic.
-  if(!fields.type && fields.distanceKm!=null && fields.avgPaceSecKm!=null) fields.type="run";
-
-  if(!fields.durationMin){
-    warnings.push("운동시간을 인식하지 못했습니다. 운동시간을 직접 입력해주세요.");
-  }
-  if(!fields.date){
-    warnings.push("날짜를 정확히 인식하지 못했습니다 — 아래에서 직접 확인해주세요.");
-  }
-  if(fields.distanceKm==null){
-    warnings.push("거리 정보 없음 — 이 운동 유형에서는 정상입니다.");
-  }
-  return {fields,warnings,durationConfidence:duration?.confidence||null};
-}
-
-function tlOcrMergeFields(list){
-  const merged={date:null,type:null,distanceKm:null,durationMin:null,avgPaceSecKm:null,avgHr:null,maxHr:null,intensityRpe:null};
-  const typeRank={strength:5,wod:5,interval:4,run:4,conditioning:3,recovery:2};
-  for(const f of list){
-    if(!merged.date && f.date) merged.date=f.date;
-    if(f.type && (!merged.type || (typeRank[f.type]||0)>(typeRank[merged.type]||0))) merged.type=f.type;
-    if(merged.distanceKm==null && f.distanceKm!=null) merged.distanceKm=f.distanceKm;
-    if(merged.durationMin==null && f.durationMin!=null) merged.durationMin=f.durationMin;
-    if(merged.avgPaceSecKm==null && f.avgPaceSecKm!=null) merged.avgPaceSecKm=f.avgPaceSecKm;
-    if(merged.avgHr==null && f.avgHr!=null) merged.avgHr=f.avgHr;
-    if(merged.maxHr==null && f.maxHr!=null) merged.maxHr=f.maxHr;
-    if(merged.intensityRpe==null && f.intensityRpe!=null) merged.intensityRpe=f.intensityRpe;
-  }
-  return merged;
-}
-
-async function runTrainingLogOcrPipeline(){
-  if(!window.Tesseract){ TL_OCR_STATE.status="error"; TL_OCR_STATE.warnings=["OCR 엔진 스크립트를 불러오지 못했습니다 (네트워크 문제일 수 있어요). 다시 시도해주세요."]; renderAll(); return; }
-  TL_OCR_STATE.status="processing"; TL_OCR_STATE.progress=0; TL_OCR_STATE.rawText=""; renderAll();
-  const workerOk=await canUseWebWorker();
-  if(!workerOk){
-    TL_OCR_STATE.status="error";
-    TL_OCR_STATE.warnings=["이 미리보기 화면은 보안 정책상 OCR에 필요한 웹 워커 실행이 막혀 있어요. 파일을 다운로드한 뒤 Safari나 Chrome 같은 일반 브라우저 앱에서 직접 열어 다시 시도해주세요."];
-    renderAll(); return;
-  }
-
-  let combinedText="";
-  const imageErrors=[];
-  const parsedImages=[];
-
-  for(let i=0;i<TL_OCR_STATE.images.length;i++){
-    try{
-      const canvas=await preprocessForOcr(TL_OCR_STATE.images[i].dataUrl);
-      let data=null;
-      try{
-        ({data}=await Tesseract.recognize(canvas,"eng+kor",{
-          logger:(m)=>{
-            if(m.status==="recognizing text"){
-              TL_OCR_STATE.progress=Math.round(((i+m.progress)/TL_OCR_STATE.images.length)*100);
-              const el=document.getElementById("tl-ocr-progress-text");
-              if(el) el.textContent=`기록을 읽고 있어요… (${TL_OCR_STATE.progress}%)`;
-            }
-          }
-        }));
-      }catch(langErr){
-        // Korean traineddata may be unavailable in some environments.
-        ({data}=await Tesseract.recognize(canvas,"eng",{
-          logger:(m)=>{
-            if(m.status==="recognizing text"){
-              TL_OCR_STATE.progress=Math.round(((i+m.progress)/TL_OCR_STATE.images.length)*100);
-              const el=document.getElementById("tl-ocr-progress-text");
-              if(el) el.textContent=`기록을 읽고 있어요… (${TL_OCR_STATE.progress}%)`;
-            }
-          }
-        }));
-      }
-      const text=data?.text||"";
-      combinedText += `\n----- 이미지 ${i+1} -----\n${text}`;
-      if(text.trim()) parsedImages.push(parseTrainingLogOcrText(text).fields);
-    }catch(e){
-      console.warn("Training log OCR failed on image",i,e);
-      imageErrors.push(`이미지 ${i+1}: ${ocrErrorText(e)}`);
-    }
-  }
-
-  TL_OCR_STATE.rawText=combinedText.trim();
-  if(!parsedImages.length){
-    TL_OCR_STATE.status="error";
-    TL_OCR_STATE.warnings=imageErrors.length?imageErrors:["OCR 엔진이 이미지에서 아무 글자도 읽지 못했습니다. 화면 캡처가 선명한지 확인 후 다시 시도해주세요."];
-    renderAll(); return;
-  }
-
-  const fields=tlOcrMergeFields(parsedImages);
-  const allWarnings=[];
-  if(!fields.durationMin) allWarnings.push("운동시간을 인식하지 못했습니다. 운동시간을 직접 입력해주세요.");
-  if(!fields.date) allWarnings.push("날짜를 정확히 인식하지 못했습니다 — 아래에서 직접 확인해주세요.");
-  if(fields.distanceKm==null) allWarnings.push("거리 정보 없음 — 이 운동 유형에서는 정상입니다.");
-  allWarnings.push(...imageErrors);
-
-  // NEVER auto-save. Date stays blank when the screenshot does not contain a
-  // usable date; this prevents silently registering a workout on today's date.
-  TL_OCR_DRAFT={
-    date:fields.date||"",
-    type:fields.type||"conditioning",
-    distanceKm:fields.distanceKm,
-    durationMin:fields.durationMin,
-    avgPaceSecKm:fields.avgPaceSecKm,
-    avgHr:fields.avgHr,
-    maxHr:fields.maxHr,
-    intensityRpe:fields.intensityRpe
-  };
-  TL_OCR_STATE.status="done";
-  TL_OCR_STATE.warnings=allWarnings;
-  renderAll();
-}
-
-
 // Preflight check: some embedded/sandboxed webviews (e.g. in-app previews) block Web Worker
 // creation outright, which makes Tesseract.recognize() fail on every image with no useful detail.
 // Detecting this up front lets us give a clear, specific message instead of a generic one.
@@ -8344,239 +7511,6 @@ function parseCSV(text){
   if(field.length||row.length){ row.push(field); rows.push(row); }
   return rows.filter(r=>r.length>1 || (r.length===1 && r[0]!==""));
 }
-function guessColumn(headers, keywords, prefer){
-  const lower=headers.map(h=>h.toLowerCase().trim());
-  if(prefer){ for(const p of prefer){ const i=lower.findIndex(h=>h===p.toLowerCase()); if(i>=0) return i; } }
-  for(const kw of keywords){ const i=lower.findIndex(h=>h.includes(kw)); if(i>=0) return i; }
-  return -1;
-}
-function guessTypeFromText(txt){
-  const t=(txt||"").toLowerCase();
-  if(t.includes("strength")||t.includes("weight")||t.includes("웨이트")||t.includes("근력")) return "strength";
-  if(t.includes("interval")||t.includes("hiit")||t.includes("인터벌")) return "interval";
-  if(t.includes("hyrox")||t.includes("wod")||t.includes("crossfit")||t.includes("circuit")||t.includes("카디오")||t.includes("cardio")||t.includes("서킷")) return "wod";
-  if(t.includes("yoga")||t.includes("stretch")||t.includes("mobility")||t.includes("recovery")||t.includes("회복")||t.includes("요가")||t.includes("스트레칭")) return "recovery";
-  if(t.includes("run")||t.includes("러닝")||t.includes("jog")||t.includes("조깅")||t.includes("트레드밀")||t.includes("트랙")) return "run";
-  return "run";
-}
-function durationStrToMin(str){
-  if(!str)return null;
-  const s=String(str).trim();
-  if(s===""||s==="--") return null;
-  if(s.includes(":")){ const sec=parseTimeToSec(s); return sec!=null? round1(sec/60): null; }
-  const n=Number(s.replace(/,/g,""));
-  return isNaN(n)? null : n;
-}
-// Garmin sometimes reports short/track activities' distance in meters (e.g. "5,990" or "810")
-// and longer/free activities in km with a decimal (e.g. "6.01"). Heuristic: no decimal point
-// + value >=100 -> treat as meters and convert to km. Also strips thousands-separator commas.
-function parseDistanceToKm(raw, unit){
-  if(raw==null) return null;
-  const s=String(raw).trim();
-  if(s===""||s==="--") return null;
-  const hasDecimal = s.includes(".");
-  const numeric = Number(s.replace(/,/g,""));
-  if(isNaN(numeric)||numeric<=0) return null;
-  let km = (!hasDecimal && numeric>=100) ? numeric/1000 : numeric;
-  if(unit==="mi") km *= 1.60934;
-  return round1(km);
-}
-// spec §3: synonym column lists — Garmin/COROS/Strava export column names vary by device/app version
-// and locale; only columns that actually exist in the uploaded CSV are used, everything else stays null.
-const AVG_HR_COLUMNS = ["평균 심박","평균심박","avg hr","average heart rate","avg. heart rate","heart rate"];
-const MAX_HR_COLUMNS = ["최대 심박","최대심박","max hr","maximum heart rate","max. heart rate"];
-const GAP_COLUMNS = ["avg gap","average gap","grade adjusted pace","gap"];
-const ELEV_GAIN_COLUMNS = ["고도 상승","상승고도","elev gain","elevation gain","total ascent","ascent"];
-const ELEV_LOSS_COLUMNS = ["고도 하강","하강고도","elev loss","elevation loss","total descent","descent"];
-const AEROBIC_TE_COLUMNS = ["유산소 트레이닝 효과","aerobic training effect","aerobic te"];
-const TRAINING_LOAD_COLUMNS = ["트레이닝 부하","training load","tss","training stress score"];
-const CADENCE_COLUMNS = ["평균 케이던스","케이던스","avg cadence","average cadence","cadence"];
-function parseGarminCsv(text, unit){
-  const rows=parseCSV(text);
-  if(rows.length<2) return { rows:[], error:"CSV에서 데이터 행을 찾지 못했습니다." };
-  const headers=rows[0];
-  const iDate=guessColumn(headers,["날짜","date"]);
-  const iType=guessColumn(headers,["활동 종류","활동종류","activity type","제목","title","type"]);
-  const iDist=guessColumn(headers,["거리","distance"]);
-  const iDur=guessColumn(headers,["이동 시간","moving time","경과 시간","elapsed time","시간","time","duration"], ["이동 시간","moving time"]);
-  const iHr=guessColumn(headers,AVG_HR_COLUMNS);
-  const iPace=guessColumn(headers,["평균 페이스","페이스","avg pace","pace"]);
-  const iMaxHr=guessColumn(headers,MAX_HR_COLUMNS);
-  const iGap=guessColumn(headers,GAP_COLUMNS);
-  const iElevGain=guessColumn(headers,ELEV_GAIN_COLUMNS);
-  const iElevLoss=guessColumn(headers,ELEV_LOSS_COLUMNS);
-  const iAerobicTe=guessColumn(headers,AEROBIC_TE_COLUMNS);
-  const iLoad=guessColumn(headers,TRAINING_LOAD_COLUMNS);
-  const iCadence=guessColumn(headers,CADENCE_COLUMNS);
-  if(iDate<0){ return { rows:[], error:"날짜 컬럼을 찾지 못했습니다. Garmin/COROS/Strava 활동 내보내기 CSV인지 확인해주세요." }; }
-  const numOrNull=(raw)=>{ if(raw==null) return null; const s=String(raw).trim(); if(s===""||s==="--") return null; const n=Number(s.replace(/,/g,"")); return isNaN(n)?null:n; };
-  const out=[];
-  for(let r=1;r<rows.length;r++){
-    const row=rows[r]; if(!row || row.every(c=>c==="")) continue;
-    const rawDate=row[iDate]||"";
-    const dateMatch = rawDate.match(/\d{4}-\d{2}-\d{2}/);
-    let dateStr = dateMatch ? dateMatch[0] : null;
-    if(!dateStr){ const d=new Date(rawDate); if(!isNaN(d)) dateStr=d.toISOString().slice(0,10); }
-    if(!dateStr) continue;
-    const typeText = iType>=0? row[iType] : "";
-    const distanceKm = iDist>=0 ? parseDistanceToKm(row[iDist], unit) : null;
-    const durationMin = iDur>=0 ? durationStrToMin(row[iDur]) : null;
-    const avgHrRaw = iHr>=0 ? row[iHr] : null;
-    const avgHr = (avgHrRaw && avgHrRaw!=="--") ? (Number(avgHrRaw.replace(/,/g,""))||null) : null;
-    const maxHrRaw = iMaxHr>=0 ? row[iMaxHr] : null;
-    const maxHr = (maxHrRaw && maxHrRaw!=="--") ? (Number(maxHrRaw.replace(/,/g,""))||null) : null;
-    let avgPaceSecKm = null;
-    if(iPace>=0 && row[iPace] && row[iPace]!=="--" && row[iPace].includes(":")) avgPaceSecKm = parseTimeToSec(row[iPace]);
-    else if(distanceKm && durationMin) avgPaceSecKm = Math.round((durationMin*60)/distanceKm);
-    // spec §4: Garmin's own directly-provided Avg Pace/GAP is preferred over a distance÷duration
-    // derivation whenever the CSV provides it directly (already the case for avgPaceSecKm above).
-    let avgGapSecKm = null;
-    if(iGap>=0 && row[iGap] && row[iGap]!=="--" && row[iGap].includes(":")) avgGapSecKm = parseTimeToSec(row[iGap]);
-    const elevationGainM = iElevGain>=0 ? numOrNull(row[iElevGain]) : null;
-    const elevationLossM = iElevLoss>=0 ? numOrNull(row[iElevLoss]) : null;
-    const aerobicTrainingEffect = iAerobicTe>=0 ? numOrNull(row[iAerobicTe]) : null;
-    const trainingLoad = iLoad>=0 ? numOrNull(row[iLoad]) : null;
-    const avgCadence = iCadence>=0 ? numOrNull(row[iCadence]) : null;
-    out.push({ id:uid(), date:dateStr, type:guessTypeFromText(typeText), rawType:typeText, distanceKm, durationMin, avgPaceSecKm,
-      avgHr, maxHr, hrDrift:"", recoveryDrop:"", intensityRpe:5, painFlag:false, painArea:"", note:typeText||"", source:"csv",
-      avgGapSecKm, elevationGainM, elevationLossM, aerobicTrainingEffect, trainingLoad, avgCadence });
-  }
-  return { rows: out, error: out.length? null : "가져올 수 있는 행이 없습니다. 파일 형식을 확인해주세요." };
-}
-
-/* ---------------------------------------------------------------------- */
-/* 19b. APPLE HEALTH XML IMPORT — parses Health app's export.xml           */
-/*      Uses regex extraction rather than DOMParser: export.xml can be     */
-/*      hundreds of MB with millions of samples: full DOM parsing would    */
-/*      hang the browser tab. We only need <Workout ...> opening tags and  */
-/*      resting-heart-rate <Record ...> tags, both self-contained in a     */
-/*      single element, so a regex scan is far lighter and just as exact.  */
-/* ---------------------------------------------------------------------- */
-function extractXmlAttrs(tagStr){
-  const attrs={}; const re=/(\w[\w:.-]*)="([^"]*)"/g; let m;
-  while((m=re.exec(tagStr))) attrs[m[1]]=m[2];
-  return attrs;
-}
-function mapAppleWorkoutType(activityType){
-  const t=(activityType||"").toLowerCase();
-  if(t.includes("strengthtraining")) return "strength";
-  if(t.includes("hiit")||t.includes("intervaltraining")) return "interval";
-  if(t.includes("crosstraining")||t.includes("coretraining")||t.includes("functionalstrength")||t.includes("mixedcardio")) return "wod";
-  if(t.includes("yoga")||t.includes("cooldown")||t.includes("flexibility")||t.includes("mindandbody")||t.includes("preparationandrecovery")) return "recovery";
-  if(t.includes("running")) return "run";
-  return "run";
-}
-function parseAppleHealthXml(text, unit){
-  const workouts=[], restingHr=[];
-  const workoutTagRe=/<Workout\b([^>]*)>/g; let m;
-  while((m=workoutTagRe.exec(text))){
-    const a=extractXmlAttrs(m[1]);
-    const dateStr=(a.startDate||"").slice(0,10);
-    if(!dateStr) continue;
-    const durationMin = a.duration!=null ? round1(Number(a.duration)) : null;
-    let distanceKm = a.totalDistance!=null ? Number(a.totalDistance) : null;
-    if(distanceKm!=null && a.totalDistanceUnit==="mi") distanceKm*=1.60934;
-    if(distanceKm!=null) distanceKm=round1(distanceKm);
-    const avgPaceSecKm = (distanceKm && durationMin) ? Math.round((durationMin*60)/distanceKm) : null;
-    workouts.push({ id:uid(), date:dateStr, type:mapAppleWorkoutType(a.workoutActivityType), rawType:(a.workoutActivityType||"").replace("HKWorkoutActivityType",""),
-      distanceKm, durationMin, avgPaceSecKm, avgHr:null, hrDrift:"", recoveryDrop:"", intensityRpe:5, painFlag:false, painArea:"", note:"", source:"apple" });
-  }
-  const restingTagRe=/<Record\b[^>]*type="HKQuantityTypeIdentifierRestingHeartRate"[^>]*>/g;
-  while((m=restingTagRe.exec(text))){
-    const a=extractXmlAttrs(m[0]);
-    const dateStr=(a.startDate||"").slice(0,10);
-    if(dateStr && a.value) restingHr.push({ date:dateStr, value:Math.round(Number(a.value)), source:"apple" });
-  }
-  return { workouts, restingHr, error: (workouts.length||restingHr.length) ? null : "가져올 수 있는 운동/심박 기록을 찾지 못했습니다. Health 앱 → 프로필 → 데이터 내보내기(export.xml)가 맞는지 확인해주세요." };
-}
-
-/* ---------------------------------------------------------------------- */
-/* 20. PAGE: UNIFIED TRAINING LOG (manual + Garmin CSV import)             */
-/* ---------------------------------------------------------------------- */
-const TRAIN_TYPES = { run:"러닝", interval:"인터벌", long:"롱런", tt:"TT", strength:"웨이트", wod:"HYROX WOD", conditioning:"컨디셔닝", hybrid:"하이브리드", recovery:"Recovery" };
-function typeLabel(t){ return TRAIN_TYPES[t]||t; }
-
-/* ---------------------------------------------------------------------- */
-/* 17b. WEEKLY TRAINING COMPOSITION BAR (최근 7일 훈련 비중)                */
-/* ---------------------------------------------------------------------- */
-const TRAIN_TYPE_COLORS = {
-  run:{ color:"var(--orange)", label:"러닝" }, interval:{ color:"var(--orange)", label:"인터벌" }, long:{ color:"var(--orange)", label:"롱런" }, tt:{ color:"var(--orange)", label:"TT" },
-  strength:{ color:"var(--low)", label:"웨이트" }, wod:{ color:"var(--amber)", label:"HYROX WOD" }, recovery:{ color:"var(--green)", label:"Recovery" },
-  conditioning:{ color:"#FF9A3D", label:"컨디셔닝" }, hybrid:{ color:"#B490FF", label:"하이브리드" },
-};
-const REST_DAY_META = { color:"var(--gray-dim)", label:"Rest" };
-const BOX_TYPE_COLOR = { "웨이트":"var(--low)", "하이브리드":"#B490FF", "컨디셔닝":"#FF9A3D", "기타":"var(--gray-dim)" };
-
-
-function renderWeeklyCompositionBar(){
-  const days=weeklyCompositionDays();
-  const legendSeen={};
-  const segs=days.map(d=>{
-    const meta=dominantDayMeta(d.entries, d.dayIdx);
-    legendSeen[meta.label]=meta.color;
-    const title=`${d.date} · ${meta.label}${d.entries.length?` (${d.entries.length}건)`:""}`;
-    return `<div title="${title}" style="flex:1;background:${meta.color};height:100%;${d.isToday?"box-shadow:inset 0 0 0 2px rgba(255,255,255,.35);":""}"></div>`;
-  }).join("");
-  const dayLabels=days.map(d=>`<div style="flex:1;text-align:center;font-size:10px;color:${d.isToday?"var(--white)":"var(--gray-dim)"};font-weight:${d.isToday?"700":"400"};">${d.weekday}</div>`).join("");
-  const legend=Object.entries(legendSeen).map(([label,color])=>`<span class="hstack" style="gap:5px;font-size:10.5px;color:var(--gray);"><span style="width:8px;height:8px;border-radius:2px;background:${color};display:inline-block;"></span>${label}</span>`).join("");
-  return `
-    <div class="card">
-      <div class="eyebrow gray">최근 7일 훈련 비중</div>
-      <div style="display:flex;height:26px;border-radius:8px;overflow:hidden;margin-top:10px;gap:2px;">${segs}</div>
-      <div style="display:flex;margin-top:5px;">${dayLabels}</div>
-      <div class="hstack" style="gap:14px;flex-wrap:wrap;margin-top:10px;">${legend}</div>
-    </div>`;
-}
-
-/* ---------------------------------------------------------------------- */
-/* 18. PAGE: TRAINING LOG (unified) — 훈련 기록 / 데이터 가져오기 sub-tabs   */
-/* ---------------------------------------------------------------------- */
-let TRAINING_TAB = "log";
-
-
-
-
-function renderTlOcrDraftForm(){
-  const d=TL_OCR_DRAFT;
-  const typeOptions = ["run","interval","strength","wod","conditioning","recovery"];
-  return `
-    <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);">
-      <div class="lead" style="color:var(--green);margin-bottom:10px;">아래 내용을 확인·수정한 뒤 저장해주세요 — 자동으로 저장되지 않습니다.</div>
-      <div class="grid grid-3">
-        ${field("날짜", `<input id="tlo-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date||"")}">`)}
-        ${field("운동 종류", `<select id="tlo-type">${typeOptions.map(t=>`<option value="${t}" ${d.type===t?"selected":""}>${typeLabel(t)}</option>`).join("")}</select>`)}
-        ${field("거리 (km)", `<input id="tlo-distance" type="number" step="0.1" value="${d.distanceKm??""}">`)}
-        ${field("시간 (분)", `<input id="tlo-duration" type="number" step="0.1" value="${d.durationMin??""}">`)}
-        ${field("평균 페이스 (초/km)", `<input id="tlo-pace" type="number" value="${d.avgPaceSecKm??""}">`)}
-        ${field("평균 심박", `<input id="tlo-avghr" type="number" value="${d.avgHr??""}">`)}
-        ${field("최대 심박", `<input id="tlo-maxhr" type="number" value="${d.maxHr??""}">`)}
-        ${field("RPE (1~10)", `<input id="tlo-rpe" type="number" min="1" max="10" value="${d.intensityRpe??""}">`)}
-      </div>
-      <div class="hstack" style="margin-top:12px;gap:8px;">
-        <button class="btn sm" id="tlo-save">기록 저장</button>
-        <button class="btn ghost sm" id="tlo-cancel">취소</button>
-      </div>
-    </div>
-  `;
-}
-function bindTlOcrDraftForm(wrap){
-  if(!TL_OCR_DRAFT) return;
-  const bind=(id,field,parse)=>wrap.querySelector(id)?.addEventListener("change",(e)=>{ TL_OCR_DRAFT[field]=parse?parse(e.target.value):e.target.value; });
-  bind("#tlo-date","date");
-  bind("#tlo-type","type");
-  bind("#tlo-distance","distanceKm",v=>v===""?null:Number(v));
-  bind("#tlo-duration","durationMin",v=>v===""?null:Number(v));
-  bind("#tlo-pace","avgPaceSecKm",v=>v===""?null:Number(v));
-  bind("#tlo-avghr","avgHr",v=>v===""?null:Number(v));
-  bind("#tlo-maxhr","maxHr",v=>v===""?null:Number(v));
-  bind("#tlo-rpe","intensityRpe",v=>v===""?null:Number(v));
-  wrap.querySelector("#tlo-save")?.addEventListener("click", saveTlOcrDraft);
-  wrap.querySelector("#tlo-cancel")?.addEventListener("click",()=>{ TL_OCR_DRAFT=null; TL_OCR_STATE=defaultTlOcrState(); renderAll(); });
-}
-
-
-
-
 /* ---------------------------------------------------------------------- */
 /* 19c. PAGE: GOAL SETTING (🎯 목표 설정)                                   */
 /* ---------------------------------------------------------------------- */
@@ -8594,14 +7528,6 @@ function probToQualLabel(prob){
 }
 // general momentum read (NOT tied to a specific target) — driven directly by the measured HPI
 // trend rather than an invented "improvement probability %".
-function trendQualitativeLabel(){
-  const growth=hpiTrendPerWeek();
-  if(growth==null) return { emoji:"🟡", label:"추세 데이터 부족", color:"var(--amber)" };
-  if(growth>=0.6) return { emoji:"🟢", label:"상승세 뚜렷", color:"var(--green)" };
-  if(growth>0.1) return { emoji:"🟡", label:"완만한 상승", color:"var(--amber)" };
-  if(growth>=-0.1) return { emoji:"🟠", label:"정체", color:"var(--high)" };
-  return { emoji:"🔴", label:"하락 추세", color:"var(--red)" };
-}
 // the "근거" bullet list that must always accompany a qualitative feasibility label (spec §7 example
 // format) — built entirely from numbers already computed elsewhere (Target Gap Decomposition §5,
 // Training Priority §9, HPI trend), nothing invented for the purpose of this list.
@@ -8641,9 +7567,6 @@ function computeCategoryGapDetail(plan, k){
   const realisticSec = segs.reduce((s,x)=>s+x.realisticSec,0);
   return { currentSec, targetSec, neededSec, conservativeSec, realisticSec };
 }
-// spec (전면수정 Phase 3): 기록 예측/Division 전환도 훈련추천 계열과 마찬가지로 메인 네비게이션에서
-// 빼서 모델 설명 > 아카이브 탭으로 옮겼다 — "목표 설정" 메뉴에는 이제 목표 설정 하나만 남는다.
-// 렌더 함수(renderPrediction/renderDivision) 자체는 그대로 남아 아카이브에서 계속 호출된다.
 function renderGoal(wrap){
   const p=STATE.profile;
   const effectiveGoalDiv = normalizeRaceDivision(p.goalDivision) || "Open Doubles";
@@ -8872,12 +7795,10 @@ function predictionSourceCardHtml(predDiv, p0){
 }
 
 function horizonCard(label,p){
-  const t=trendQualitativeLabel();
   return `<div class="card tight">
     <div class="eyebrow gray">${label}</div>
     <div style="font-family:var(--font-display); font-size:26px; font-weight:800; margin-top:4px;">${fmtTime(p.predicted)}</div>
     <div style="font-size:10.5px; color:var(--gray-dim); margin-top:2px;">${fmtTime(p.ciLow)}–${fmtTime(p.ciHigh)}</div>
-    <div style="font-size:10.5px; color:${t.color}; margin-top:4px;">${t.emoji} ${t.label}</div>
   </div>`;
 }
 
