@@ -9797,7 +9797,7 @@ function renderMyDnaPage(wrap){
     <div><div class="eyebrow">MY HYROX DNA</div><h1 class="page-title">내 DNA</h1></div>
     <div class="card" style="padding:28px 16px;text-align:center;">
       <div class="hps-podium-spinner" style="width:34px;height:34px;margin:0 auto;border-radius:50%;border:4px solid var(--surface2);border-top-color:var(--orange);animation:hpsPodiumSpin .8s linear infinite;"></div>
-      <div style="font-size:14px;font-weight:700;margin-top:14px;">Race DNA를 계산하고 있어요</div>
+      <div style="font-size:14px;font-weight:700;margin-top:14px;">분석 중입니다...</div>
       <div class="reason-line" style="margin-top:6px;">동일 성별 · 연령대 · Division의 실제 참가자 데이터를 분석합니다.</div>
     </div>
   `;
@@ -9852,15 +9852,10 @@ function renderMyDnaPage(wrap){
         </div>
       `;
       wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{
-        const restoreY=window.scrollY||window.pageYOffset||0;
         CURRENT_PAGE="peer";
-        window.__DNA_DETAIL_RESTORE_Y=restoreY;
+        PEER_DETAIL_OPEN=true;
+        window.__DNA_DETAIL_SCROLL_TO_OPEN=true;
         renderAll();
-        requestAnimationFrame(()=>requestAnimationFrame(()=>{
-          const y=Number(window.__DNA_DETAIL_RESTORE_Y||0);
-          window.scrollTo(0,y);
-          delete window.__DNA_DETAIL_RESTORE_Y;
-        }));
       });
       wrap.querySelector("#mydna-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
       wrap.querySelector("#mydna-goto-goal")?.addEventListener("click",()=>{ CURRENT_PAGE="mygoal"; renderAll(); });
@@ -13795,7 +13790,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">전체 (최근 경기 가중 평균)</option>
+          <option value="">최근 경기</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
@@ -13939,7 +13934,24 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
     </div>
   `;
   wrap.querySelector("#dna-race-filter")?.addEventListener("change",(e)=>{ DNA_RACE_FILTER=e.target.value||null; renderAll(); });
-  wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{ PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN; renderAll(); });
+  if(window.__DNA_DETAIL_SCROLL_TO_OPEN){
+    delete window.__DNA_DETAIL_SCROLL_TO_OPEN;
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      const detail=wrap.querySelector("#peer-detail-toggle");
+      if(detail) detail.scrollIntoView({behavior:"auto",block:"start"});
+    }));
+  }
+  wrap.querySelector("#peer-detail-toggle")?.addEventListener("click",()=>{
+    const y=window.scrollY||window.pageYOffset||0;
+    PEER_DETAIL_OPEN=!PEER_DETAIL_OPEN;
+    window.__DNA_DETAIL_RESTORE_Y=y;
+    renderAll();
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      const restore=Number(window.__DNA_DETAIL_RESTORE_Y||0);
+      window.scrollTo(0,restore);
+      delete window.__DNA_DETAIL_RESTORE_Y;
+    }));
+  });
   wrap.querySelector("#peer-running-toggle-row")?.addEventListener("click",()=>{ PEER_RUN_DETAIL_OPEN=!PEER_RUN_DETAIL_OPEN; renderAll(); });
   wrap.querySelectorAll("[data-dna-evo-tab]").forEach(el=>el.addEventListener("click",()=>{ DNA_EVO_TAB=el.dataset.dnaEvoTab; renderAll(); }));
   wrap.querySelector("#dna-evo-show-all")?.addEventListener("click",()=>{ DNA_EVO_SHOW_ALL=!DNA_EVO_SHOW_ALL; renderAll(); });
