@@ -2735,106 +2735,140 @@ function raceOnlyUnifiedConversionEntry(gender, source, target, segment){
 // Global alias kept only for compatibility with older debug tools. Production prediction does not
 // depend on this name, so a stale/partial browser global can never break Race-only prediction.
 if(typeof window!=="undefined") window.getUnifiedConversionEntry = raceOnlyUnifiedConversionEntry;
+// bug fix (Pro Doubles predicted faster than Open Doubles): Open/Pro is a fixed team FORMAT
+// (Singles stays Singles, Doubles stays Doubles) with only the LOAD STANDARD changing between
+// the two tiers — Pro uses heavier implements at the same distances/reps. Physically, adding
+// load to the exact same team can only ever make them the same speed or slower, never faster.
+// The embedded empirical ratios below are fit from real race population averages, and for at
+// least one gender/segment combination the fitted ratio came out under 1.0 (predicting the
+// heavier tier as FASTER) — almost certainly because Pro-division registrants are, on average,
+// stronger athletes to begin with (a population-selection effect), which is a different thing
+// from "this specific team gets faster by adding weight." This floor enforces the one relationship
+// that must always hold regardless of population fit: same-format, heavier-tier conversions are
+// never below 1.0, and the reverse (lighter-tier) conversions are never above 1.0. It deliberately
+// does NOT apply to pairs that also change team FORMAT (e.g. Open Singles <-> Pro Doubles), since
+// format change legitimately dominates the time delta there and can go either direction.
+const UPV4_TIER_DIRECTION = {
+  "Open|Pro": "heavier", "Pro|Open": "lighter",
+  "Open Doubles|Pro Doubles": "heavier", "Pro Doubles|Open Doubles": "lighter",
+};
+function upv4ApplyTierFloor(source, target, result){
+  if(!result || !Number.isFinite(Number(result.multiplier))) return result;
+  const dir = UPV4_TIER_DIRECTION[`${source}|${target}`];
+  if(!dir) return result;
+  const clamped = dir==="heavier" ? Math.max(1, result.multiplier) : Math.min(1, result.multiplier);
+  if(clamped===result.multiplier) return result;
+  return { ...result, multiplier:clamped, source: result.source+"_TIER_FLOOR" };
+}
+// Looks up a direct measured empirical ratio for (source -> target), trying the reciprocal of the
+// OPPOSITE direction's measured entry when the requested direction itself was never recorded. The
+// embedded tables only ever measured ONE direction per pair (e.g. "Open|Open Doubles" but never
+// "Open Doubles|Open"); the previous code only special-cased two of these reverse pairs by hand
+// (Open Doubles->Open, Pro Doubles->Pro) and left every other reverse direction — including
+// Open Doubles/Pro Doubles -> Mixed Doubles, the direction actually needed for an athlete whose
+// only real races are Open/Pro Doubles wanting a Mixed Doubles estimate — completely unreachable
+// (silently dropped as "no data", not blended in at all). This generalizes that reciprocal lookup
+// to any pair, for both the per-segment and (runTotal-only) total tables.
+function upv4LookupEmpirical(gender, source, target, segment){
+  // "officialTotal" is a synthetic segment id (used only by raceOnlyOfficialTimeAnchors) meaning
+  // the WHOLE race's official finish time. This is NOT the same quantity as the "runTotal" segment
+  // used everywhere else in this file (upv4SegmentValue/UPV4_SEGMENTS), which means only the summed
+  // 8 running legs. UPV4_EMPIRICAL_SEGMENT's own "runTotal" sub-field is a RUNNING-ONLY conversion
+  // ratio — mixing it up with UPV4_EMPIRICAL_TOTAL's WHOLE-RACE ratio (which is what "officialTotal"
+  // needs) would silently apply the running-only ratio to a full finish time. Kept as a fully
+  // separate branch, consulting UPV4_EMPIRICAL_TOTAL only, so the two "runTotal"-shaped strings can
+  // never bleed into each other.
+  if(segment==="officialTotal"){
+    const fwdTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${source}|${target}`];
+    if(Number.isFinite(Number(fwdTotal))){
+      return { multiplier:Number(fwdTotal), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_TOTAL" };
+    }
+    const revTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${target}|${source}`];
+    if(Number.isFinite(Number(revTotal)) && Number(revTotal)>0){
+      return { multiplier:1/Number(revTotal), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_TOTAL_REVERSE" };
+    }
+    return null;
+  }
+
+  const fwdSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${source}|${target}`];
+  if(fwdSeg && Number.isFinite(Number(fwdSeg[segment]))){
+    return { multiplier:Number(fwdSeg[segment]), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_SEGMENT" };
+  }
+  const revSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${target}|${source}`];
+  if(revSeg && Number.isFinite(Number(revSeg[segment])) && Number(revSeg[segment])>0){
+    return { multiplier:1/Number(revSeg[segment]), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_SEGMENT_REVERSE" };
+  }
+  return null;
+}
 function upv4Conversion(gender, source, target, segment){
-  if(source===target) return {multiplier:1, confidence:"EXACT", hops:0, source:"exact"};
+  let result = null;
 
-  const empirical = raceOnlyUnifiedConversionEntry(gender, source, target, segment);
-  if(empirical && Number.isFinite(Number(empirical.median_ratio))){
-    const hops = Number.isFinite(Number(empirical.hops)) ? Number(empirical.hops) : 1;
-    return {
-      multiplier:Number(empirical.median_ratio),
-      confidence:empirical.confidence || (hops===1?"MEDIUM":hops===2?"LOW":"VERY_LOW"),
-      hops,
-      source:"REAL_RACE_CONVERSION_MATRIX"
-    };
+  if(source===target){
+    result = {multiplier:1, confidence:"EXACT", hops:0, source:"exact"};
   }
 
-  // Production fallback: use the embedded gender × source × target × segment
-  // empirical ratios when the external conversion matrix has not been loaded.
-  // This is especially important for Mixed Doubles → gendered Doubles: never
-  // fall back to the generic workload model for the athlete's race prediction.
-  const empiricalSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${source}|${target}`];
-  if(empiricalSeg && Number.isFinite(Number(empiricalSeg[segment]))){
-    return {
-      multiplier:Number(empiricalSeg[segment]),
-      confidence:"MEDIUM",
-      hops:1,
-      source:"EMBEDDED_EMPIRICAL_SEGMENT"
-    };
-  }
-  const empiricalTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${source}|${target}`];
-  if(segment==="runTotal" && Number.isFinite(Number(empiricalTotal))){
-    return {
-      multiplier:Number(empiricalTotal),
-      confidence:"MEDIUM",
-      hops:1,
-      source:"EMBEDDED_EMPIRICAL_TOTAL"
-    };
-  }
-
-  /*
-    Reverse empirical bridge for Singles <- Doubles.
-    The embedded empirical tables are stored in the measured direction
-    Singles -> corresponding Doubles. When the athlete only has a Doubles
-    race (including Mixed -> Doubles -> Singles), the mathematically consistent
-    reverse conversion is the reciprocal of that same gender-specific ratio.
-    This is deliberately limited to the four established Singles/Doubles pairs
-    and does not introduce any benchmark/HPI/profile signal.
-  */
-  const reversePair = {
-    "Open Doubles|Open":"Open|Open Doubles",
-    "Pro Doubles|Pro":"Pro|Pro Doubles"
-  }[`${source}|${target}`];
-  if(reversePair){
-    const reverseSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${reversePair}`];
-    const reverseTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${reversePair}`];
-    const ratio = segment==="runTotal"
-      ? Number(reverseTotal)
-      : Number(reverseSeg?.[segment]);
-    if(Number.isFinite(ratio) && ratio>0){
-      return {
-        multiplier:1/ratio,
-        confidence:"MEDIUM",
-        hops:1,
-        source:"EMBEDDED_EMPIRICAL_REVERSE"
+  if(!result){
+    const empirical = raceOnlyUnifiedConversionEntry(gender, source, target, segment);
+    if(empirical && Number.isFinite(Number(empirical.median_ratio))){
+      const hops = Number.isFinite(Number(empirical.hops)) ? Number(empirical.hops) : 1;
+      result = {
+        multiplier:Number(empirical.median_ratio),
+        confidence:empirical.confidence || (hops===1?"MEDIUM":hops===2?"LOW":"VERY_LOW"),
+        hops,
+        source:"REAL_RACE_CONVERSION_MATRIX"
       };
     }
   }
 
+  // Production fallback: use the embedded gender × source × target × segment empirical ratios
+  // (forward direction, then reciprocal of the opposite-direction entry) when the external
+  // conversion matrix has not been loaded.
+  if(!result){
+    result = upv4LookupEmpirical(gender, source, target, segment);
+  }
+
   /*
-    Mixed Doubles -> Singles is a two-hop cross-division conversion.
-    There is no direct empirical Mixed -> Open/Pro Singles row, so use the
-    already-established gender-specific Doubles conversion as the bridge:
-      Mixed -> Open Doubles -> Open
-      Mixed -> Pro Doubles  -> Pro
-    This is intentionally limited to these two paths. No generic benchmark,
-    HPI, body metrics, training data, or other signal is introduced.
+    Mixed Doubles <-> Singles is a two-hop cross-division conversion, in EITHER direction — bridged
+    through the corresponding gendered Doubles division:
+      Mixed <-> Open Doubles <-> Open
+      Mixed <-> Pro Doubles  <-> Pro
+    bug fix: this used to only bridge FROM Mixed Doubles TO Open/Pro (source==="Mixed Doubles").
+    The reverse — an athlete whose only real races are Open/Pro Singles wanting a Mixed Doubles
+    estimate — fell straight through to CONVERSION_MATRIX_NOT_LOADED (multiplier:null), silently
+    dropping every one of that athlete's real races and leaving the prediction to fall back to a
+    generic, athlete-independent benchmark. This is intentionally limited to these two paths. No
+    generic benchmark, HPI, body metrics, training data, or other signal is introduced.
   */
-  const mixedBridge = {
-    "Open": "Open Doubles",
-    "Pro": "Pro Doubles"
-  };
-  if(source === "Mixed Doubles" && mixedBridge[target]){
-    const mid=mixedBridge[target];
-    const first=upv4Conversion(gender,source,mid,segment);
-    const second=upv4Conversion(gender,mid,target,segment);
-    if(Number.isFinite(Number(first?.multiplier)) && Number.isFinite(Number(second?.multiplier))){
-      return {
-        multiplier:Number(first.multiplier)*Number(second.multiplier),
-        confidence:"LOW",
-        hops:2,
-        source:`COMPOSED_EMPIRICAL_MIXED_${mid.replace(/\s+/g,"_")}_TO_${target.replace(/\s+/g,"_")}`
-      };
+  if(!result){
+    const mixedBridge = { "Open": "Open Doubles", "Pro": "Pro Doubles" };
+    const bridgeMid = source==="Mixed Doubles" ? mixedBridge[target]
+                     : target==="Mixed Doubles" ? mixedBridge[source]
+                     : null;
+    if(bridgeMid){
+      const first=upv4Conversion(gender,source,bridgeMid,segment);
+      const second=upv4Conversion(gender,bridgeMid,target,segment);
+      if(Number.isFinite(Number(first?.multiplier)) && Number.isFinite(Number(second?.multiplier))){
+        result = {
+          multiplier:Number(first.multiplier)*Number(second.multiplier),
+          confidence:"LOW",
+          hops:2,
+          source:`COMPOSED_EMPIRICAL_${source.replace(/\s+/g,"_")}_TO_${bridgeMid.replace(/\s+/g,"_")}_TO_${target.replace(/\s+/g,"_")}`
+        };
+      }
     }
   }
 
-  const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
-  return {
-    multiplier:null,
-    confidence:"UNAVAILABLE",
-    hops:path ? path[1] : null,
-    source:"CONVERSION_MATRIX_NOT_LOADED"
-  };
+  if(!result){
+    const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
+    result = {
+      multiplier:null,
+      confidence:"UNAVAILABLE",
+      hops:path ? path[1] : null,
+      source:"CONVERSION_MATRIX_NOT_LOADED"
+    };
+  }
+
+  return upv4ApplyTierFloor(source, target, result);
 }
 
 function upv4SegmentValue(race, segment){
@@ -2872,7 +2906,16 @@ function upv4ResolveAthleteGender(race){
 /*
   Core resolver:
   - goalDivision is the ONLY target context.
-  - all real races are candidates.
+  - all real races are candidates, with one exception: when the athlete has ANY real race in the
+    same team FORMAT as the goal (Singles<->Singles or Doubles<->Doubles), races that require a
+    format-CHANGING conversion (Singles<->Doubles) are set aside for this goal. A Singles->Doubles
+    conversion has to assume how a hypothetical partner would split the workload — a much bigger,
+    unverified extrapolation than a same-format tier conversion (Open<->Pro, which only changes
+    implement weight) — and blending it in at equal weight can pull a Doubles goal's estimate below
+    real, same-format Doubles evidence at a lighter tier (e.g. predicting Pro Doubles faster than
+    the athlete's own real Open Doubles result). Only used as a last resort when the athlete has NO
+    same-format evidence at all for this goal, in which case every real race is still a candidate,
+    per the original rule above.
   - Mixed Doubles is never silently renamed to Open.
   - Run is aggregated; contribution only affects Doubles stations.
 */
@@ -2883,9 +2926,15 @@ function resolveUnifiedPerformance(goalDivision, options={}){
 
   const records=[];
   const targetCandidates=(UPV4_DIVISION_GRAPH[goal]||[[goal,0]]).map(x=>x[0]);
+  const goalIsDoubles=upv4IsDoubles(goal);
+  const hasSameFormatEvidence=races.some(r=>{
+    const src=normalizeRaceDivision(r.division)||r.division;
+    return src && upv4IsDoubles(src)===goalIsDoubles;
+  });
 
   for(const race of races){
     const source=normalizeRaceDivision(race.division)||race.division;
+    if(hasSameFormatEvidence && source && upv4IsDoubles(source)!==goalIsDoubles) continue;
     const gender=upv4ResolveAthleteGender(race);
 
     /* Mixed is gender-aware for conversion, but remains Mixed Doubles as source. */
@@ -2995,48 +3044,54 @@ function getRaceOnlyBenchmarkSegmentSec(goalDiv, segment){
 /* total; Division conversion is applied to that total when available.     */
 /* No HPI / recovery / body metrics / 1RM / training data are used here.   */
 /* ---------------------------------------------------------------------- */
-function raceOnlyOfficialTimeAnchors(goalDivision, unified){
+function raceOnlyOfficialTimeAnchors(goalDivision){
   const goal=normalizeRaceDivision(goalDivision)||goalDivision;
-  const rows=unified?.records||[];
+  // bug fix: this used to source rows from resolveUnifiedPerformance's per-segment `records`,
+  // which only ever contains a race at all if at least one Run/Station/Transition split was
+  // entered for it (see upv4SegmentValue). A race logged with ONLY an official finish time — no
+  // splits, which is a completely normal way to log a result — produced zero records and was
+  // therefore invisible here, even though the official time itself is real, standalone evidence.
+  // Reading straight from STATE.races makes every logged official time count, split data or not.
+  const rows=(STATE?.races||[]).filter(r=>r && r.date && parseTimeToSec(r.officialTime)!=null);
   const byRace=new Map();
-  rows.forEach(x=>{
-    const official=parseTimeToSec(x.officialTime);
+  rows.forEach(race=>{
+    const official=parseTimeToSec(race.officialTime);
     if(!Number.isFinite(official) || official<=0) return;
-    const source=normalizeRaceDivision(x.sourceDivision)||x.sourceDivision;
+    const source=normalizeRaceDivision(race.division)||race.division;
     if(!source) return;
-    const key=[x.date||"", source, official, x.gender||""].join("|");
+    const gender=upv4ResolveAthleteGender(race);
+    const key=[race.date||"", source, official, gender].join("|");
     if(byRace.has(key)) return;
-    byRace.set(key,{date:x.date,sourceDivision:source,officialTime:official,gender:x.gender||""});
+    byRace.set(key,{date:race.date,sourceDivision:source,officialTime:official,gender});
   });
 
   const anchors=[...byRace.values()].map(r=>{
-    let multiplier=1;
-    let method="EXACT_OFFICIAL_TIME";
-    if(r.sourceDivision!==goal){
-      const totalKey=`${r.gender}|${r.sourceDivision}|${goal}`;
-      const empirical=UPV4_EMPIRICAL_TOTAL[totalKey];
-      if(Number.isFinite(Number(empirical))){
-        multiplier=Number(empirical);
-        method="OFFICIAL_TIME_TOTAL_CONVERSION";
-      }else{
-        const conv=upv4Conversion(r.gender,r.sourceDivision,goal,"runTotal");
-        if(Number.isFinite(Number(conv?.multiplier))){
-          multiplier=Number(conv.multiplier);
-          method="OFFICIAL_TIME_RUN_TOTAL_CONVERSION";
-        }else{
-          return null;
-        }
-      }
-    }
+    // bug fix: this used to check UPV4_EMPIRICAL_TOTAL directly before ever calling
+    // upv4Conversion(), so it bypassed upv4Conversion's tier-direction floor and its Mixed-Doubles
+    // bidirectional bridge entirely — the exact same problems fixed there, just duplicated via a
+    // second code path. Routing every conversion through upv4Conversion (which itself still checks
+    // UPV4_EMPIRICAL_TOTAL first) gives identical results for every case that already worked, and
+    // correctly fixed results for the cases that didn't.
+    const conv=upv4Conversion(r.gender,r.sourceDivision,goal,"officialTotal");
+    if(!Number.isFinite(Number(conv?.multiplier))) return null;
+    const multiplier=Number(conv.multiplier);
+    const method = r.sourceDivision===goal ? "EXACT_OFFICIAL_TIME"
+      : conv.hops===2 ? "OFFICIAL_TIME_COMPOSED_CONVERSION" : "OFFICIAL_TIME_TOTAL_CONVERSION";
     return {...r,multiplier,convertedTotal:r.officialTime*multiplier,method};
   }).filter(Boolean);
 
   if(!anchors.length) return null;
 
-  /* Target-division official races are strongest. Cross-Division official
-     races remain valid fallback evidence, but are never treated as exact. */
+  /* Target-division official races are strongest. Same-team-FORMAT official races (Doubles-goal
+     using other-tier Doubles evidence, or vice versa for Singles) are the next best thing — they
+     only require a same-format tier conversion (Open<->Pro weight standard), never the much
+     bigger, unverified Singles<->Doubles workload-split assumption. Cross-format official races
+     are used only when that's genuinely all the athlete has. See resolveUnifiedPerformance's
+     header comment for the same reasoning applied to the segment-level pooling. */
+  const goalIsDoubles=upv4IsDoubles(goal);
   const exact=anchors.filter(a=>a.sourceDivision===goal);
-  const pool=exact.length?exact:anchors;
+  const sameFormat=anchors.filter(a=>upv4IsDoubles(a.sourceDivision)===goalIsDoubles);
+  const pool=exact.length?exact:(sameFormat.length?sameFormat:anchors);
   const weighted=pool.map(a=>({
     ...a,
     weight:upv4RecencyWeight(a.date||todayISO()) * (a.sourceDivision===goal ? 1 : 0.75)
@@ -3051,7 +3106,7 @@ function raceOnlyOfficialTimeAnchors(goalDivision, unified){
     anchorCount:pool.length,
     crossDivision:crossCount>0,
     exactDivision:exact.length>0,
-    method:pool.length===1 ? pool[0].method : (exact.length?"WEIGHTED_EXACT_OFFICIAL_TIMES":"WEIGHTED_CROSS_DIVISION_OFFICIAL_TIMES")
+    method:pool.length===1 ? pool[0].method : (exact.length?"WEIGHTED_EXACT_OFFICIAL_TIMES":sameFormat.length?"WEIGHTED_SAME_FORMAT_OFFICIAL_TIMES":"WEIGHTED_CROSS_FORMAT_OFFICIAL_TIMES")
   };
 }
 
@@ -3095,7 +3150,7 @@ function raceOnlyPrediction(targetDivision){
      converted through the empirical TOTAL matrix as the race-time center.
      Segment detail remains available for DNA/diagnostics, but cannot override
      the official total anchor in this sparse-evidence case. */
-  const officialAnchor=raceOnlyOfficialTimeAnchors(goal,u);
+  const officialAnchor=raceOnlyOfficialTimeAnchors(goal);
   let total=segmentTotal;
   let predictionSource=`Race-only Performance (${goal})`;
   let anchorNote=null;
