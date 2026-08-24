@@ -13122,12 +13122,20 @@ function renderGoal(wrap){
       const directUnified=resolveUnifiedPerformance(goalDiv);
       const bridgeUnified=stationBridgeDiv ? resolveUnifiedPerformance(stationBridgeDiv) : null;
       const stationGender=upv4NormGender(effectiveGoalGender);
+      // STATIONS UI keys와 Race-only Unified Performance segment keys는 일부 이름이 다릅니다.
+      // (burpee→bbj, carry→farmers, lunge→lunges, wallball→wallBalls)
+      // 이 매핑이 빠지면 해당 4개 Station만 조회에서 탈락해 화면에 4개만 표시됩니다.
+      const stationSegmentKey={
+        ski:"ski", sledPush:"sledPush", sledPull:"sledPull", burpee:"bbj",
+        row:"row", carry:"farmers", lunge:"lunges", wallball:"wallBalls"
+      };
       const stationSegValue=(segKey)=>{
-        const direct=Number(directUnified?.segments?.[segKey]?.value);
+        const engineKey=stationSegmentKey[segKey]||segKey;
+        const direct=Number(directUnified?.segments?.[engineKey]?.value);
         if(Number.isFinite(direct)&&direct>0) return direct;
-        const bridged=Number(bridgeUnified?.segments?.[segKey]?.value);
+        const bridged=Number(bridgeUnified?.segments?.[engineKey]?.value);
         if(!Number.isFinite(bridged)||bridged<=0||!stationBridgeDiv) return null;
-        const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,segKey);
+        const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,engineKey);
         return Number.isFinite(Number(conv?.multiplier)) ? bridged*Number(conv.multiplier) : null;
       };
       const segs=STATIONS.map(st=>({
