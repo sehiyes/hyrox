@@ -7070,7 +7070,30 @@ function queryDerivedBenchmark(division, gender, ageBand, segment){
   return null;
 }
 let _peerDbFilterCache = new Map();
-function clearPeerDbFilterCache(){ _peerDbFilterCache = new Map(); }
+let _peerDbGroupIndex = null;
+// PERF: DNA가 같은 성별·연령·Division·segment 조합을 여러 번 조회할 때
+// 대규모 DB를 매번 filter()로 다시 순회하지 않도록 인덱스/통계를 캐시합니다.
+// 계산식/결과는 기존과 동일하고, 반복 조회만 줄입니다.
+let _peerSegmentStatsCache = new Map();
+function buildPeerDbGroupIndex(){
+  if(_peerDbGroupIndex) return _peerDbGroupIndex;
+  const idx=new Map();
+  for(const r of EXTERNAL_RACE_DB){
+    if(!r || r.analysis_valid===false) continue;
+    const d=normalizeRaceDivision(r.division)||r.division||"";
+    const g=String(r.gender||"").toLowerCase();
+    const a=r.age_group||"";
+    const key=d+"|"+g+"|"+a;
+    let arr=idx.get(key); if(!arr){arr=[]; idx.set(key,arr);} arr.push(r);
+  }
+  _peerDbGroupIndex=idx;
+  return idx;
+}
+function clearPeerDbFilterCache(){
+  _peerDbFilterCache = new Map();
+  _peerSegmentStatsCache = new Map();
+  _peerDbGroupIndex = null;
+}
 function peerDbFilterCacheKey(group){
   const g=group||{};
   return [g.gender||"",g.ageGroup||"",g.division||"",g.event||"",g.country||"",g.strictAge?"strictAge":"ageFallback"].join("|");
@@ -7079,25 +7102,19 @@ function filterExternalRaceDb(group){
   const cacheKey=peerDbFilterCacheKey(group);
   if(_peerDbFilterCache.has(cacheKey)) return _peerDbFilterCache.get(cacheKey);
   const { gender, ageGroup, division } = group;
-  // Mixed Doubles is a team category: the peer pool is the Mixed team pool,
-  // not the athlete's individual sex. A female user competing in Mixed must
-  // therefore NOT filter real Mixed rows by gender=female.
   const isMixedDivision = normalizeRaceDivision(division)==="Mixed Doubles";
-  const result = EXTERNAL_RACE_DB.filter(r=>{
-    if(r.analysis_valid===false) return false; // RAW is preserved in EXTERNAL_RACE_DB; only ANALYSIS-valid rows feed DNA/Peer/Podium
-    if(isMixedDivision){
-      if(normalizeRaceDivision(r.division)!=="Mixed Doubles") return false;
-      if(r.gender && String(r.gender).toLowerCase()!=="mixed") return false;
-    } else if(gender && r.gender!==gender) return false;
-    if(ageGroup && r.age_group!==ageGroup) return false;
-    if(division && r.division!==division) return false;
-    // event/date/country: only filter when the record actually has a value AND it differs — an
-    // unlabeled record isn't excluded just because the athlete's own race has an event name, since
-    // that would shrink an already-scarce real dataset for no statistical reason.
+  const idx=buildPeerDbGroupIndex();
+  let candidates;
+  if(isMixedDivision){
+    candidates=idx.get((normalizeRaceDivision(division)||division||"")+"|mixed|"+(ageGroup||"")) || [];
+  }else{
+    candidates=idx.get((normalizeRaceDivision(division)||division||"")+"|"+(gender||"")+"|"+(ageGroup||"")) || [];
+  }
+  const result = (group.event||group.country) ? candidates.filter(r=>{
     if(group.event && r.event && r.event!==group.event) return false;
     if(group.country && r.country && r.country!==group.country) return false;
     return true;
-  });
+  }) : candidates;
   _peerDbFilterCache.set(cacheKey, result);
   return result;
 }
@@ -7131,6 +7148,9 @@ function mixedAthleteGenderFactor(gender){
 
 function queryPeerSegmentStats(seg, group){
   const { gender, ageGroup, division } = group;
+  const statsCacheKey = `${peerDbFilterCacheKey(group)}|${seg.key}|${group.mixedPersonalMode===true?'personal':''}|${group.mixedSharePct??''}|${group.athleteGender??''}`;
+  if(_peerSegmentStatsCache.has(statsCacheKey)) return _peerSegmentStatsCache.get(statsCacheKey);
+  const finishStats = value => { _peerSegmentStatsCache.set(statsCacheKey, value); return value; };
   const mixedPersonalMode = normalizeRaceDivision(division)==="Mixed Doubles" &&
     seg.kind==="station" && group.mixedPersonalMode===true && !!group.athleteGender;
   // Personal-share fraction actually worked by the athlete on this station (e.g. 0.3 for a 30% share).
@@ -7161,9 +7181,9 @@ function queryPeerSegmentStats(seg, group){
       realMean*=f;
       if(realSd!=null) realSd*=f;
     }
-    return { mean:realMean, sd:realSd, n:realValues.length, isReal:true,
+    return finishStats({ mean:realMean, sd:realSd, n:realValues.length, isReal:true,
       source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
-      benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length };
+      benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length });
   }
 
   // If the newly uploaded/local participant sample is still thin, keep the existing
@@ -7188,9 +7208,9 @@ function queryPeerSegmentStats(seg, group){
     let benchmarkMean=derivedP50;
     if(mixedPersonalMode) benchmarkMean*=mixedShare*mixedAthleteGenderFactor(group.athleteGender);
     const sd = benchmarkMean * SD_PCT[seg.kind];
-    return { mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
+    return finishStats({ mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
       source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
-      benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null };
+      benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null });
   }
 
   const am = AGE_MULT[ageGroup] || 1.0;
@@ -7213,7 +7233,7 @@ function queryPeerSegmentStats(seg, group){
   const source = realValues.length>0
     ? `예시 벤치마크 모델 (실제 데이터 ${realValues.length}건 — ${MIN_REAL_SAMPLE}건 미만이라 percentile 미표시, 데이터 부족)`
     : PEER_DATA_SOURCE.sourceLabel;
-  return { mean:illustrativeMean, sd:illustrativeSd, n:realValues.length||null, isReal:false, source, benchmarkSource:"STATIC_FALLBACK", sampleN:realValues.length||null };
+  return finishStats({ mean:illustrativeMean, sd:illustrativeSd, n:realValues.length||null, isReal:false, source, benchmarkSource:"STATIC_FALLBACK", sampleN:realValues.length||null });
 }
 const PEER_SEGMENTS = [
   { key:"run1", label:"Run 1", kind:"run", base:265 },
@@ -9773,7 +9793,9 @@ function renderMyDnaPage(wrap){
   setTimeout(()=>{
     if(token!==MY_DNA_RENDER_TOKEN || CURRENT_PAGE!=="mydna") return;
     try{
-      const peer=memoPure("peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length), ()=>computePeerAnalysis(true));
+      const _dnaCacheKey="peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length);
+      const peer=PURE_CACHE.has(_dnaCacheKey) ? PURE_CACHE.get(_dnaCacheKey) : computePeerAnalysis(true);
+      if(!PURE_CACHE.has(_dnaCacheKey)) PURE_CACHE.set(_dnaCacheKey, peer);
       const dnaScores=buildRaceOnlyDnaScores(peer);
       const hasRace = !!(STATE.races||[]).find(r=>r&&r.date);
       const strengths = peer ? buildStrengthsTop3(peer.segments).slice(0,3).map(s=>({label:s.label,reason:s.desc})) : [];
@@ -9823,10 +9845,13 @@ function renderMyDnaPage(wrap){
       wrap.querySelector("#mydna-goto-detail")?.addEventListener("click",()=>{
         const restoreY=window.scrollY||window.pageYOffset||0;
         CURRENT_PAGE="peer";
+        window.__DNA_DETAIL_RESTORE_Y = restoreY;
         renderAll();
-        // 상세 분석으로 이동할 때 현재 읽던 위치를 유지한다.
-        // renderAll()의 일반적인 페이지 전환 scroll-to-top은 다른 메뉴 이동에서는 그대로 유지한다.
-        requestAnimationFrame(()=>requestAnimationFrame(()=>window.scrollTo(0,restoreY)));
+        requestAnimationFrame(()=>requestAnimationFrame(()=>{
+          const y=Number(window.__DNA_DETAIL_RESTORE_Y||0);
+          window.scrollTo({top:y,left:0,behavior:"instant"});
+          delete window.__DNA_DETAIL_RESTORE_Y;
+        }));
       });
       wrap.querySelector("#mydna-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
       wrap.querySelector("#mydna-goto-goal")?.addEventListener("click",()=>{ CURRENT_PAGE="mygoal"; renderAll(); });
@@ -13761,7 +13786,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">전체 (최근 경기 가중 평균)</option>
+          <option value="">최근 경기</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
@@ -15075,3 +15100,104 @@ function renderAccount(wrap){
     STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
   }));
   wrap.querySelectorAll("[data-account-tab]").forEach(t=>t.addEventListener("click",()=>{ ACCOUNT_UI_MODE=t.dataset.accountTab; renderAll(); }));
+  wrap.querySelector("#account-profile-save")?.addEventListener("click",async ()=>{
+    const gender=wrap.querySelector("#account-profile-gender")?.value;
+    const age=Number(wrap.querySelector("#account-profile-age")?.value);
+    if(!["female","male"].includes(gender) || !Number.isFinite(age) || age<16 || age>90){ showToast("성별과 나이를 정확히 입력해주세요"); return; }
+    STATE.profile.gender=gender; STATE.profile.age=age;
+    await persistNow();
+    showToast("성별·나이가 저장되었습니다");
+    renderAll();
+  });
+  wrap.querySelector("#sb-signin")?.addEventListener("click",async ()=>{
+    const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value;
+    if(!username||!pw){ showToast("아이디/비밀번호를 입력해주세요"); return; }
+    const statusEl=wrap.querySelector("#sb-status");
+    statusEl.innerHTML=`<div class="reason-line">로그인 중...</div>`;
+    const err=await sbSignIn(username,pw);
+    if(err) statusEl.innerHTML=`<div class="reason-line" style="color:var(--red);">${escapeHtml(err)}</div>`;
+    else { showToast("로그인되었습니다"); renderAll(); }
+  });
+  wrap.querySelector("#sb-signup")?.addEventListener("click",async ()=>{
+    const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value,
+      name=wrap.querySelector("#sb-name").value.trim(), birthday=wrap.querySelector("#sb-birthday").value,
+      gender=wrap.querySelector("#sb-gender")?.value, age=wrap.querySelector("#sb-age")?.value;
+    if(!username||!pw){ showToast("아이디/비밀번호를 입력해주세요"); return; }
+    if(pw.length<6){ showToast("비밀번호는 6자 이상이어야 합니다"); return; }
+    if(!gender || !age || Number(age)<16 || Number(age)>90){ showToast("성별과 나이를 입력해주세요"); return; }
+    const statusEl=wrap.querySelector("#sb-status");
+    statusEl.innerHTML=`<div class="reason-line">가입 처리 중...</div>`;
+    const err=await sbSignUp(username,pw,name,birthday,gender,age);
+    if(err) statusEl.innerHTML=`<div class="reason-line" style="color:var(--red);">${escapeHtml(err)}</div>`;
+    else { showToast("가입 완료 — 자동으로 로그인되었습니다"); renderAll(); }
+  });
+  wrap.querySelector("#sb-signout")?.addEventListener("click",async ()=>{ await sbSignOut(); showToast("로그아웃되었습니다"); renderAll(); });
+}
+
+/* ---------------------------------------------------------------------- */
+/* 25. INIT                                                                 */
+/* ---------------------------------------------------------------------- */
+// PERF: 이전에는 loadState -> loadExternalRaceDb -> loadDerivedBenchmark 를 전부 순차로
+// await 한 뒤에야 첫 renderAll()이 실행됐다. 뒤의 두 개는 네트워크 fetch라서, 화면이 나오기
+// 전에 왕복 2회를 기다리는 구조였다 (= "데이터부터 읽고 화면이 나오는" 체감 지연).
+//
+// 이제는:
+//   1) 로컬 상태만 읽고 즉시 첫 화면을 그린다 (benchmark/외부 DB는 전부 폴백이 있으므로
+//      없어도 정상 동작한다 — queryDerivedBenchmark()는 null -> STATIC_FALLBACK).
+//   2) 나머지는 병렬로 로드하고, 도착하는 대로 다시 그린다.
+//   3) 연속 렌더 요청은 한 프레임으로 합쳐 중복 계산을 막는다.
+let _renderQueued=false;
+function scheduleRender(){
+  if(_renderQueued) return;
+  _renderQueued=true;
+  (window.requestAnimationFrame||setTimeout)(()=>{ _renderQueued=false; try{ renderAll(); }catch(e){ console.error(e); } },0);
+}
+(async function init(){
+  initMobileMenu();
+  initDateTextMasking();
+  document.getElementById("modal-overlay")?.addEventListener("click",(e)=>{ if(e.target.id==="modal-overlay") closeModal(); });
+
+  await loadState();
+  renderAll();                       // 첫 화면은 즉시 표시하되, DNA/포디움 분석은 실제 DB 준비 전에는 계산하지 않음
+
+  EXTERNAL_RACE_DB_READY_PROMISE = Promise.resolve().then(loadExternalRaceDb).catch(e=>{
+    console.warn("EXTERNAL_RACE_DB 로드 실패:",e);
+    EXTERNAL_RACE_DB_READY = true;
+    return false;
+  });
+  const bg=[
+    EXTERNAL_RACE_DB_READY_PROMISE,
+    Promise.resolve().then(loadDerivedBenchmark).catch(e=>console.warn("DERIVED_BENCHMARK 로드 실패:",e)),
+  ];
+  if(sbEnabled()) bg.push(Promise.resolve().then(initSupabaseAuth).catch(e=>console.warn("Supabase auth 실패:",e)));
+  bg.forEach(pr=>pr.then(scheduleRender));   // 도착하는 대로 갱신 (프레임 단위로 합쳐짐)
+  await Promise.allSettled(bg);
+  scheduleRender();
+})();
+</script>
+
+<script>
+  // HPS cache cleanup.
+  // This build does NOT register a service worker. If an older build registered one,
+  // remove it and its caches so it cannot keep serving an old index.html.
+  (async function(){
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const reg of regs) {
+          try { await reg.unregister(); } catch (e) {}
+        }
+      }
+      if (window.caches) {
+        const keys = await caches.keys();
+        for (const key of keys) {
+          try { await caches.delete(key); } catch (e) {}
+        }
+      }
+    } catch (e) {
+      console.warn('HPS cache cleanup skipped:', e);
+    }
+  })();
+</script>
+</body>
+</html>
