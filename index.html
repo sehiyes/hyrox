@@ -289,6 +289,7 @@ input,select,textarea{min-width:0;}
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="HPS HYROX">
 <link rel="apple-touch-icon" href="./icons/icon-192.png">
+<style id="dna-spinner-animation-fix">@keyframes hpsPodiumSpin{to{transform:rotate(360deg);}}</style>
 </head>
 <body style="background:#0A0A0B; margin:0;">
 <div id="app">
@@ -2142,6 +2143,14 @@ function calcFatigueScore(){
   // 0-100, higher = more fatigued. V3 (spec §19-20): ACWR overload + RPE trend + pain — PLUS HR drift
   // and performance trend, so no single signal (esp. ACWR) drives this alone. Each new component
   // defaults to 0 without data, so behavior is unchanged for anyone without HR/history yet.
+  // bug fix: `acwr` was referenced below without ever being computed/declared in this function,
+  // so every call threw ReferenceError. Because this runs inside calcHPI(), which recordHpiSnapshot()
+  // calls FIRST (before persist()/renderAll()), the exception silently aborted every "추가/저장"
+  // action across the whole app right after the click handler — the data had already been pushed
+  // into STATE, but persist() and renderAll() never got a chance to run, so nothing appeared to save
+  // or refresh until some other action (e.g. navigating to another page) re-rendered the same
+  // already-mutated in-memory STATE.
+  const acwr=calcACWR();
   const acwrPenalty = acwr!=null? clamp((acwr-1.0)*60,0,50) : 0;
   const recent3=recentTraining(3);
   const rpeVals=recent3.map(l=>Number(l.intensityRpe)).filter(v=>!isNaN(v)&&v);
@@ -2560,6 +2569,15 @@ function getBaselineTime(hpiResult){
 const UPV4_SEGMENTS = [
   "runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"
 ];
+// UPV4 내부 segment 이름(bbj/farmers/lunges/wallBalls)은 실제 데이터가 저장되는 키
+// (STATIONS[].key: burpee/carry/lunge/wallball — race.stations, race.share, 벤치마크
+// 테이블 등 앱 전역에서 공통으로 쓰는 이름)와 다르다. 이 하나의 매핑을 모든 조회 지점
+// (upv4SegmentValue/upv4GetContribution/getRaceOnlyBenchmarkSegmentSec)이 공유해서,
+// 이름이 어긋나 실제 기록을 못 찾는 문제가 한 곳에서만 관리되도록 한다.
+const UPV4_SEGMENT_TO_STATION_KEY = {
+  ski:"ski", sledPush:"sledPush", sledPull:"sledPull", bbj:"burpee",
+  row:"row", farmers:"carry", lunges:"lunge", wallBalls:"wallball"
+};
 
 const UPV4_RECENCY_BANDS = [
   { maxMonths: 6,  weight: 1.00 },
@@ -2683,20 +2701,18 @@ function getUnifiedContributionPrior(gender, division, segment){
 function upv4GetContribution(race, gender, segment){
   if(!upv4IsDoubles(race?.division) || segment==="runTotal") return 1;
 
-  const direct =
-    race?.athleteContribution ??
-    race?.myContribution ??
-    race?.doublesContribution ??
-    race?.contribution;
-
-  if(typeof direct==="number" && Number.isFinite(direct)){
-    return Math.min(1,Math.max(0,direct));
-  }
-
-  const map = race?.stationContributions || race?.doublesStationContributions;
-  const raw = map && (map[segment] ?? map[segment==="runTotal"?"total":segment]);
-  if(typeof raw==="number" && Number.isFinite(raw)){
-    return Math.min(1,Math.max(0,raw));
+  // bug fix: this used to look for race.athleteContribution/myContribution/doublesContribution/
+  // contribution and race.stationContributions/doublesStationContributions — none of which the
+  // app ever writes anywhere. The real per-station 개인 수행 비율(%) input (HYROX 대회 기록 폼의
+  // "개인 수행 비율" 필드) is saved to race.share, keyed by STATIONS[].key (e.g. "burpee", not
+  // the UPV4 internal name "bbj"), as a 0-100 percentage. Because of this, a Doubles athlete who
+  // carefully filled in their real share% for every station was still silently defaulted to a
+  // flat 50/50 guess. Reading race.share here (mapped through the same UPV4_SEGMENT_TO_STATION_KEY
+  // table used elsewhere) makes real user-entered share data actually reach the prediction engine.
+  const stationKey = UPV4_SEGMENT_TO_STATION_KEY[segment] || segment;
+  const sharePct = race?.share?.[stationKey];
+  if(sharePct!=null && sharePct!=="" && !isNaN(Number(sharePct))){
+    return Math.min(1,Math.max(0,Number(sharePct)/100));
   }
 
   const prior = getUnifiedContributionPrior(gender, race?.division, segment);
@@ -2727,106 +2743,140 @@ function raceOnlyUnifiedConversionEntry(gender, source, target, segment){
 // Global alias kept only for compatibility with older debug tools. Production prediction does not
 // depend on this name, so a stale/partial browser global can never break Race-only prediction.
 if(typeof window!=="undefined") window.getUnifiedConversionEntry = raceOnlyUnifiedConversionEntry;
+// bug fix (Pro Doubles predicted faster than Open Doubles): Open/Pro is a fixed team FORMAT
+// (Singles stays Singles, Doubles stays Doubles) with only the LOAD STANDARD changing between
+// the two tiers — Pro uses heavier implements at the same distances/reps. Physically, adding
+// load to the exact same team can only ever make them the same speed or slower, never faster.
+// The embedded empirical ratios below are fit from real race population averages, and for at
+// least one gender/segment combination the fitted ratio came out under 1.0 (predicting the
+// heavier tier as FASTER) — almost certainly because Pro-division registrants are, on average,
+// stronger athletes to begin with (a population-selection effect), which is a different thing
+// from "this specific team gets faster by adding weight." This floor enforces the one relationship
+// that must always hold regardless of population fit: same-format, heavier-tier conversions are
+// never below 1.0, and the reverse (lighter-tier) conversions are never above 1.0. It deliberately
+// does NOT apply to pairs that also change team FORMAT (e.g. Open Singles <-> Pro Doubles), since
+// format change legitimately dominates the time delta there and can go either direction.
+const UPV4_TIER_DIRECTION = {
+  "Open|Pro": "heavier", "Pro|Open": "lighter",
+  "Open Doubles|Pro Doubles": "heavier", "Pro Doubles|Open Doubles": "lighter",
+};
+function upv4ApplyTierFloor(source, target, result){
+  if(!result || !Number.isFinite(Number(result.multiplier))) return result;
+  const dir = UPV4_TIER_DIRECTION[`${source}|${target}`];
+  if(!dir) return result;
+  const clamped = dir==="heavier" ? Math.max(1, result.multiplier) : Math.min(1, result.multiplier);
+  if(clamped===result.multiplier) return result;
+  return { ...result, multiplier:clamped, source: result.source+"_TIER_FLOOR" };
+}
+// Looks up a direct measured empirical ratio for (source -> target), trying the reciprocal of the
+// OPPOSITE direction's measured entry when the requested direction itself was never recorded. The
+// embedded tables only ever measured ONE direction per pair (e.g. "Open|Open Doubles" but never
+// "Open Doubles|Open"); the previous code only special-cased two of these reverse pairs by hand
+// (Open Doubles->Open, Pro Doubles->Pro) and left every other reverse direction — including
+// Open Doubles/Pro Doubles -> Mixed Doubles, the direction actually needed for an athlete whose
+// only real races are Open/Pro Doubles wanting a Mixed Doubles estimate — completely unreachable
+// (silently dropped as "no data", not blended in at all). This generalizes that reciprocal lookup
+// to any pair, for both the per-segment and (runTotal-only) total tables.
+function upv4LookupEmpirical(gender, source, target, segment){
+  // "officialTotal" is a synthetic segment id (used only by raceOnlyOfficialTimeAnchors) meaning
+  // the WHOLE race's official finish time. This is NOT the same quantity as the "runTotal" segment
+  // used everywhere else in this file (upv4SegmentValue/UPV4_SEGMENTS), which means only the summed
+  // 8 running legs. UPV4_EMPIRICAL_SEGMENT's own "runTotal" sub-field is a RUNNING-ONLY conversion
+  // ratio — mixing it up with UPV4_EMPIRICAL_TOTAL's WHOLE-RACE ratio (which is what "officialTotal"
+  // needs) would silently apply the running-only ratio to a full finish time. Kept as a fully
+  // separate branch, consulting UPV4_EMPIRICAL_TOTAL only, so the two "runTotal"-shaped strings can
+  // never bleed into each other.
+  if(segment==="officialTotal"){
+    const fwdTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${source}|${target}`];
+    if(Number.isFinite(Number(fwdTotal))){
+      return { multiplier:Number(fwdTotal), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_TOTAL" };
+    }
+    const revTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${target}|${source}`];
+    if(Number.isFinite(Number(revTotal)) && Number(revTotal)>0){
+      return { multiplier:1/Number(revTotal), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_TOTAL_REVERSE" };
+    }
+    return null;
+  }
+
+  const fwdSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${source}|${target}`];
+  if(fwdSeg && Number.isFinite(Number(fwdSeg[segment]))){
+    return { multiplier:Number(fwdSeg[segment]), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_SEGMENT" };
+  }
+  const revSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${target}|${source}`];
+  if(revSeg && Number.isFinite(Number(revSeg[segment])) && Number(revSeg[segment])>0){
+    return { multiplier:1/Number(revSeg[segment]), confidence:"MEDIUM", hops:1, source:"EMBEDDED_EMPIRICAL_SEGMENT_REVERSE" };
+  }
+  return null;
+}
 function upv4Conversion(gender, source, target, segment){
-  if(source===target) return {multiplier:1, confidence:"EXACT", hops:0, source:"exact"};
+  let result = null;
 
-  const empirical = raceOnlyUnifiedConversionEntry(gender, source, target, segment);
-  if(empirical && Number.isFinite(Number(empirical.median_ratio))){
-    const hops = Number.isFinite(Number(empirical.hops)) ? Number(empirical.hops) : 1;
-    return {
-      multiplier:Number(empirical.median_ratio),
-      confidence:empirical.confidence || (hops===1?"MEDIUM":hops===2?"LOW":"VERY_LOW"),
-      hops,
-      source:"REAL_RACE_CONVERSION_MATRIX"
-    };
+  if(source===target){
+    result = {multiplier:1, confidence:"EXACT", hops:0, source:"exact"};
   }
 
-  // Production fallback: use the embedded gender × source × target × segment
-  // empirical ratios when the external conversion matrix has not been loaded.
-  // This is especially important for Mixed Doubles → gendered Doubles: never
-  // fall back to the generic workload model for the athlete's race prediction.
-  const empiricalSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${source}|${target}`];
-  if(empiricalSeg && Number.isFinite(Number(empiricalSeg[segment]))){
-    return {
-      multiplier:Number(empiricalSeg[segment]),
-      confidence:"MEDIUM",
-      hops:1,
-      source:"EMBEDDED_EMPIRICAL_SEGMENT"
-    };
-  }
-  const empiricalTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${source}|${target}`];
-  if(segment==="runTotal" && Number.isFinite(Number(empiricalTotal))){
-    return {
-      multiplier:Number(empiricalTotal),
-      confidence:"MEDIUM",
-      hops:1,
-      source:"EMBEDDED_EMPIRICAL_TOTAL"
-    };
-  }
-
-  /*
-    Reverse empirical bridge for Singles <- Doubles.
-    The embedded empirical tables are stored in the measured direction
-    Singles -> corresponding Doubles. When the athlete only has a Doubles
-    race (including Mixed -> Doubles -> Singles), the mathematically consistent
-    reverse conversion is the reciprocal of that same gender-specific ratio.
-    This is deliberately limited to the four established Singles/Doubles pairs
-    and does not introduce any benchmark/HPI/profile signal.
-  */
-  const reversePair = {
-    "Open Doubles|Open":"Open|Open Doubles",
-    "Pro Doubles|Pro":"Pro|Pro Doubles"
-  }[`${source}|${target}`];
-  if(reversePair){
-    const reverseSeg = UPV4_EMPIRICAL_SEGMENT[`${gender}|${reversePair}`];
-    const reverseTotal = UPV4_EMPIRICAL_TOTAL[`${gender}|${reversePair}`];
-    const ratio = segment==="runTotal"
-      ? Number(reverseTotal)
-      : Number(reverseSeg?.[segment]);
-    if(Number.isFinite(ratio) && ratio>0){
-      return {
-        multiplier:1/ratio,
-        confidence:"MEDIUM",
-        hops:1,
-        source:"EMBEDDED_EMPIRICAL_REVERSE"
+  if(!result){
+    const empirical = raceOnlyUnifiedConversionEntry(gender, source, target, segment);
+    if(empirical && Number.isFinite(Number(empirical.median_ratio))){
+      const hops = Number.isFinite(Number(empirical.hops)) ? Number(empirical.hops) : 1;
+      result = {
+        multiplier:Number(empirical.median_ratio),
+        confidence:empirical.confidence || (hops===1?"MEDIUM":hops===2?"LOW":"VERY_LOW"),
+        hops,
+        source:"REAL_RACE_CONVERSION_MATRIX"
       };
     }
   }
 
+  // Production fallback: use the embedded gender × source × target × segment empirical ratios
+  // (forward direction, then reciprocal of the opposite-direction entry) when the external
+  // conversion matrix has not been loaded.
+  if(!result){
+    result = upv4LookupEmpirical(gender, source, target, segment);
+  }
+
   /*
-    Mixed Doubles -> Singles is a two-hop cross-division conversion.
-    There is no direct empirical Mixed -> Open/Pro Singles row, so use the
-    already-established gender-specific Doubles conversion as the bridge:
-      Mixed -> Open Doubles -> Open
-      Mixed -> Pro Doubles  -> Pro
-    This is intentionally limited to these two paths. No generic benchmark,
-    HPI, body metrics, training data, or other signal is introduced.
+    Mixed Doubles <-> Singles is a two-hop cross-division conversion, in EITHER direction — bridged
+    through the corresponding gendered Doubles division:
+      Mixed <-> Open Doubles <-> Open
+      Mixed <-> Pro Doubles  <-> Pro
+    bug fix: this used to only bridge FROM Mixed Doubles TO Open/Pro (source==="Mixed Doubles").
+    The reverse — an athlete whose only real races are Open/Pro Singles wanting a Mixed Doubles
+    estimate — fell straight through to CONVERSION_MATRIX_NOT_LOADED (multiplier:null), silently
+    dropping every one of that athlete's real races and leaving the prediction to fall back to a
+    generic, athlete-independent benchmark. This is intentionally limited to these two paths. No
+    generic benchmark, HPI, body metrics, training data, or other signal is introduced.
   */
-  const mixedBridge = {
-    "Open": "Open Doubles",
-    "Pro": "Pro Doubles"
-  };
-  if(source === "Mixed Doubles" && mixedBridge[target]){
-    const mid=mixedBridge[target];
-    const first=upv4Conversion(gender,source,mid,segment);
-    const second=upv4Conversion(gender,mid,target,segment);
-    if(Number.isFinite(Number(first?.multiplier)) && Number.isFinite(Number(second?.multiplier))){
-      return {
-        multiplier:Number(first.multiplier)*Number(second.multiplier),
-        confidence:"LOW",
-        hops:2,
-        source:`COMPOSED_EMPIRICAL_MIXED_${mid.replace(/\s+/g,"_")}_TO_${target.replace(/\s+/g,"_")}`
-      };
+  if(!result){
+    const mixedBridge = { "Open": "Open Doubles", "Pro": "Pro Doubles" };
+    const bridgeMid = source==="Mixed Doubles" ? mixedBridge[target]
+                     : target==="Mixed Doubles" ? mixedBridge[source]
+                     : null;
+    if(bridgeMid){
+      const first=upv4Conversion(gender,source,bridgeMid,segment);
+      const second=upv4Conversion(gender,bridgeMid,target,segment);
+      if(Number.isFinite(Number(first?.multiplier)) && Number.isFinite(Number(second?.multiplier))){
+        result = {
+          multiplier:Number(first.multiplier)*Number(second.multiplier),
+          confidence:"LOW",
+          hops:2,
+          source:`COMPOSED_EMPIRICAL_${source.replace(/\s+/g,"_")}_TO_${bridgeMid.replace(/\s+/g,"_")}_TO_${target.replace(/\s+/g,"_")}`
+        };
+      }
     }
   }
 
-  const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
-  return {
-    multiplier:null,
-    confidence:"UNAVAILABLE",
-    hops:path ? path[1] : null,
-    source:"CONVERSION_MATRIX_NOT_LOADED"
-  };
+  if(!result){
+    const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
+    result = {
+      multiplier:null,
+      confidence:"UNAVAILABLE",
+      hops:path ? path[1] : null,
+      source:"CONVERSION_MATRIX_NOT_LOADED"
+    };
+  }
+
+  return upv4ApplyTierFloor(source, target, result);
 }
 
 function upv4SegmentValue(race, segment){
@@ -2837,12 +2887,13 @@ function upv4SegmentValue(race, segment){
     // Never inject the full race time into RUN_TOTAL when run splits are missing.
     return vals.length ? vals.reduce((a,b)=>a+b,0) : null;
   }
-  const stationMap={
-    ski:"ski",sledPush:"sledPush",sledPull:"sledPull",bbj:"bbj",row:"row",
-    farmers:"farmers",lunges:"lunges",wallBalls:"wallBalls",roxzone:"roxzone"
-  };
-  const key=stationMap[segment];
   if(segment==="roxzone") return parseTimeToSec(race?.transition);
+  // bug fix: this used to map segment -> itself (e.g. bbj -> "bbj"), but race.stations is
+  // keyed by STATIONS[].key (burpee/carry/lunge/wallball), never by the UPV4 internal names
+  // (bbj/farmers/lunges/wallBalls). That mismatch meant Burpee/Farmers Carry/Sandbag Lunge/
+  // Wall Ball could never find their real race data here — silently treated as "no data" for
+  // every athlete, even ones who had actually recorded those 4 stations.
+  const key=UPV4_SEGMENT_TO_STATION_KEY[segment]||segment;
   const st=race?.stations?.[key];
   return parseTimeToSec(st);
 }
@@ -2863,7 +2914,16 @@ function upv4ResolveAthleteGender(race){
 /*
   Core resolver:
   - goalDivision is the ONLY target context.
-  - all real races are candidates.
+  - all real races are candidates, with one exception: when the athlete has ANY real race in the
+    same team FORMAT as the goal (Singles<->Singles or Doubles<->Doubles), races that require a
+    format-CHANGING conversion (Singles<->Doubles) are set aside for this goal. A Singles->Doubles
+    conversion has to assume how a hypothetical partner would split the workload — a much bigger,
+    unverified extrapolation than a same-format tier conversion (Open<->Pro, which only changes
+    implement weight) — and blending it in at equal weight can pull a Doubles goal's estimate below
+    real, same-format Doubles evidence at a lighter tier (e.g. predicting Pro Doubles faster than
+    the athlete's own real Open Doubles result). Only used as a last resort when the athlete has NO
+    same-format evidence at all for this goal, in which case every real race is still a candidate,
+    per the original rule above.
   - Mixed Doubles is never silently renamed to Open.
   - Run is aggregated; contribution only affects Doubles stations.
 */
@@ -2874,9 +2934,15 @@ function resolveUnifiedPerformance(goalDivision, options={}){
 
   const records=[];
   const targetCandidates=(UPV4_DIVISION_GRAPH[goal]||[[goal,0]]).map(x=>x[0]);
+  const goalIsDoubles=upv4IsDoubles(goal);
+  const hasSameFormatEvidence=races.some(r=>{
+    const src=normalizeRaceDivision(r.division)||r.division;
+    return src && upv4IsDoubles(src)===goalIsDoubles;
+  });
 
   for(const race of races){
     const source=normalizeRaceDivision(race.division)||race.division;
+    if(hasSameFormatEvidence && source && upv4IsDoubles(source)!==goalIsDoubles) continue;
     const gender=upv4ResolveAthleteGender(race);
 
     /* Mixed is gender-aware for conversion, but remains Mixed Doubles as source. */
@@ -2899,8 +2965,13 @@ function resolveUnifiedPerformance(goalDivision, options={}){
       const recency=upv4RecencyWeight(race.date);
       const completeness=typeof raceDataCompleteness==="function"
         ? Math.max(0.25,raceDataCompleteness(race)/17) : 1;
+      // bug fix: same dead-field issue as upv4GetContribution() — checks the actual storage
+      // field (race.share, mapped via UPV4_SEGMENT_TO_STATION_KEY) instead of fields the app
+      // never writes, so a real user-entered share% now correctly earns full confidence.
+      const stationKeyForConf = UPV4_SEGMENT_TO_STATION_KEY[segment] || segment;
+      const hasRealShare = race?.share?.[stationKeyForConf]!=null && race.share[stationKeyForConf]!=="" && !isNaN(Number(race.share[stationKeyForConf]));
       const contributionConfidence = upv4IsDoubles(source) && segment!=="runTotal"
-        ? (race?.athleteContribution!=null || race?.myContribution!=null || race?.doublesContribution!=null ? 1 : 0.75)
+        ? (hasRealShare ? 1 : 0.75)
         : 1;
 
       /*
@@ -2961,7 +3032,10 @@ function auditUnifiedPerformanceV4(goalDivision){
 /* segment falls back to the target benchmark.                             */
 /* ---------------------------------------------------------------------- */
 function getRaceOnlyBenchmarkSegmentSec(goalDiv, segment){
-  const segMap={runTotal:"runTotal",ski:"ski",sledPush:"sledPush",sledPull:"sledPull",bbj:"bbj",row:"row",farmers:"farmers",lunges:"lunges",wallBalls:"wallBalls",roxzone:"roxzone"};
+  // bug fix: same UPV4-name vs STATIONS-key mismatch as upv4SegmentValue() above — getSegmentBenchmarkSec()
+  // expects STATIONS[].key (burpee/carry/lunge/wallball), not the UPV4 internal names, so this fallback
+  // silently returned null for those 4 stations whenever the real-data lookup above also failed.
+  const segMap={runTotal:"runTotal", roxzone:"roxzone", ...UPV4_SEGMENT_TO_STATION_KEY};
   const key=segMap[segment]||segment;
   if(key==="runTotal"){
     const vals=RUN_KEYS.map(k=>runLegBenchmarkSec(RUN_KEYS.indexOf(k)).sec).filter(v=>v!=null);
@@ -2978,48 +3052,54 @@ function getRaceOnlyBenchmarkSegmentSec(goalDiv, segment){
 /* total; Division conversion is applied to that total when available.     */
 /* No HPI / recovery / body metrics / 1RM / training data are used here.   */
 /* ---------------------------------------------------------------------- */
-function raceOnlyOfficialTimeAnchors(goalDivision, unified){
+function raceOnlyOfficialTimeAnchors(goalDivision){
   const goal=normalizeRaceDivision(goalDivision)||goalDivision;
-  const rows=unified?.records||[];
+  // bug fix: this used to source rows from resolveUnifiedPerformance's per-segment `records`,
+  // which only ever contains a race at all if at least one Run/Station/Transition split was
+  // entered for it (see upv4SegmentValue). A race logged with ONLY an official finish time — no
+  // splits, which is a completely normal way to log a result — produced zero records and was
+  // therefore invisible here, even though the official time itself is real, standalone evidence.
+  // Reading straight from STATE.races makes every logged official time count, split data or not.
+  const rows=(STATE?.races||[]).filter(r=>r && r.date && parseTimeToSec(r.officialTime)!=null);
   const byRace=new Map();
-  rows.forEach(x=>{
-    const official=parseTimeToSec(x.officialTime);
+  rows.forEach(race=>{
+    const official=parseTimeToSec(race.officialTime);
     if(!Number.isFinite(official) || official<=0) return;
-    const source=normalizeRaceDivision(x.sourceDivision)||x.sourceDivision;
+    const source=normalizeRaceDivision(race.division)||race.division;
     if(!source) return;
-    const key=[x.date||"", source, official, x.gender||""].join("|");
+    const gender=upv4ResolveAthleteGender(race);
+    const key=[race.date||"", source, official, gender].join("|");
     if(byRace.has(key)) return;
-    byRace.set(key,{date:x.date,sourceDivision:source,officialTime:official,gender:x.gender||""});
+    byRace.set(key,{date:race.date,sourceDivision:source,officialTime:official,gender});
   });
 
   const anchors=[...byRace.values()].map(r=>{
-    let multiplier=1;
-    let method="EXACT_OFFICIAL_TIME";
-    if(r.sourceDivision!==goal){
-      const totalKey=`${r.gender}|${r.sourceDivision}|${goal}`;
-      const empirical=UPV4_EMPIRICAL_TOTAL[totalKey];
-      if(Number.isFinite(Number(empirical))){
-        multiplier=Number(empirical);
-        method="OFFICIAL_TIME_TOTAL_CONVERSION";
-      }else{
-        const conv=upv4Conversion(r.gender,r.sourceDivision,goal,"runTotal");
-        if(Number.isFinite(Number(conv?.multiplier))){
-          multiplier=Number(conv.multiplier);
-          method="OFFICIAL_TIME_RUN_TOTAL_CONVERSION";
-        }else{
-          return null;
-        }
-      }
-    }
+    // bug fix: this used to check UPV4_EMPIRICAL_TOTAL directly before ever calling
+    // upv4Conversion(), so it bypassed upv4Conversion's tier-direction floor and its Mixed-Doubles
+    // bidirectional bridge entirely — the exact same problems fixed there, just duplicated via a
+    // second code path. Routing every conversion through upv4Conversion (which itself still checks
+    // UPV4_EMPIRICAL_TOTAL first) gives identical results for every case that already worked, and
+    // correctly fixed results for the cases that didn't.
+    const conv=upv4Conversion(r.gender,r.sourceDivision,goal,"officialTotal");
+    if(!Number.isFinite(Number(conv?.multiplier))) return null;
+    const multiplier=Number(conv.multiplier);
+    const method = r.sourceDivision===goal ? "EXACT_OFFICIAL_TIME"
+      : conv.hops===2 ? "OFFICIAL_TIME_COMPOSED_CONVERSION" : "OFFICIAL_TIME_TOTAL_CONVERSION";
     return {...r,multiplier,convertedTotal:r.officialTime*multiplier,method};
   }).filter(Boolean);
 
   if(!anchors.length) return null;
 
-  /* Target-division official races are strongest. Cross-Division official
-     races remain valid fallback evidence, but are never treated as exact. */
+  /* Target-division official races are strongest. Same-team-FORMAT official races (Doubles-goal
+     using other-tier Doubles evidence, or vice versa for Singles) are the next best thing — they
+     only require a same-format tier conversion (Open<->Pro weight standard), never the much
+     bigger, unverified Singles<->Doubles workload-split assumption. Cross-format official races
+     are used only when that's genuinely all the athlete has. See resolveUnifiedPerformance's
+     header comment for the same reasoning applied to the segment-level pooling. */
+  const goalIsDoubles=upv4IsDoubles(goal);
   const exact=anchors.filter(a=>a.sourceDivision===goal);
-  const pool=exact.length?exact:anchors;
+  const sameFormat=anchors.filter(a=>upv4IsDoubles(a.sourceDivision)===goalIsDoubles);
+  const pool=exact.length?exact:(sameFormat.length?sameFormat:anchors);
   const weighted=pool.map(a=>({
     ...a,
     weight:upv4RecencyWeight(a.date||todayISO()) * (a.sourceDivision===goal ? 1 : 0.75)
@@ -3034,7 +3114,7 @@ function raceOnlyOfficialTimeAnchors(goalDivision, unified){
     anchorCount:pool.length,
     crossDivision:crossCount>0,
     exactDivision:exact.length>0,
-    method:pool.length===1 ? pool[0].method : (exact.length?"WEIGHTED_EXACT_OFFICIAL_TIMES":"WEIGHTED_CROSS_DIVISION_OFFICIAL_TIMES")
+    method:pool.length===1 ? pool[0].method : (exact.length?"WEIGHTED_EXACT_OFFICIAL_TIMES":sameFormat.length?"WEIGHTED_SAME_FORMAT_OFFICIAL_TIMES":"WEIGHTED_CROSS_FORMAT_OFFICIAL_TIMES")
   };
 }
 
@@ -3078,7 +3158,7 @@ function raceOnlyPrediction(targetDivision){
      converted through the empirical TOTAL matrix as the race-time center.
      Segment detail remains available for DNA/diagnostics, but cannot override
      the official total anchor in this sparse-evidence case. */
-  const officialAnchor=raceOnlyOfficialTimeAnchors(goal,u);
+  const officialAnchor=raceOnlyOfficialTimeAnchors(goal);
   let total=segmentTotal;
   let predictionSource=`Race-only Performance (${goal})`;
   let anchorNote=null;
@@ -6111,7 +6191,7 @@ function buildStationTechniqueSession(stationKey, ctx){
     why: buildStationWhyReasoning(stationKey),
   };
 }
-// spec §7: box Station 후반 Running degradation이 특히 큰 경우 — Station → Run 반복(전환 자체를
+// spec §7: box Station Running 지속력 degradation이 특히 큰 경우 — Station → Run 반복(전환 자체를
 // 훈련), buildStationAddOnSession과 형태는 비슷하지만 목적이 "전환 속도"로 다르게 표시된다.
 function buildTransitionAddOnSession(stationKey, ctx){
   const station = STATIONS.find(s=>s.key===stationKey);
@@ -9819,7 +9899,11 @@ function renderMyDnaPage(wrap){
       <div class="reason-line" style="margin-top:6px;">동일 성별 · 연령대 · Division의 실제 참가자 데이터를 분석합니다.</div>
     </div>
   `;
-  setTimeout(()=>{
+  // Let the browser paint the spinner before starting the synchronous DNA calculation.
+  // A single timeout is not sufficient on some browsers because the heavy calculation can
+  // begin before the animation gets its first rendered frame. Two RAFs guarantee at least
+  // one paint opportunity while keeping the calculation/result logic unchanged.
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
     if(token!==MY_DNA_RENDER_TOKEN || CURRENT_PAGE!=="mydna") return;
     try{
       const peer=memoPure("peerDNA:"+pureCacheProfileKey()+":"+(DNA_RACE_FILTER||"")+":"+String(EXTERNAL_RACE_DB.length), ()=>computePeerAnalysis(true));
@@ -9887,7 +9971,7 @@ function renderMyDnaPage(wrap){
       </div>`;
       wrap.querySelector("#dna-retry")?.addEventListener("click",()=>renderAll());
     }
-  },50);
+  }));
 }
 
 /* ---- 목표 (simplified) + 포디움 가능성 ---- */
@@ -10066,8 +10150,16 @@ function renderMyGoalPodiumResult(wrap){
     ${r.gapDecomposition ? `<div style="padding:18px 20px;">
       <div class="eyebrow gray" style="margin-bottom:10px;">GAP 구간별 분해</div>
       <p class="reason-line" style="margin-bottom:8px;">동일 조건 3위 기록의 실제 구간 splits와 비교</p>
-      ${r.gapDecomposition.rows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
-        <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("")}
+      ${(()=>{
+        const gapRows=r.gapDecomposition.rows||[];
+        const runRows=gapRows.filter(x=>/^run[1-8]$/i.test(String(x.key||"")) || /^Run\s*[1-8]$/i.test(String(x.label||"")));
+        const runningGap=runRows.reduce((sum,x)=>sum+(Number(x.gapSec)||0),0);
+        const displayRows=gapRows.filter(x=>!(/^run[1-8]$/i.test(String(x.key||"")) || /^Run\s*[1-8]$/i.test(String(x.label||""))));
+        if(runRows.length) displayRows.push({label:"Running",key:"running",gapSec:runningGap});
+        displayRows.sort((a,b)=>b.gapSec-a.gapSec);
+        return displayRows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
+        <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("");
+      })()}
       ${Math.abs(r.gapDecomposition.unaccountedGap)>=1 ? `<div class="row-between" style="padding:4px 0;color:var(--gray-dim);"><span style="font-size:12.5px;">기타 (측정 방식 차이 등)</span><span class="mono" style="font-size:12.5px;">${r.gapDecomposition.unaccountedGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.unaccountedGap))}</span></div>` : ""}
       <div class="row-between" style="padding:6px 0 0;margin-top:6px;border-top:1px solid var(--line);"><span style="font-size:12.5px;font-weight:700;">Total</span><span class="mono" style="font-size:12.5px;font-weight:800;">${r.gapDecomposition.totalGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.totalGap))}</span></div>
     </div>
@@ -13117,13 +13209,33 @@ function renderGoal(wrap){
       const directUnified=resolveUnifiedPerformance(goalDiv);
       const bridgeUnified=stationBridgeDiv ? resolveUnifiedPerformance(stationBridgeDiv) : null;
       const stationGender=upv4NormGender(effectiveGoalGender);
+      // STATIONS UI keys와 Race-only Unified Performance segment keys는 일부 이름이 다릅니다.
+      // (burpee→bbj, carry→farmers, lunge→lunges, wallball→wallBalls)
+      // 이 매핑이 빠지면 해당 4개 Station만 조회에서 탈락해 화면에 4개만 표시됩니다.
+      const stationSegmentKey={
+        ski:"ski", sledPush:"sledPush", sledPull:"sledPull", burpee:"bbj",
+        row:"row", carry:"farmers", lunge:"lunges", wallball:"wallBalls"
+      };
       const stationSegValue=(segKey)=>{
-        const direct=Number(directUnified?.segments?.[segKey]?.value);
+        const engineKey=stationSegmentKey[segKey]||segKey;
+        const direct=Number(directUnified?.segments?.[engineKey]?.value);
         if(Number.isFinite(direct)&&direct>0) return direct;
-        const bridged=Number(bridgeUnified?.segments?.[segKey]?.value);
-        if(!Number.isFinite(bridged)||bridged<=0||!stationBridgeDiv) return null;
-        const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,segKey);
-        return Number.isFinite(Number(conv?.multiplier)) ? bridged*Number(conv.multiplier) : null;
+        const bridged=Number(bridgeUnified?.segments?.[engineKey]?.value);
+        if(!Number.isFinite(bridged)||bridged<=0||!stationBridgeDiv){
+          return getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
+        }
+        const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,engineKey);
+        if(Number.isFinite(Number(conv?.multiplier))) return bridged*Number(conv.multiplier);
+        // Match raceOnlyPrediction(): if cross-Division station evidence is unavailable,
+        // use the target-Division benchmark fallback. If the derived benchmark table does not
+        // contain this station, use the existing BENCH table as the final display-only fallback
+        // so all 8 HYROX Stations remain visible in Goal Gap > Station Detail.
+        const derivedFallback=getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
+        if(Number.isFinite(derivedFallback)&&derivedFallback>0) return derivedFallback;
+        const benchKey={bbj:"burpee",farmers:"carry",lunges:"lunge",wallBalls:"wallball"}[engineKey]||engineKey;
+        const targetBench=BENCH[goalDiv] || BENCH.Open;
+        const benchSec=Number(targetBench?.[benchKey]);
+        return Number.isFinite(benchSec)&&benchSec>0 ? benchSec : null;
       };
       const segs=STATIONS.map(st=>({
         key:st.key,
@@ -13652,19 +13764,12 @@ function stationRunFatigueSectionHtml(){
     ` : `<div class="empty-note">측정된 Station → Run 저하가 없습니다.</div>`}
   ` : `<p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">대회가 2개 이상 등록되면 반복성(여러 대회에서 일관되게 나타나는 패턴인지)을 함께 보여드립니다. 현재 ${raceCount}개 대회만 분석되었습니다.</p>`;
 
-  // 대회 전반의 Run1→Run8 진단 분포 (spec §6 — 단일 대회의 인과 단정 대신, 여러 대회에서 어떤 진단이
-  // 몇 번 나왔는지 그대로 집계해서 보여준다. analyzeRaceExecution()의 기존 로직/문구를 재사용하며
-  // 새 인과모델을 만들지 않는다.)
-  const dLabels = { good:"Pacing 양호", station:"Station-induced Fatigue 주요 원인", "station-uneven":"Station 영향이 구간마다 회복됨", mixed:"Station+Pacing 혼합", pacing:"Pacing 문제 가능성" };
-  const diagLines = Object.entries(diagnosisCounts).sort((a,b)=>b[1]-a[1])
-    .map(([k,n])=>`${dLabels[k]||k} ${n}/${raceCount}`).join(" · ");
-
   return `<div class="divider" style="margin:16px 0;"></div>
     <div class="eyebrow gray">🏃 Station → Run Fatigue</div>
     <p class="lead" style="margin:6px 0 10px;">등록된 ${raceCount}개 대회 전체를 각각 분석합니다 — 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지(해당 스테이션의 피로가 다음 Run으로 넘어간 정도)를 대회별로 비교합니다.</p>
     ${tableHtml}
     ${patternHtml}
-    ${diagLines ? `<div class="divider" style="margin:14px 0;"></div><div class="reason-line">대회별 Run1→Run8 진단 분포: ${escapeHtml(diagLines)} <span style="color:var(--gray-dim);">(단일 대회의 관찰값이며, 여러 대회에 걸친 인과관계 증명이 아닙니다 — 위 반복성 지표를 함께 참고하세요.)</span></div>` : ""}`;
+    `;
 }
 // spec (doc5 §9/§10): dynamic composition banner — replaces the old static "실제로 뛴 X 경기 기록
 // (대회명)으로 계산했습니다" wording (which only ever named ONE race) with a description that reflects
@@ -14026,7 +14131,7 @@ function buildStrengthsTop3(segments){
   return sorted.map((s,i)=>({ label:s.label, desc:templates[i]||"강점 구간", score:Math.round(s.percentile) }));
 }
 // spec §3: individual station bottlenecks (NOT the aggregate "Running (8구간 합)" line — that's used
-// in the separate 기록 손실 분석 section) + a specific "후반 Running" item when measured post-station
+// in the separate 기록 손실 분석 section) + a specific "Running 지속력" item when measured post-station
 // degradation (computeStationInducedDegradation, already real data) is large enough to call out.
 function buildImprovementTop3(impactList, race){
   const stationItems = impactList.filter(c=>c.key!=="run" && c.timeLoss>0).slice(0,3)
@@ -14037,7 +14142,7 @@ function buildImprovementTop3(impactList, race){
   if(topDeg){
     const pct=(topDeg.degradationSec/topDeg.baselineSec)*100;
     if(pct>=8){
-      const degItem={ label:"후반 Running", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
+      const degItem={ label:"Running 지속력", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
       if(items.length<3) items.push(degItem); else items[2]=degItem;
     }
   }
@@ -15180,6 +15285,10 @@ function renderAccount(wrap){
 let _renderQueued=false;
 function scheduleRender(){
   if(_renderQueued) return;
+  // DNA pages manage their own async DB-ready render. Do not let background
+  // benchmark/auth fetches re-render an actively viewed DNA page, which can
+  // make the page look like it refreshed while the user is reading it.
+  if(CURRENT_PAGE==="peer" || CURRENT_PAGE==="mydna") return;
   _renderQueued=true;
   (window.requestAnimationFrame||setTimeout)(()=>{ _renderQueued=false; try{ renderAll(); }catch(e){ console.error(e); } },0);
 }
