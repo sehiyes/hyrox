@@ -7070,14 +7070,7 @@ function queryDerivedBenchmark(division, gender, ageBand, segment){
   return null;
 }
 let _peerDbFilterCache = new Map();
-// PERF: DNA가 같은 성별·연령·Division·segment 조합을 여러 번 조회할 때
-// 11만+ 행 DB를 다시 순회하지 않도록 segment 통계 자체도 캐시합니다.
-// 계산식/결과는 기존과 동일하고, 반복 조회만 줄입니다.
-let _peerSegmentStatsCache = new Map();
-function clearPeerDbFilterCache(){
-  _peerDbFilterCache = new Map();
-  _peerSegmentStatsCache = new Map();
-}
+function clearPeerDbFilterCache(){ _peerDbFilterCache = new Map(); }
 function peerDbFilterCacheKey(group){
   const g=group||{};
   return [g.gender||"",g.ageGroup||"",g.division||"",g.event||"",g.country||"",g.strictAge?"strictAge":"ageFallback"].join("|");
@@ -7138,9 +7131,6 @@ function mixedAthleteGenderFactor(gender){
 
 function queryPeerSegmentStats(seg, group){
   const { gender, ageGroup, division } = group;
-  const statsCacheKey = `${peerDbFilterCacheKey(group)}|${seg.key}|${group.mixedPersonalMode===true?'personal':''}|${group.mixedSharePct??''}|${group.athleteGender??''}`;
-  if(_peerSegmentStatsCache.has(statsCacheKey)) return _peerSegmentStatsCache.get(statsCacheKey);
-  const finishStats = value => { _peerSegmentStatsCache.set(statsCacheKey, value); return value; };
   const mixedPersonalMode = normalizeRaceDivision(division)==="Mixed Doubles" &&
     seg.kind==="station" && group.mixedPersonalMode===true && !!group.athleteGender;
   // Personal-share fraction actually worked by the athlete on this station (e.g. 0.3 for a 30% share).
@@ -7171,9 +7161,9 @@ function queryPeerSegmentStats(seg, group){
       realMean*=f;
       if(realSd!=null) realSd*=f;
     }
-    return finishStats({ mean:realMean, sd:realSd, n:realValues.length, isReal:true,
+    return { mean:realMean, sd:realSd, n:realValues.length, isReal:true,
       source:`HYROX 업로드 실측 참가자 DB (n=${realValues.length})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
-      benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length });
+      benchmarkSource:"EXTERNAL_RACE_DB", sampleN:realValues.length };
   }
 
   // If the newly uploaded/local participant sample is still thin, keep the existing
@@ -7198,9 +7188,9 @@ function queryPeerSegmentStats(seg, group){
     let benchmarkMean=derivedP50;
     if(mixedPersonalMode) benchmarkMean*=mixedShare*mixedAthleteGenderFactor(group.athleteGender);
     const sd = benchmarkMean * SD_PCT[seg.kind];
-    return finishStats({ mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
+    return { mean:benchmarkMean, sd, n:derived.sample_n||null, isReal:true,
       source:`ASIA/Global 실측 벤치마크 (${derived.benchmark_source}, n=${derived.sample_n ?? "?"})${mixedPersonalMode?` · Mixed ${group.athleteGender} 개인 기준(share ${Math.round(mixedShare*100)}%)`:``}`,
-      benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null });
+      benchmarkSource:derived.benchmark_source, sampleN:derived.sample_n||null };
   }
 
   const am = AGE_MULT[ageGroup] || 1.0;
@@ -7223,7 +7213,7 @@ function queryPeerSegmentStats(seg, group){
   const source = realValues.length>0
     ? `예시 벤치마크 모델 (실제 데이터 ${realValues.length}건 — ${MIN_REAL_SAMPLE}건 미만이라 percentile 미표시, 데이터 부족)`
     : PEER_DATA_SOURCE.sourceLabel;
-  return finishStats({ mean:illustrativeMean, sd:illustrativeSd, n:realValues.length||null, isReal:false, source, benchmarkSource:"STATIC_FALLBACK", sampleN:realValues.length||null });
+  return { mean:illustrativeMean, sd:illustrativeSd, n:realValues.length||null, isReal:false, source, benchmarkSource:"STATIC_FALLBACK", sampleN:realValues.length||null };
 }
 const PEER_SEGMENTS = [
   { key:"run1", label:"Run 1", kind:"run", base:265 },
@@ -15085,104 +15075,3 @@ function renderAccount(wrap){
     STATE.settings.predictionSensitivity=chip.dataset.sensitivity; persist(); renderAll();
   }));
   wrap.querySelectorAll("[data-account-tab]").forEach(t=>t.addEventListener("click",()=>{ ACCOUNT_UI_MODE=t.dataset.accountTab; renderAll(); }));
-  wrap.querySelector("#account-profile-save")?.addEventListener("click",async ()=>{
-    const gender=wrap.querySelector("#account-profile-gender")?.value;
-    const age=Number(wrap.querySelector("#account-profile-age")?.value);
-    if(!["female","male"].includes(gender) || !Number.isFinite(age) || age<16 || age>90){ showToast("성별과 나이를 정확히 입력해주세요"); return; }
-    STATE.profile.gender=gender; STATE.profile.age=age;
-    await persistNow();
-    showToast("성별·나이가 저장되었습니다");
-    renderAll();
-  });
-  wrap.querySelector("#sb-signin")?.addEventListener("click",async ()=>{
-    const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value;
-    if(!username||!pw){ showToast("아이디/비밀번호를 입력해주세요"); return; }
-    const statusEl=wrap.querySelector("#sb-status");
-    statusEl.innerHTML=`<div class="reason-line">로그인 중...</div>`;
-    const err=await sbSignIn(username,pw);
-    if(err) statusEl.innerHTML=`<div class="reason-line" style="color:var(--red);">${escapeHtml(err)}</div>`;
-    else { showToast("로그인되었습니다"); renderAll(); }
-  });
-  wrap.querySelector("#sb-signup")?.addEventListener("click",async ()=>{
-    const username=wrap.querySelector("#sb-username").value.trim(), pw=wrap.querySelector("#sb-pw").value,
-      name=wrap.querySelector("#sb-name").value.trim(), birthday=wrap.querySelector("#sb-birthday").value,
-      gender=wrap.querySelector("#sb-gender")?.value, age=wrap.querySelector("#sb-age")?.value;
-    if(!username||!pw){ showToast("아이디/비밀번호를 입력해주세요"); return; }
-    if(pw.length<6){ showToast("비밀번호는 6자 이상이어야 합니다"); return; }
-    if(!gender || !age || Number(age)<16 || Number(age)>90){ showToast("성별과 나이를 입력해주세요"); return; }
-    const statusEl=wrap.querySelector("#sb-status");
-    statusEl.innerHTML=`<div class="reason-line">가입 처리 중...</div>`;
-    const err=await sbSignUp(username,pw,name,birthday,gender,age);
-    if(err) statusEl.innerHTML=`<div class="reason-line" style="color:var(--red);">${escapeHtml(err)}</div>`;
-    else { showToast("가입 완료 — 자동으로 로그인되었습니다"); renderAll(); }
-  });
-  wrap.querySelector("#sb-signout")?.addEventListener("click",async ()=>{ await sbSignOut(); showToast("로그아웃되었습니다"); renderAll(); });
-}
-
-/* ---------------------------------------------------------------------- */
-/* 25. INIT                                                                 */
-/* ---------------------------------------------------------------------- */
-// PERF: 이전에는 loadState -> loadExternalRaceDb -> loadDerivedBenchmark 를 전부 순차로
-// await 한 뒤에야 첫 renderAll()이 실행됐다. 뒤의 두 개는 네트워크 fetch라서, 화면이 나오기
-// 전에 왕복 2회를 기다리는 구조였다 (= "데이터부터 읽고 화면이 나오는" 체감 지연).
-//
-// 이제는:
-//   1) 로컬 상태만 읽고 즉시 첫 화면을 그린다 (benchmark/외부 DB는 전부 폴백이 있으므로
-//      없어도 정상 동작한다 — queryDerivedBenchmark()는 null -> STATIC_FALLBACK).
-//   2) 나머지는 병렬로 로드하고, 도착하는 대로 다시 그린다.
-//   3) 연속 렌더 요청은 한 프레임으로 합쳐 중복 계산을 막는다.
-let _renderQueued=false;
-function scheduleRender(){
-  if(_renderQueued) return;
-  _renderQueued=true;
-  (window.requestAnimationFrame||setTimeout)(()=>{ _renderQueued=false; try{ renderAll(); }catch(e){ console.error(e); } },0);
-}
-(async function init(){
-  initMobileMenu();
-  initDateTextMasking();
-  document.getElementById("modal-overlay")?.addEventListener("click",(e)=>{ if(e.target.id==="modal-overlay") closeModal(); });
-
-  await loadState();
-  renderAll();                       // 첫 화면은 즉시 표시하되, DNA/포디움 분석은 실제 DB 준비 전에는 계산하지 않음
-
-  EXTERNAL_RACE_DB_READY_PROMISE = Promise.resolve().then(loadExternalRaceDb).catch(e=>{
-    console.warn("EXTERNAL_RACE_DB 로드 실패:",e);
-    EXTERNAL_RACE_DB_READY = true;
-    return false;
-  });
-  const bg=[
-    EXTERNAL_RACE_DB_READY_PROMISE,
-    Promise.resolve().then(loadDerivedBenchmark).catch(e=>console.warn("DERIVED_BENCHMARK 로드 실패:",e)),
-  ];
-  if(sbEnabled()) bg.push(Promise.resolve().then(initSupabaseAuth).catch(e=>console.warn("Supabase auth 실패:",e)));
-  bg.forEach(pr=>pr.then(scheduleRender));   // 도착하는 대로 갱신 (프레임 단위로 합쳐짐)
-  await Promise.allSettled(bg);
-  scheduleRender();
-})();
-</script>
-
-<script>
-  // HPS cache cleanup.
-  // This build does NOT register a service worker. If an older build registered one,
-  // remove it and its caches so it cannot keep serving an old index.html.
-  (async function(){
-    try {
-      if ('serviceWorker' in navigator) {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        for (const reg of regs) {
-          try { await reg.unregister(); } catch (e) {}
-        }
-      }
-      if (window.caches) {
-        const keys = await caches.keys();
-        for (const key of keys) {
-          try { await caches.delete(key); } catch (e) {}
-        }
-      }
-    } catch (e) {
-      console.warn('HPS cache cleanup skipped:', e);
-    }
-  })();
-</script>
-</body>
-</html>
