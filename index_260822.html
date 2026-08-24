@@ -6112,7 +6112,7 @@ function buildStationTechniqueSession(stationKey, ctx){
     why: buildStationWhyReasoning(stationKey),
   };
 }
-// spec §7: box Station 후반 Running degradation이 특히 큰 경우 — Station → Run 반복(전환 자체를
+// spec §7: box Station Running 지속력 degradation이 특히 큰 경우 — Station → Run 반복(전환 자체를
 // 훈련), buildStationAddOnSession과 형태는 비슷하지만 목적이 "전환 속도"로 다르게 표시된다.
 function buildTransitionAddOnSession(stationKey, ctx){
   const station = STATIONS.find(s=>s.key===stationKey);
@@ -10071,8 +10071,16 @@ function renderMyGoalPodiumResult(wrap){
     ${r.gapDecomposition ? `<div style="padding:18px 20px;">
       <div class="eyebrow gray" style="margin-bottom:10px;">GAP 구간별 분해</div>
       <p class="reason-line" style="margin-bottom:8px;">동일 조건 3위 기록의 실제 구간 splits와 비교</p>
-      ${r.gapDecomposition.rows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
-        <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("")}
+      ${(()=>{
+        const gapRows=r.gapDecomposition.rows||[];
+        const runRows=gapRows.filter(x=>/^run[1-8]$/i.test(String(x.key||"")) || /^Run\s*[1-8]$/i.test(String(x.label||"")));
+        const runningGap=runRows.reduce((sum,x)=>sum+(Number(x.gapSec)||0),0);
+        const displayRows=gapRows.filter(x=>!(/^run[1-8]$/i.test(String(x.key||"")) || /^Run\s*[1-8]$/i.test(String(x.label||""))));
+        if(runRows.length) displayRows.push({label:"Running",key:"running",gapSec:runningGap});
+        displayRows.sort((a,b)=>b.gapSec-a.gapSec);
+        return displayRows.filter(x=>Math.abs(x.gapSec)>=1).slice(0,6).map(x=>`
+        <div class="row-between" style="padding:4px 0;"><span style="font-size:12.5px;">${escapeHtml(x.label)}</span><span class="mono" style="font-size:12.5px;font-weight:700;color:${x.gapSec>=0?'var(--red)':'var(--green)'};">${x.gapSec>=0?"+":"-"}${fmtTime(Math.abs(x.gapSec))}</span></div>`).join("");
+      })()}
       ${Math.abs(r.gapDecomposition.unaccountedGap)>=1 ? `<div class="row-between" style="padding:4px 0;color:var(--gray-dim);"><span style="font-size:12.5px;">기타 (측정 방식 차이 등)</span><span class="mono" style="font-size:12.5px;">${r.gapDecomposition.unaccountedGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.unaccountedGap))}</span></div>` : ""}
       <div class="row-between" style="padding:6px 0 0;margin-top:6px;border-top:1px solid var(--line);"><span style="font-size:12.5px;font-weight:700;">Total</span><span class="mono" style="font-size:12.5px;font-weight:800;">${r.gapDecomposition.totalGap>=0?"+":"-"}${fmtTime(Math.abs(r.gapDecomposition.totalGap))}</span></div>
     </div>
@@ -13134,9 +13142,14 @@ function renderGoal(wrap){
         const direct=Number(directUnified?.segments?.[engineKey]?.value);
         if(Number.isFinite(direct)&&direct>0) return direct;
         const bridged=Number(bridgeUnified?.segments?.[engineKey]?.value);
-        if(!Number.isFinite(bridged)||bridged<=0||!stationBridgeDiv) return null;
+        if(!Number.isFinite(bridged)||bridged<=0||!stationBridgeDiv){
+          return getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
+        }
         const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,engineKey);
-        return Number.isFinite(Number(conv?.multiplier)) ? bridged*Number(conv.multiplier) : null;
+        if(Number.isFinite(Number(conv?.multiplier))) return bridged*Number(conv.multiplier);
+        // Match raceOnlyPrediction(): if cross-Division station evidence is unavailable,
+        // use the same target-Division benchmark fallback so every HYROX Station remains visible.
+        return getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
       };
       const segs=STATIONS.map(st=>({
         key:st.key,
@@ -14039,7 +14052,7 @@ function buildStrengthsTop3(segments){
   return sorted.map((s,i)=>({ label:s.label, desc:templates[i]||"강점 구간", score:Math.round(s.percentile) }));
 }
 // spec §3: individual station bottlenecks (NOT the aggregate "Running (8구간 합)" line — that's used
-// in the separate 기록 손실 분석 section) + a specific "후반 Running" item when measured post-station
+// in the separate 기록 손실 분석 section) + a specific "Running 지속력" item when measured post-station
 // degradation (computeStationInducedDegradation, already real data) is large enough to call out.
 function buildImprovementTop3(impactList, race){
   const stationItems = impactList.filter(c=>c.key!=="run" && c.timeLoss>0).slice(0,3)
@@ -14050,7 +14063,7 @@ function buildImprovementTop3(impactList, race){
   if(topDeg){
     const pct=(topDeg.degradationSec/topDeg.baselineSec)*100;
     if(pct>=8){
-      const degItem={ label:"후반 Running", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
+      const degItem={ label:"Running 지속력", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
       if(items.length<3) items.push(degItem); else items[2]=degItem;
     }
   }
@@ -15193,6 +15206,10 @@ function renderAccount(wrap){
 let _renderQueued=false;
 function scheduleRender(){
   if(_renderQueued) return;
+  // DNA pages manage their own async DB-ready render. Do not let background
+  // benchmark/auth fetches re-render an actively viewed DNA page, which can
+  // make the page look like it refreshed while the user is reading it.
+  if(CURRENT_PAGE==="peer" || CURRENT_PAGE==="mydna") return;
   _renderQueued=true;
   (window.requestAnimationFrame||setTimeout)(()=>{ _renderQueued=false; try{ renderAll(); }catch(e){ console.error(e); } },0);
 }
