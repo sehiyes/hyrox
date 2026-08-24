@@ -13148,8 +13148,15 @@ function renderGoal(wrap){
         const conv=upv4Conversion(stationGender,stationBridgeDiv,goalDiv,engineKey);
         if(Number.isFinite(Number(conv?.multiplier))) return bridged*Number(conv.multiplier);
         // Match raceOnlyPrediction(): if cross-Division station evidence is unavailable,
-        // use the same target-Division benchmark fallback so every HYROX Station remains visible.
-        return getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
+        // use the target-Division benchmark fallback. If the derived benchmark table does not
+        // contain this station, use the existing BENCH table as the final display-only fallback
+        // so all 8 HYROX Stations remain visible in Goal Gap > Station Detail.
+        const derivedFallback=getRaceOnlyBenchmarkSegmentSec(goalDiv,engineKey);
+        if(Number.isFinite(derivedFallback)&&derivedFallback>0) return derivedFallback;
+        const benchKey={bbj:"burpee",farmers:"carry",lunges:"lunge",wallBalls:"wallball"}[engineKey]||engineKey;
+        const targetBench=BENCH[goalDiv] || BENCH.Open;
+        const benchSec=Number(targetBench?.[benchKey]);
+        return Number.isFinite(benchSec)&&benchSec>0 ? benchSec : null;
       };
       const segs=STATIONS.map(st=>({
         key:st.key,
@@ -13678,19 +13685,12 @@ function stationRunFatigueSectionHtml(){
     ` : `<div class="empty-note">측정된 Station → Run 저하가 없습니다.</div>`}
   ` : `<p class="reason-line" style="margin-top:10px;color:var(--gray-dim);">대회가 2개 이상 등록되면 반복성(여러 대회에서 일관되게 나타나는 패턴인지)을 함께 보여드립니다. 현재 ${raceCount}개 대회만 분석되었습니다.</p>`;
 
-  // 대회 전반의 Run1→Run8 진단 분포 (spec §6 — 단일 대회의 인과 단정 대신, 여러 대회에서 어떤 진단이
-  // 몇 번 나왔는지 그대로 집계해서 보여준다. analyzeRaceExecution()의 기존 로직/문구를 재사용하며
-  // 새 인과모델을 만들지 않는다.)
-  const dLabels = { good:"Pacing 양호", station:"Station-induced Fatigue 주요 원인", "station-uneven":"Station 영향이 구간마다 회복됨", mixed:"Station+Pacing 혼합", pacing:"Pacing 문제 가능성" };
-  const diagLines = Object.entries(diagnosisCounts).sort((a,b)=>b[1]-a[1])
-    .map(([k,n])=>`${dLabels[k]||k} ${n}/${raceCount}`).join(" · ");
-
   return `<div class="divider" style="margin:16px 0;"></div>
     <div class="eyebrow gray">🏃 Station → Run Fatigue</div>
     <p class="lead" style="margin:6px 0 10px;">등록된 ${raceCount}개 대회 전체를 각각 분석합니다 — 각 스테이션 직후 Run이 그 경기 평균 Run 페이스보다 얼마나 느려졌는지(해당 스테이션의 피로가 다음 Run으로 넘어간 정도)를 대회별로 비교합니다.</p>
     ${tableHtml}
     ${patternHtml}
-    ${diagLines ? `<div class="divider" style="margin:14px 0;"></div><div class="reason-line">대회별 Run1→Run8 진단 분포: ${escapeHtml(diagLines)} <span style="color:var(--gray-dim);">(단일 대회의 관찰값이며, 여러 대회에 걸친 인과관계 증명이 아닙니다 — 위 반복성 지표를 함께 참고하세요.)</span></div>` : ""}`;
+    `;
 }
 // spec (doc5 §9/§10): dynamic composition banner — replaces the old static "실제로 뛴 X 경기 기록
 // (대회명)으로 계산했습니다" wording (which only ever named ONE race) with a description that reflects
