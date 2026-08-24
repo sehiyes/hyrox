@@ -2143,6 +2143,14 @@ function calcFatigueScore(){
   // 0-100, higher = more fatigued. V3 (spec §19-20): ACWR overload + RPE trend + pain — PLUS HR drift
   // and performance trend, so no single signal (esp. ACWR) drives this alone. Each new component
   // defaults to 0 without data, so behavior is unchanged for anyone without HR/history yet.
+  // bug fix: `acwr` was referenced below without ever being computed/declared in this function,
+  // so every call threw ReferenceError. Because this runs inside calcHPI(), which recordHpiSnapshot()
+  // calls FIRST (before persist()/renderAll()), the exception silently aborted every "추가/저장"
+  // action across the whole app right after the click handler — the data had already been pushed
+  // into STATE, but persist() and renderAll() never got a chance to run, so nothing appeared to save
+  // or refresh until some other action (e.g. navigating to another page) re-rendered the same
+  // already-mutated in-memory STATE.
+  const acwr=calcACWR();
   const acwrPenalty = acwr!=null? clamp((acwr-1.0)*60,0,50) : 0;
   const recent3=recentTraining(3);
   const rpeVals=recent3.map(l=>Number(l.intensityRpe)).filter(v=>!isNaN(v)&&v);
@@ -2890,6 +2898,68 @@ function upv4SegmentValue(race, segment){
   return parseTimeToSec(st);
 }
 
+/* ---------------------------------------------------------------------- */
+/* FULL SIMULATION -> RACE-ONLY PREDICTION (feature)                       */
+/* Only the portion of a Simulation that was actually attempted in real    */
+/* HYROX race order — starting from the very first station (SkiErg), with  */
+/* no gaps — is trusted. This mirrors the concern that motivated removing  */
+/* isolated Quick Test entries: a single station measured on its own, with */
+/* no race-like context around it, is a much weaker signal than the same   */
+/* station measured as part of an actual attempt at the race sequence.     */
+/* ---------------------------------------------------------------------- */
+// Counts how many STATIONS[] entries (0..8) are validly filled starting from index 0, stopping at
+// the first gap. "Validly filled" requires BOTH a parseable time AND an exact unit match against
+// the station's official distance/reps (STATIONS[].unit) — the same exact-unit-match safety rule
+// the legacy engine already used for Quick Test/Simulation station data, so a half-distance rep is
+// never silently blended in as if it were the full official distance.
+function simulationValidStationPrefix(sim){
+  let n=0;
+  for(const st of STATIONS){
+    const s=sim?.stations?.[st.key];
+    const sec=s && parseTimeToSec(s.time);
+    if(!sec) break;
+    if(String(s.amount||"").trim().toLowerCase()!==String(st.unit).trim().toLowerCase()) break;
+    n++;
+  }
+  return n;
+}
+// Resolves one UPV4_SEGMENTS value from a Simulation record, respecting the valid-prefix rule above:
+//  - a station counts only if it falls within the valid prefix (index < n)
+//  - a run leg counts up to and including the leg right after the last valid station (run(n+1)) —
+//    run1 is always eligible regardless of station progress, since it happens before any station
+//  - roxzone (aggregate transition time) and the runTotal aggregate both only make sense once every
+//    station has been validly completed (n===8) — see raceOnlyOfficialTimeAnchors for the same rule
+//    applied to the record's own totalTime field
+function upv4SimulationSegmentValue(sim, segment){
+  const n=simulationValidStationPrefix(sim);
+  if(segment==="roxzone"){
+    if(n<8) return null;
+    return parseTimeToSec(sim.transition);
+  }
+  const stationKey=UPV4_SEGMENT_TO_STATION_KEY[segment];
+  if(stationKey){
+    const idx=STATIONS.findIndex(s=>s.key===stationKey);
+    if(idx<0 || idx>=n) return null; // outside the order-verified prefix — not trusted
+    const s=sim.stations?.[stationKey];
+    return s ? parseTimeToSec(s.time) : null;
+  }
+  if(segment==="runTotal"){
+    const maxRun=n+1;
+    let sum=0, any=false;
+    RUN_KEYS.forEach(k=>{
+      if(k>maxRun) return;
+      const r=sim.runs?.[k];
+      if(!r || !r.time || !r.distanceM) return; // never guess a missing distance
+      const sec=parseTimeToSec(r.time);
+      if(!sec) return;
+      sum += (sec/r.distanceM)*1000; // normalize to a 1km-equivalent pace, same convention every
+      any=true;                      // other run-leg source in this file already uses
+    });
+    return any ? sum : null;
+  }
+  return null;
+}
+
 function upv4ResolveAthleteGender(race){
   // Mixed Doubles is a team-level result, so a DB row's gender/team label must
   // never override the athlete's selected target gender. Goal > gender override
@@ -2922,7 +2992,11 @@ function upv4ResolveAthleteGender(race){
 function resolveUnifiedPerformance(goalDivision, options={}){
   const goal=normalizeRaceDivision(goalDivision)||goalDivision;
   const races=(STATE?.races||[]).filter(r=>r && r.date);
-  if(!goal || !races.length) return {goalDivision:goal,segments:{},records:[],confidence:"NONE"};
+  // feature: Full Simulation now also feeds this pool (see upv4SimulationSegmentValue's header
+  // comment) — an athlete with zero real races but a real Full Simulation should still get
+  // segment data here, so the emptiness guard below now checks both sources.
+  const sims=(STATE?.simulationTests||[]).filter(s=>s && s.date);
+  if(!goal || (!races.length && !sims.length)) return {goalDivision:goal,segments:{},records:[],confidence:"NONE"};
 
   const records=[];
   const targetCandidates=(UPV4_DIVISION_GRAPH[goal]||[[goal,0]]).map(x=>x[0]);
@@ -2979,7 +3053,34 @@ function resolveUnifiedPerformance(goalDivision, options={}){
         gender,segment,rawSec:raw,convertedSec:converted,
         conversion:conv,recencyWeight:recency,
         completeness,contribution,weight,
-        officialTime:parseTimeToSec(race.officialTime)
+        officialTime:parseTimeToSec(race.officialTime), isSimulation:false
+      });
+    }
+  }
+
+  // feature: Full Simulation as a lower-trust supplementary source — reuses the exact same
+  // conversion/tiering machinery as real races above (upv4Conversion, same-format preference),
+  // just at SOURCE_TRUST_V3.simulation weight and restricted to whichever segments fall within
+  // the order-verified prefix (see upv4SimulationSegmentValue). Simulation only ever records
+  // Open/Pro (no Doubles option), so for a Doubles goal it's always cross-format — exactly like a
+  // real Singles race would be — and gets set aside the same way once real Doubles evidence exists.
+  for(const sim of sims){
+    const source=sim.division==="Pro" ? "Pro" : "Open";
+    if(hasSameFormatEvidence && upv4IsDoubles(source)!==goalIsDoubles) continue;
+    const gender=upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
+    for(const segment of UPV4_SEGMENTS){
+      const raw=upv4SimulationSegmentValue(sim,segment);
+      if(raw==null) continue;
+      const conv=upv4Conversion(gender,source,goal,segment);
+      if(conv.multiplier==null) continue;
+      const converted=raw*conv.multiplier;
+      const weight=upv4RecencyWeight(sim.date)*(SOURCE_TRUST_V3.simulation||0.7);
+      records.push({
+        date:sim.date,sourceDivision:source,goalDivision:goal,
+        gender,segment,rawSec:raw,convertedSec:converted,
+        conversion:conv,recencyWeight:upv4RecencyWeight(sim.date),
+        completeness:1,contribution:1,weight,
+        officialTime:null, isSimulation:true
       });
     }
   }
@@ -2993,6 +3094,10 @@ function resolveUnifiedPerformance(goalDivision, options={}){
       value:sumW ? xs.reduce((s,x)=>s+x.convertedSec*x.weight,0)/sumW : null,
       sampleN:xs.length,
       sources:[...new Set(xs.map(x=>x.sourceDivision))],
+      // transparency: lets callers (e.g. raceOnlyPrediction's part labels) say "Simulation 기반"
+      // instead of implying real race evidence when every contributing record for this specific
+      // segment actually came from a Full Simulation rather than an official race.
+      allSimulation:xs.every(x=>x.isSimulation),
       records:xs.sort((a,b)=>b.date.localeCompare(a.date)).slice(0,10)
     };
   }
@@ -3062,7 +3167,23 @@ function raceOnlyOfficialTimeAnchors(goalDivision){
     const gender=upv4ResolveAthleteGender(race);
     const key=[race.date||"", source, official, gender].join("|");
     if(byRace.has(key)) return;
-    byRace.set(key,{date:race.date,sourceDivision:source,officialTime:official,gender});
+    byRace.set(key,{date:race.date,sourceDivision:source,officialTime:official,gender,isSimulation:false});
+  });
+  // feature: a Full Simulation's own total time is real, self-measured evidence of the athlete's
+  // current ability — but only when it actually completed all 8 stations in real race order (see
+  // simulationValidStationPrefix). A partial attempt's "total time" can't be trusted as a race-
+  // equivalent total (it's not clear what portion of the race it actually represents), so it's
+  // excluded here entirely — the same partial attempt's individual completed segments still feed
+  // resolveUnifiedPerformance's per-segment blend, just not this whole-race anchor.
+  (STATE?.simulationTests||[]).filter(s=>s && s.date && parseTimeToSec(s.totalTime)!=null).forEach(sim=>{
+    if(simulationValidStationPrefix(sim)<8) return;
+    const official=parseTimeToSec(sim.totalTime);
+    if(!Number.isFinite(official) || official<=0) return;
+    const source=sim.division==="Pro" ? "Pro" : "Open";
+    const gender=upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
+    const key=["sim", sim.date||"", source, official, gender].join("|");
+    if(byRace.has(key)) return;
+    byRace.set(key,{date:sim.date,sourceDivision:source,officialTime:official,gender,isSimulation:true});
   });
 
   const anchors=[...byRace.values()].map(r=>{
@@ -3075,7 +3196,8 @@ function raceOnlyOfficialTimeAnchors(goalDivision){
     const conv=upv4Conversion(r.gender,r.sourceDivision,goal,"officialTotal");
     if(!Number.isFinite(Number(conv?.multiplier))) return null;
     const multiplier=Number(conv.multiplier);
-    const method = r.sourceDivision===goal ? "EXACT_OFFICIAL_TIME"
+    const method = r.isSimulation ? "SIMULATION_OFFICIAL_TIME"
+      : r.sourceDivision===goal ? "EXACT_OFFICIAL_TIME"
       : conv.hops===2 ? "OFFICIAL_TIME_COMPOSED_CONVERSION" : "OFFICIAL_TIME_TOTAL_CONVERSION";
     return {...r,multiplier,convertedTotal:r.officialTime*multiplier,method};
   }).filter(Boolean);
@@ -3087,14 +3209,17 @@ function raceOnlyOfficialTimeAnchors(goalDivision){
      only require a same-format tier conversion (Open<->Pro weight standard), never the much
      bigger, unverified Singles<->Doubles workload-split assumption. Cross-format official races
      are used only when that's genuinely all the athlete has. See resolveUnifiedPerformance's
-     header comment for the same reasoning applied to the segment-level pooling. */
+     header comment for the same reasoning applied to the segment-level pooling.
+     A Simulation is never "exact" evidence even when its division matches the goal exactly — it's
+     unofficial, self-measured data, so it should never outrank/exclude a real race in a same-
+     format-but-different-tier division the way real exact-division evidence would. */
   const goalIsDoubles=upv4IsDoubles(goal);
-  const exact=anchors.filter(a=>a.sourceDivision===goal);
+  const exact=anchors.filter(a=>a.sourceDivision===goal && !a.isSimulation);
   const sameFormat=anchors.filter(a=>upv4IsDoubles(a.sourceDivision)===goalIsDoubles);
   const pool=exact.length?exact:(sameFormat.length?sameFormat:anchors);
   const weighted=pool.map(a=>({
     ...a,
-    weight:upv4RecencyWeight(a.date||todayISO()) * (a.sourceDivision===goal ? 1 : 0.75)
+    weight:upv4RecencyWeight(a.date||todayISO()) * (a.sourceDivision===goal ? 1 : 0.75) * (a.isSimulation ? (SOURCE_TRUST_V3.simulation||0.7) : 1)
   }));
   const sumW=weighted.reduce((s,a)=>s+a.weight,0)||1;
   const predicted=weighted.reduce((s,a)=>s+a.convertedTotal*a.weight,0)/sumW;
@@ -3118,7 +3243,7 @@ function raceOnlyPrediction(targetDivision){
   let actualCount=0;
   order.forEach(seg=>{
     let v=u.segments?.[seg]?.value;
-    let source=u.segments?.[seg] ? "실제 대회/Division 환산" : null;
+    let source=u.segments?.[seg] ? (u.segments[seg].allSimulation ? "Full Simulation 기반" : "실제 대회/Division 환산") : null;
     if(v==null && seg==="runTotal"){
       const pb10=parseTimeToSec(STATE.running.pb10k || STATE.running.tt10k);
       if(pb10){ v=(pb10/10+30)*8; source="10K TT/PB +30초/km · 8km"; }
@@ -9588,8 +9713,8 @@ let SIM_QUICK_DRAFT=null, TENK_QUICK_DRAFT=null, SIM_EDIT_ID=null, TENK_EDIT_ID=
 function openSimQuickAddModal(existing=null){
   SIM_EDIT_ID = existing?.id || null;
   SIM_QUICK_DRAFT = existing
-    ? { date:existing.date, type:existing.type||"full", division:existing.division||STATE.profile.goalDivision||"Open Doubles", totalTime:existing.totalTime||"", note:existing.note||"" }
-    : { date:todayISO(), type:"full", division:STATE.profile.division, totalTime:"", note:"" };
+    ? { date:existing.date, division:existing.division||STATE.profile.goalDivision||"Open Doubles", totalTime:existing.totalTime||"", note:existing.note||"" }
+    : { date:todayISO(), division:STATE.profile.division, totalTime:"", note:"" };
   renderSimQuickAddModal(); openModal();
 }
 function deleteSimRecord(id){
@@ -9612,15 +9737,11 @@ function renderSimQuickAddModal(){
   const runCount = editingRec ? Object.keys(editingRec.runs||{}).length : 0;
   const stCount = editingRec ? Object.keys(editingRec.stations||{}).length : 0;
   panel.innerHTML = `
-    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Simulation 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="simq-close">✕</span></div>
+    <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏁 Full Simulation 기록 ${editing?"수정":"추가"}</div><span class="modal-close" id="simq-close">✕</span></div>
+    <p class="reason-line" style="margin:0 0 10px;">전체 레이스(8 Run + 8 Station)를 기준으로 한 자체 시뮬레이션만 기록합니다. 일부 구간만 테스트했다면 아래 "Run/Station 상세"에서 해당 구간만 입력해주세요 — 총 기록은 실제로 전체를 완주했을 때만 입력해주세요.</p>
     <div class="field"><label>날짜</label><input id="simq-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}"></div>
-    <div class="field" style="margin-top:10px;"><label>유형</label><select id="simq-type">
-      <option value="full" ${d.type==="full"?"selected":""}>Full Simulation</option>
-      <option value="half" ${d.type==="half"?"selected":""}>Half Simulation</option>
-      <option value="custom" ${d.type==="custom"?"selected":""}>Custom Simulation</option>
-    </select></div>
     <div class="field" style="margin-top:10px;"><label>Division (수행 기준)</label><select id="simq-div">${DIVISIONS.map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select></div>
-    <div class="field" style="margin-top:10px;"><label>총 기록 (선택, h:mm:ss)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
+    <div class="field" style="margin-top:10px;"><label>총 기록 (선택, h:mm:ss — 전체 완주 시에만)</label><input id="simq-time" placeholder="예: 1:08:42" value="${escapeHtml(d.totalTime)}"></div>
     <div class="field" style="margin-top:10px;"><label>메모 (선택)</label><input id="simq-note" placeholder="선택사항" value="${escapeHtml(d.note)}"></div>
     <button class="btn" id="simq-save" style="width:100%;justify-content:center;margin-top:16px;">${editing?"수정 저장":"저장"}</button>
     <div class="card tight" style="margin-top:14px;text-align:center;padding:12px;">
@@ -9630,7 +9751,6 @@ function renderSimQuickAddModal(){
   `;
   panel.querySelector("#simq-close").addEventListener("click", closeModal);
   panel.querySelector("#simq-date").addEventListener("change",e=>{ d.date=e.target.value; });
-  panel.querySelector("#simq-type").addEventListener("change",e=>{ d.type=e.target.value; });
   panel.querySelector("#simq-div").addEventListener("change",e=>{ d.division=e.target.value; });
   panel.querySelector("#simq-time").addEventListener("change",e=>{ d.totalTime=e.target.value; });
   panel.querySelector("#simq-note").addEventListener("change",e=>{ d.note=e.target.value; });
@@ -9639,7 +9759,7 @@ function renderSimQuickAddModal(){
     // no record saved yet in add-mode — create a bare record first (light fields only) so there's
     // something to attach Run/Station detail to on the desktop tab, then jump there.
     if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
-    const rec={ id:uid(), date:d.date, type:d.type, division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime.trim()||null, note:d.note||"", source:"manual" };
+    const rec={ id:uid(), date:d.date, type:"full", division:d.division, runs:{}, stations:{}, transition:null, totalTime:d.totalTime.trim()||null, note:d.note||"", source:"manual" };
     STATE.simulationTests.push(rec); persist();
     goToSimulationDetailTab(rec.id);
   });
@@ -9649,11 +9769,16 @@ function renderSimQuickAddModal(){
     if(totalTime && !parseTimeToSec(totalTime)){ showToast("총 기록을 mm:ss 또는 h:mm:ss 형식으로 입력해주세요"); return; }
     if(editing){
       const rec = STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
-      if(rec){ rec.date=d.date; rec.type=d.type; rec.division=d.division; rec.totalTime=totalTime||null; rec.note=d.note||""; }
+      // bug-safe: preserve whatever `type` an existing record already had (e.g. a legacy Half/
+      // Custom entry made before Half/Custom were removed) rather than silently upgrading it to
+      // "full" just because this light editor no longer shows a type selector — the completeness
+      // rules that decide what actually counts for prediction look at the ACTUAL entered segments,
+      // not this flag, so leaving it alone here is purely about not misrepresenting old data.
+      if(rec){ rec.date=d.date; rec.division=d.division; rec.totalTime=totalTime||null; rec.note=d.note||""; }
       persist(); closeModal(); showToast("Simulation 기록을 수정했습니다"); renderAll();
     } else {
       if(!totalTime){ showToast("총 기록을 입력하거나, 아래에서 Run/Station 상세를 먼저 입력해주세요"); return; }
-      STATE.simulationTests.push({ id:uid(), date:d.date, type:d.type, division:d.division, runs:{}, stations:{}, transition:null, totalTime, note:d.note||"", source:"manual" });
+      STATE.simulationTests.push({ id:uid(), date:d.date, type:"full", division:d.division, runs:{}, stations:{}, transition:null, totalTime, note:d.note||"", source:"manual" });
       persist(); closeModal(); showToast("Simulation 기록이 저장되었습니다"); renderAll();
     }
   });
@@ -12405,7 +12530,7 @@ function renderStrength(wrap){
   wrap.innerHTML = `
     <div><div class="eyebrow">DATA INPUT · ④ TEST & SIMULATION</div><h1 class="page-title">테스트 · 시뮬레이션 기록</h1></div>
     <div class="tabs">
-      <div class="tab ${STRENGTH_TAB==="quicktest"?"active":""}" data-strength-tab="quicktest">Quick Test</div>
+      <div class="tab ${STRENGTH_TAB==="quicktest"?"active":""}" data-strength-tab="quicktest">Running 기록</div>
       <div class="tab ${STRENGTH_TAB==="simulation"?"active":""}" data-strength-tab="simulation">Simulation 기록</div>
     </div>
     <div id="strength-tab-body"></div>
@@ -12418,13 +12543,18 @@ function renderStrength(wrap){
 function renderStrengthSubTab(wrap){
   wrap.innerHTML=`<div class="card"><div class="eyebrow gray">기초 근력 입력 종료</div><p class="lead" style="margin-top:8px;">Squat · Bench · Deadlift · 체중 기반 점수는 현재 Race DNA/예상기록/포디움 분석에 사용하지 않습니다. HYROX Station 테스트와 실제 대회 기록만 분석에 사용됩니다.</p></div>`;
 }
+// spec: Station Calibration Test(고립된 단발 스테이션 측정)는 완전히 제거되었다 — 예상기록에는
+// "레이스 맥락이 있는" 데이터(실제 대회, Full Simulation)만 반영하기로 한 결정에 따라, 레이스 순서와
+// 무관하게 스테이션 하나만 재는 이 기능 자체를 없앴다. 기존에 STATE.stationTests에 남아있는 데이터는
+// (사용자가 명시적으로 삭제를 요청하지 않는 한) 건드리지 않고 그대로 두지만, 이 탭에서는 더 이상
+// 입력/조회 UI를 제공하지 않는다 — 함수명(renderQuickTestTab)은 다른 코드의 참조를 바꾸지 않기 위해
+// 유지하되, 실제로는 Running Calibration만 다룬다.
 function renderQuickTestTab(wrap){
   const tt=runningTtRecords();
-  const stationTests=STATE.stationTests||[];
   wrap.innerHTML = `
     <div class="card">
       <div class="row-between"><h2 class="section-title">🏃 Running Calibration</h2><span class="badge elite">1K · 3K · 5K · 10K TT</span></div>
-      <p class="lead" style="margin:6px 0 12px;">여기서 입력한 TT는 <b style="color:var(--orange);">러닝 기록의 공식 저장소</b>에 함께 남습니다. 5K/10K는 기존 Running PB에도 자동 반영되고, 1K/3K도 별도 TT 값으로 보존됩니다.</p>
+      <p class="lead" style="margin:6px 0 12px;">여기서 입력한 TT는 <b style="color:var(--orange);">러닝 기록의 공식 저장소</b>에 함께 남습니다. 5K/10K는 기존 Running PB에도 자동 반영되고, 1K/3K도 별도 TT 값으로 보존됩니다. 대회에 실제 러닝 기록이 없는 Division의 예상기록 계산에 참고로 반영됩니다 (10K &gt; 5K &gt; 3K &gt; 1K 순).</p>
       <div class="grid grid-3">
         ${field("테스트 종류", `<select id="qt-run-key">${RUN_TT_OPTIONS.map(o=>`<option value="${o.key}">${o.label}</option>`).join("")}</select>`)}
         ${field("기록 (mm:ss)", `<input id="qt-run-time" placeholder="예: 23:10">`)}
@@ -12437,21 +12567,6 @@ function renderQuickTestTab(wrap){
       <h2 class="section-title">🏃 Running TT 기록 (${tt.length})</h2>
       ${tt.length? `<div style="overflow-x:auto;"><table style="margin-top:10px;"><thead><tr><th>날짜</th><th>거리</th><th class="num">기록</th><th class="num">페이스</th><th>출처</th><th></th></tr></thead><tbody>${tt.map(r=>{const km=Number(r.distanceKm); return `<tr><td>${r.date}</td><td>${km}K</td><td class="num mono">${fmtTime(r.avgPaceSecKm*km)}</td><td class="num mono">${fmtPace(r.avgPaceSecKm)}</td><td>${r.source==="calibration"?"Calibration":"기록"}</td><td class="hstack" style="gap:5px;"><span class="chip" data-tt-edit="${r.id}" style="cursor:pointer;font-size:10px;">수정</span><span class="list-remove" data-tt-del="${r.id}">✕</span></td></tr>`;}).join("")}</tbody></table></div>` : `<div class="empty-note">아직 Running TT 기록이 없습니다.</div>`}
     </div>
-    <div class="card">
-      <div class="row-between"><h2 class="section-title">⚡ Station Calibration Test</h2></div>
-      <p class="lead" style="margin:6px 0 12px;">Station 테스트는 해당 Station의 데이터만 보강합니다. 전체 HYROX 기록을 임의로 빨라지게 만들지 않습니다.</p>
-      <div class="grid grid-3">
-        ${field("테스트 종류", `<select id="qt-key">${QUICK_TEST_OPTIONS.filter(o=>!o.isRunning).map(o=>`<option value="${o.key}">${o.label} (${o.unit})</option>`).join("")}</select>`)}
-        ${field("기록 (mm:ss)", `<input id="qt-time" placeholder="예: 4:20">`)}
-        ${field("날짜", `<input id="qt-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${todayISO()}">`)}
-      </div>
-      <div style="margin-top:12px;"><button class="btn sm" id="qt-add">Station Test 추가</button></div>
-      <div id="qt-status" style="margin-top:8px;font-size:12px;"></div>
-    </div>
-    <div class="card">
-      <h2 class="section-title">Station 테스트 기록 (${stationTests.length})</h2>
-      ${stationTests.length? `<div style="overflow-x:auto;"><table style="margin-top:10px;"><thead><tr><th>날짜</th><th>Station</th><th class="num">기록</th><th></th></tr></thead><tbody>${[...stationTests].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>Object.entries(t.values||{}).map(([key,val])=>{const st=STATIONS.find(x=>x.key===key); return `<tr><td>${t.date}</td><td>${st?.label||key}</td><td class="num mono">${escapeHtml(val)}</td><td><span class="list-remove" data-del-st="${t.id}">✕</span></td></tr>`;}).join("")).join("")}</tbody></table></div>` : `<div class="empty-note">Station Test 기록이 없습니다.</div>`}
-    </div>
   `;
   wrap.querySelector("#qt-run-add").addEventListener("click",()=>{
     const opt=RUN_TT_OPTIONS.find(o=>o.key===wrap.querySelector("#qt-run-key").value);
@@ -12461,55 +12576,31 @@ function renderQuickTestTab(wrap){
     saveRunningTT({distanceKm:opt.distanceKm,time,date,source:"calibration",note:`${opt.label} Calibration Test`});
     recordHpiSnapshot(); persist(); showToast(`${opt.label}가 러닝 기록과 Calibration에 함께 저장되었습니다`); renderAll();
   });
-  wrap.querySelector("#qt-add").addEventListener("click",()=>{
-    const key=wrap.querySelector("#qt-key").value, time=wrap.querySelector("#qt-time").value.trim(), date=wrap.querySelector("#qt-date").value||todayISO();
-    const statusEl=wrap.querySelector("#qt-status");
-    if(!parseTimeToSec(time)){ statusEl.style.color="var(--red)"; statusEl.textContent="기록을 mm:ss 형식으로 입력해주세요."; return; }
-    STATE.stationTests.push({id:uid(),date,values:{[key]:time},source:"quick"});
-    recordHpiSnapshot(); persist(); showToast("Station Test가 저장되었습니다"); renderAll();
-  });
-  wrap.querySelectorAll("[data-del-st]").forEach(b=>b.addEventListener("click",()=>{ STATE.stationTests=STATE.stationTests.filter(t=>t.id!==b.dataset.delSt); persist(); renderAll(); }));
   wrap.querySelectorAll("[data-tt-del]").forEach(b=>b.addEventListener("click",()=>{ if(confirm("이 Running TT 기록을 삭제할까요?")) deleteRunningTT(b.dataset.ttDel); }));
   wrap.querySelectorAll("[data-tt-edit]").forEach(b=>b.addEventListener("click",()=>editRunningTT(b.dataset.ttEdit)));
 }
-const SIM_RUN_DEFAULT_DIST = { full:1000, half:500, custom:null };
-// spec (bug fix): Run 거리 입력칸이 "비어있을 때만" 유형별 기본값을 채우던 기존 로직 때문에, 한 번
-// Half를 눌러 500이 들어가고 나면 그 필드는 더 이상 "비어있지" 않아서 Full/Custom으로 다시 바꿔도
-// 500이 그대로 남아있는 버그가 있었다. 이제 "사용자가 직접 타이핑해서 값을 바꾼 적이 있는가"를
-// 필드별로 추적해서, 유형을 바꿀 때 사용자가 손대지 않은 필드는 항상 새 기본값으로 갱신하고
-// (Full↔Half↔Custom 자유롭게 왕복 가능), 사용자가 실제로 직접 입력한 값은 유형이 바뀌어도 절대
-// 덮어쓰지 않는다.
-let SIM_RUN_DIST_TOUCHED = {};
 function renderSimulationTab(wrap){
   const editingRec = SIM_EDIT_ID ? STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID) : null;
   if(SIM_EDIT_ID && !editingRec) SIM_EDIT_ID=null; // stale id (e.g. deleted elsewhere) — fall back to add mode
   const editing = !!editingRec;
-  const initialType = editingRec?.type || "full";
-  // 수정 모드에서는 이미 실제 데이터가 들어있으니 전부 "손댄 것"으로 간주해 덮어쓰지 않고, 새 입력
-  // 모드에서는 전부 "기본값 상태"로 간주해 유형을 바꿀 때 자유롭게 갱신되도록 한다.
-  RUN_KEYS.forEach(k=>{ SIM_RUN_DIST_TOUCHED[k] = editing; });
   const runVal = (k,field)=> editingRec?.runs?.[k]?.[field];
   const stVal = (key,field)=> editingRec?.stations?.[key]?.[field];
+  const legacyType = editingRec?.type && editingRec.type!=="full" ? editingRec.type : null;
   wrap.innerHTML = `
     <div class="card">
-      <div class="row-between"><h2 class="section-title">🏁 Simulation 기록 ${editing?"수정":""}</h2>${editing?`<span class="chip" id="sim-edit-cancel" style="cursor:pointer;">수정 취소</span>`:""}</div>
-      <p class="lead" style="margin:6px 0 12px;">실제 대회가 아닌 자체 시뮬레이션 기록입니다. <b style="color:var(--orange);">대회 기록(STATE.races)과 완전히 분리된 별도 저장소</b>에 저장되어, Division 전환 계산이나 실제 대회 Backtest에 절대 섞이지 않습니다. 입력하지 않은 구간은 비워두면 됩니다 — 임의로 채우지 않습니다.</p>
+      <div class="row-between"><h2 class="section-title">🏁 Full Simulation 기록 ${editing?"수정":""}</h2>${editing?`<span class="chip" id="sim-edit-cancel" style="cursor:pointer;">수정 취소</span>`:""}</div>
+      <p class="lead" style="margin:6px 0 12px;">실제 대회가 아닌 자체 시뮬레이션 기록입니다. <b style="color:var(--orange);">대회 기록(STATE.races)과 완전히 분리된 별도 저장소</b>에 저장되어, Division 전환 계산이나 실제 대회 Backtest에 절대 섞이지 않습니다. 8 Run + 8 Station을 처음(Run 1 · SkiErg)부터 이어서 수행한 구간까지만 예상기록에 반영됩니다 — 중간에 끊긴 구간이나 순서를 벗어난 구간은 반영되지 않습니다. 총 기록/Transition은 8개 스테이션을 전부 순서대로 입력했을 때만 반영됩니다.</p>
+      ${legacyType ? `<div class="reason-line" style="margin-bottom:10px;padding:9px 11px;background:var(--surface2);border-radius:8px;">이 기록은 예전 "${legacyType==="half"?"Half":"Custom"} Simulation"으로 등록된 기록입니다 — Half/Custom 유형은 더 이상 새로 만들 수 없지만, 기존 기록은 그대로 보존되며 예측 반영 기준(처음부터 이어진 구간)은 동일하게 적용됩니다.</div>` : ""}
       <div class="grid grid-3">
         ${field("날짜", `<input id="sim-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(editingRec?.date||todayISO())}">`)}
-        ${field("유형", `<select id="sim-type">
-          <option value="full" ${(editingRec?.type||"full")==="full"?"selected":""}>Full Simulation</option>
-          <option value="half" ${editingRec?.type==="half"?"selected":""}>Half Simulation</option>
-          <option value="custom" ${editingRec?.type==="custom"?"selected":""}>Custom Simulation</option>
-        </select>`)}
         ${field("Division (수행 기준)", `<select id="sim-division"><option value="Open" ${(editingRec?.division||currentProfileDivisionBase())==="Open"?"selected":""}>Open</option><option value="Pro" ${(editingRec?.division||currentProfileDivisionBase())==="Pro"?"selected":""}>Pro</option></select>`)}
         ${field("총 기록 (선택, h:mm:ss)", `<input id="sim-total" placeholder="예: 1:32:00" value="${escapeHtml(editingRec?.totalTime||"")}">`)}
       </div>
       <p class="reason-line" style="margin:4px 0;">Division은 이 Simulation을 <b>어떤 기준(Open/Pro 하중)으로 수행했는지</b> 표시합니다 — 현재 프로필 Division과 다르면, 이 기록은 현재 예측에 직접 반영되지 않고 보존만 됩니다.</p>
-      <p class="reason-line" id="sim-type-hint" style="margin:10px 0 4px;">Full = Run 기본 1000m로 채워둡니다 (수정 가능). Half = 기본 500m로 채워두되 실제 수행 거리로 자유롭게 바꿔주세요. Custom = 거리를 직접 입력해주세요 (기본값 없음).</p>
-      <div class="eyebrow gray" style="margin-top:10px;margin-bottom:4px;">Run 1~8 (거리 + 기록)</div>
+      <div class="eyebrow gray" style="margin-top:10px;margin-bottom:4px;">Run 1~8 (거리 + 기록, 기본 1000m)</div>
       <div class="grid grid-4">
         ${RUN_KEYS.map(k=>`<div class="field"><label>Run ${k}</label><div class="hstack" style="gap:4px;">
-          <input id="sim-run${k}-dist" type="number" placeholder="m" style="width:70px;" value="${runVal(k,'distanceM') ?? (editing? "" : SIM_RUN_DEFAULT_DIST[initialType])}">
+          <input id="sim-run${k}-dist" type="number" placeholder="m" style="width:70px;" value="${runVal(k,'distanceM') ?? 1000}">
           <input id="sim-run${k}-time" placeholder="mm:ss" value="${escapeHtml(runVal(k,'time')||"")}">
         </div></div>`).join("")}
       </div>
@@ -12521,7 +12612,7 @@ function renderSimulationTab(wrap){
         </div></div>`).join("")}
       </div>
       <div class="grid grid-3" style="margin-top:10px;">
-        ${field("Transition/Roxzone (선택)", `<input id="sim-transition" placeholder="mm:ss" value="${escapeHtml(editingRec?.transition||"")}">`)}
+        ${field("Transition/Roxzone (선택, 8개 스테이션 전부 완료 시에만 반영)", `<input id="sim-transition" placeholder="mm:ss" value="${escapeHtml(editingRec?.transition||"")}">`)}
         ${field("메모 (선택)", `<input id="sim-note" placeholder="선택사항" value="${escapeHtml(editingRec?.note||"")}">`)}
       </div>
       <div style="margin-top:12px;"><button class="btn sm" id="sim-add">${editing?"수정 저장":"Simulation 기록 추가"}</button></div>
@@ -12532,7 +12623,7 @@ function renderSimulationTab(wrap){
       <h2 class="section-title">Simulation 기록 (${STATE.simulationTests.length})</h2>
       ${STATE.simulationTests.length? `<div style="overflow-x:auto;"><table style="margin-top:10px;"><thead><tr><th>날짜</th><th>유형</th><th>Division</th><th class="num">Run 입력수</th><th class="num">Station 입력수</th><th class="num">총기록</th><th></th></tr></thead>
         <tbody>${[...STATE.simulationTests].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr ${t.id===SIM_EDIT_ID?'style="background:var(--surface2);"':''}>
-          <td style="white-space:nowrap;">${t.date}</td><td>${t.type==="full"?"Full":t.type==="half"?"Half":"Custom"}</td>
+          <td style="white-space:nowrap;">${t.date}</td><td>${t.type==="full"||!t.type?"Full":t.type==="half"?"Half (구버전)":"Custom (구버전)"}</td>
           <td>${t.division||`<span style="color:var(--gray-dim);">미분류</span>`}</td>
           <td class="num mono">${Object.keys(t.runs||{}).length}</td><td class="num mono">${Object.keys(t.stations||{}).length}</td>
           <td class="num mono">${t.totalTime||"—"}</td>
@@ -12541,24 +12632,8 @@ function renderSimulationTab(wrap){
     </div>
   `;
   wrap.querySelector("#sim-edit-cancel")?.addEventListener("click",()=>{ SIM_EDIT_ID=null; renderAll(); });
-  RUN_KEYS.forEach(k=>{
-    wrap.querySelector(`#sim-run${k}-dist`)?.addEventListener("input", ()=>{ SIM_RUN_DIST_TOUCHED[k] = true; });
-  });
-  wrap.querySelector("#sim-type")?.addEventListener("change",(e)=>{
-    const type=e.target.value;
-    const defDist = SIM_RUN_DEFAULT_DIST[type];
-    RUN_KEYS.forEach(k=>{
-      const el=wrap.querySelector(`#sim-run${k}-dist`);
-      if(el && !SIM_RUN_DIST_TOUCHED[k]) el.value = defDist==null ? "" : defDist;
-    });
-    const hint=wrap.querySelector("#sim-type-hint");
-    if(hint) hint.textContent = type==="full" ? "Full = Run 기본 1000m로 채워둡니다 (수정 가능)."
-      : type==="half" ? "Half = 기본 500m로 채워두되 실제 수행 거리로 자유롭게 바꿔주세요."
-      : "Custom = 거리를 직접 입력해주세요 (기본값 없음).";
-  });
   wrap.querySelector("#sim-add").addEventListener("click",()=>{
     const statusEl=wrap.querySelector("#sim-status");
-    const type=wrap.querySelector("#sim-type").value;
     // spec: only include a run entry when the user actually filled a TIME for it — never invent an
     // entry from a leftover default distance with no time. distanceM stored alongside time exactly as
     // the user set it (or null if they left the distance field blank while still giving a time).
@@ -12586,7 +12661,10 @@ function renderSimulationTab(wrap){
     const division=wrap.querySelector("#sim-division").value;
     if(editing){
       const rec=STATE.simulationTests.find(s=>s.id===SIM_EDIT_ID);
-      if(rec){ rec.date=date; rec.type=type; rec.division=division; rec.runs=runs; rec.stations=stations;
+      // bug-safe: preserve the record's existing `type` (see mobile modal's identical comment) —
+      // this editor no longer exposes a type selector, so it must never silently upgrade an old
+      // Half/Custom record to "full".
+      if(rec){ rec.date=date; rec.division=division; rec.runs=runs; rec.stations=stations;
         rec.transition=transition||null; rec.totalTime=totalTime||null; rec.note=note||""; }
       persist(); showToast("Simulation 기록을 수정했습니다"); SIM_EDIT_ID=null; renderAll();
     } else {
@@ -12594,7 +12672,7 @@ function renderSimulationTab(wrap){
       // official-race Backtest / predictTime()/calcHPI()/computeTrainingPriority()/
       // computeStationPriority() code paths don't read from, by construction (none of those functions
       // reference STATE.simulationTests — verified, none touched in this change).
-      STATE.simulationTests.push({ id:uid(), date, type, division, runs, stations, transition:transition||null, totalTime:totalTime||null, note:note||"", source:"manual" });
+      STATE.simulationTests.push({ id:uid(), date, type:"full", division, runs, stations, transition:transition||null, totalTime:totalTime||null, note:note||"", source:"manual" });
       persist(); showToast("Simulation 기록이 추가되었습니다 (실제 대회 기록과 별도 저장)");
       statusEl.style.color="var(--green)"; statusEl.textContent="저장 완료";
       renderAll();
