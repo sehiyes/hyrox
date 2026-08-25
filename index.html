@@ -451,6 +451,7 @@ function indexStatusBand(score){
 
 let _pureCache = new Map();
 function memoPure(key, fn){
+  if(typeof _pureCache==="undefined" || !(_pureCache instanceof Map)) _pureCache = new Map();
   if(_pureCache.has(key)) return _pureCache.get(key);
   const v = fn();
   _pureCache.set(key, v);
@@ -6176,7 +6177,7 @@ function renderMyDnaPage(wrap){
       wrap.querySelector("#mydna-goto-record")?.addEventListener("click",()=>{ CURRENT_PAGE="myrecord"; renderAll(); });
       wrap.querySelector("#mydna-goto-goal")?.addEventListener("click",()=>{ CURRENT_PAGE="mygoal"; renderAll(); });
     }catch(err){
-      console.error("[My DNA Render Error]",err);
+      console.error("[My DNA Render Error]", err?.name || "Error", err?.message || err, err?.stack || "");
       if(token!==MY_DNA_RENDER_TOKEN || CURRENT_PAGE!=="mydna") return;
       wrap.innerHTML = `<div class="card" style="border:1px solid var(--red);margin-top:12px;">
         <div style="font-weight:800;color:var(--red);">Race DNA 계산을 완료하지 못했습니다.</div>
