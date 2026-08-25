@@ -10,7 +10,7 @@
   // HPS build cache-buster.
   // A new build version forces Safari/GitHub Pages to request this HTML again.
   (function(){
-    var HPS_BUILD_VERSION = "hyrox";
+    var HPS_BUILD_VERSION = "20260820-division-fix-02";
     try {
       var url = new URL(window.location.href);
       if (url.searchParams.get("hpsv") !== HPS_BUILD_VERSION) {
@@ -5836,8 +5836,13 @@ function myRecordHyroxSummary(){
 }
 function myRecordSimSummary(){ return [...STATE.simulationTests].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5); }
 function myRecord10kSummary(){
-  const time=STATE.running.tt10k||STATE.running.pb10k||null;
-  return { pb: STATE.running.pb10k||null, recent: time ? [{id:"running-tt10k",date:"",avgPaceSecKm:parseTimeToSec(time)/10,time}] : [] };
+  // The "10K TT" card must reflect the TT field only.
+  // pb10k is a separate PB/calibration value and must not resurrect a deleted TT.
+  const tt=STATE.running?.tt10k || null;
+  return {
+    pb: tt || null,
+    recent: tt ? [{id:"running-tt10k",date:"",avgPaceSecKm:parseTimeToSec(tt)/10,time:tt}] : []
+  };
 }
 function myRecordRowHtml(bigText, dateText, subText){
   return `<div class="row-between" style="padding:9px 0;border-bottom:1px solid var(--line);">
@@ -5995,20 +6000,9 @@ function open10kFullListModal(){ render10kFullListModal(); openModal(); }
 function render10kFullListModal(){
   const panel=document.getElementById("modal-panel");
   const list=runningTtRecords().filter(l=>Number(l.distanceKm)===10);
-  // 버그 수정: "러닝 능력치" 페이지에서 입력한 10K PB(STATE.running.pb10k)는 날짜가 없는 별도 필드라
-  // 위 기존 기록 목록에는 절대 나타나지 않았다 — 그래서 러닝 능력치에만 10K 기록을 적어둔 사람은
-  // "전체보기"를 눌러도 그 기록을 볼 수 없었다. 날짜가 없어 목록에 끼워 넣을 수는 없으니, 목록
-  // 맨 위에 출처를 명확히 표시한 별도 줄로 보여준다 (성능 테스트 기록과는 구분).
-  const pb10kSec = parseTimeToSec(STATE.running.pb10k || STATE.running.tt10k);
-  const pbAlreadyInList = list.length>0;
-  const pbRowHtml = (pb10kSec!=null && !pbAlreadyInList) ? `
-    <div class="row-between" style="padding:10px 0;border-bottom:1px solid var(--line);background:var(--surface2);">
-      <div>
-        <div style="font-family:var(--font-mono);font-size:15px;font-weight:700;">${escapeHtml(STATE.running.pb10k)}</div>
-        <div style="font-size:10.5px;color:var(--gray-dim);margin-top:1px;">날짜 미기재 · 기존 PB 값 (Calibration에서 기록 관리)</div>
-      </div>
-      <span class="chip" style="font-size:11px;cursor:pointer;" id="tenk-pb-goto-running">수정하러 가기</span>
-    </div>` : "";
+  // "10K TT 전체 기록"은 실제 TT만 보여준다.
+  // pb10k는 별도 PB/calibration 값이므로 TT를 삭제한 뒤 다시 표시되면 안 된다.
+  const pbRowHtml = "";
   panel.innerHTML = `
     <div class="modal-head"><div style="font-family:var(--font-display);font-weight:800;font-size:18px;">🏃 10K TT 전체 기록</div><span class="modal-close" id="tenklist-close">✕</span></div>
     <div style="display:flex;flex-direction:column;gap:2px;max-height:60vh;overflow-y:auto;">
@@ -6028,7 +6022,6 @@ function render10kFullListModal(){
   `;
   panel.querySelector("#tenklist-close").addEventListener("click", closeModal);
   panel.querySelector("#tenklist-add").addEventListener("click", ()=>open10kQuickAddModal());
-  panel.querySelector("#tenk-pb-goto-running")?.addEventListener("click", ()=>{ closeModal(); CURRENT_PAGE="strength"; STRENGTH_TAB="quicktest"; renderAll(); });
   panel.querySelectorAll(".tenk-edit").forEach(el=>el.addEventListener("click",()=>open10kQuickAddModal({id:el.dataset.id,date:"",avgPaceSecKm:parseTimeToSec(STATE.running.tt10k||"")/10})));
   panel.querySelectorAll(".tenk-del").forEach(el=>el.addEventListener("click",()=>delete10kRecord(el.dataset.id)));
 }
@@ -8797,7 +8790,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">최신 기록</option>
+          <option value="">최근 경기</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
@@ -8864,7 +8857,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="row-between"><h2 class="section-title">⏱️ 기록을 가장 많이 잃는 곳</h2><span class="mono" style="font-size:11px;color:var(--gray-dim);">총 손실 ${fmtTime(totalLossSec)}</span></div>
       ${lossTop3.length ? `<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;">
         ${lossTop3.map((c,i)=>`<div class="row-between"><span style="font-size:13px;">${["①","②","③"][i]} ${escapeHtml(c.label)}</span><span class="mono" style="color:var(--red);font-weight:700;">기준보다 +${fmtTime(c.timeLoss)}</span></div>`).join("")}
-      </div>` : `<div class="empty-note">뚜렷한 손실 구간이 보이지 않습니다.</div>`}
+      </div>` : `<div class="empty-note">현재 비교 기준보다 느린 구간이 없습니다.<br><span style="font-size:11px;color:var(--gray-dim);">모든 Station이 동일 비교그룹의 평균 기록보다 빠릅니다.</span></div>`}
     </div>
 
     <div class="card" style="border-left:3px solid var(--green);">
