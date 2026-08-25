@@ -719,6 +719,8 @@ function computeTrainingPriority(){
   return rows;
 }
 
+const LOAD_RATIO_OPEN_TO_PRO = { sledPush:202/152, sledPull:153/103, carry:64/48, lunge:30/20, wallball:9/6 };
+const LOAD_ELASTICITY = { sledPush:0.82, sledPull:0.85, carry:0.68, lunge:0.58, wallball:0.60 };
 function divisionLoadAdjustmentPct(stationKey, sourceIsPro, targetIsPro){
   if(sourceIsPro===targetIsPro) return 0;
   const ratio=LOAD_RATIO_OPEN_TO_PRO[stationKey];
@@ -1988,9 +1990,17 @@ function saveRunningTT({distanceKm,time,date,source="calibration",note="Running 
 }
 function deleteRunningTT(id){
   const opt=RUN_TT_OPTIONS.find(o=>`running-${o.key}`===id);
-  if(opt) STATE.running[opt.field]="";
-  refreshRunningTtMirrors();
-  persist(); renderAll();
+  if(!opt) return;
+  const deletedValue=STATE.running?.[opt.field] || "";
+  STATE.running[opt.field]="";
+  // TT values can previously have been promoted into the PB field.
+  // Remove that mirror only when it is exactly the deleted TT value;
+  // a separately-entered/faster PB must remain untouched.
+  if(opt.pbField && STATE.running?.[opt.pbField]===deletedValue){
+    STATE.running[opt.pbField]="";
+  }
+  persist();
+  renderAll();
 }
 function editRunningTT(id){
   const opt=RUN_TT_OPTIONS.find(o=>`running-${o.key}`===id);
@@ -5907,8 +5917,15 @@ function open10kQuickAddModal(existing=null){
 }
 function delete10kRecord(id){
   if(!confirm("이 10K TT 기록을 삭제할까요? 삭제 후에는 되돌릴 수 없습니다.")) return;
-  if(id==="running-tt10k"){ STATE.running.tt10k=""; }
-  persist(); showToast("10K TT 기록을 삭제했습니다"); render10kFullListModal();
+  if(id==="running-tt10k"){
+    const deletedValue=STATE.running?.tt10k || "";
+    STATE.running.tt10k="";
+    // Keep a separately entered PB, but remove the PB mirror created from this TT.
+    if(STATE.running?.pb10k===deletedValue) STATE.running.pb10k="";
+  }
+  persist();
+  showToast("10K TT 기록을 삭제했습니다");
+  render10kFullListModal();
 }
 function render10kQuickAddModal(){
   const panel=document.getElementById("modal-panel"); const d=TENK_QUICK_DRAFT; const editing=!!TENK_EDIT_ID;
@@ -8987,18 +9004,56 @@ function buildStrengthsTop3(segments){
 // in the separate 기록 손실 분석 section) + a specific "Running 지속력" item when measured post-station
 // degradation (computeStationInducedDegradation, already real data) is large enough to call out.
 function buildImprovementTop3(impactList, race){
-  const stationItems = impactList.filter(c=>c.key!=="run" && c.timeLoss>0).slice(0,3)
+  // Primary ranking: measured time-loss bottlenecks.
+  const stationItems = impactList.filter(c=>c.key!=="run" && Number.isFinite(c.timeLoss) && c.timeLoss>0).slice(0,3)
     .map(c=>({ label:c.label, key:c.key, reason:`기준 기록보다 ${fmtTime(Math.abs(c.timeLoss))} 느림` }));
   const items=[...stationItems];
+
+  // Keep the existing Station → Run degradation signal.
   const degradation=computeStationInducedDegradation(race);
-  const topDeg=degradation.find(d=>d.degradationSec>0);
-  if(topDeg){
+  const topDeg=degradation.find(d=>Number.isFinite(d.degradationSec) && d.degradationSec>0);
+  if(topDeg && Number.isFinite(topDeg.baselineSec) && topDeg.baselineSec>0){
     const pct=(topDeg.degradationSec/topDeg.baselineSec)*100;
     if(pct>=8){
       const degItem={ label:"Running 지속력", key:"run_fatigue", reason:`${topDeg.label} 이후 Running 페이스가 평균보다 ${round1(pct)}% 이상 저하` };
-      if(items.length<3) items.push(degItem); else items[2]=degItem;
+      if(!items.some(x=>x.key===degItem.key)){
+        if(items.length<3) items.push(degItem); else items[2]=degItem;
+      }
     }
   }
+
+  // Fallback: if there is no positive time-loss bottleneck, do not hide the section.
+  // Use the lowest real peer percentiles from the SAME DNA analysis. This is still
+  // peer-comparison data, not training/recovery logic or a new benchmark.
+  if(!items.length){
+    const fallback = (impactList||[])
+      .filter(c=>c.key!=="run" && Number.isFinite(c.percentile))
+      .sort((a,b)=>a.percentile-b.percentile)
+      .slice(0,3)
+      .map(c=>({
+        label:c.label,
+        key:c.key,
+        reason:`비교 그룹 대비 ${Math.round(c.percentile)}점 — 현재 기록에서 상대적으로 낮은 영역`
+      }));
+    items.push(...fallback);
+  }
+
+  // If stations are absent/insufficient, include Running as a single aggregated
+  // candidate when its eight run legs have a real percentile signal.
+  if(items.length<3){
+    const runSegs=(impactList||[]).filter(c=>c.key==="run" && Number.isFinite(c.percentile));
+    if(runSegs.length){
+      const r=runSegs[0];
+      if(!items.some(x=>x.key==="run")){
+        items.push({
+          label:"Running",
+          key:"run",
+          reason:`비교 그룹 대비 ${Math.round(r.percentile)}점 — 상대적으로 낮은 수행 영역`
+        });
+      }
+    }
+  }
+
   return items.slice(0,3);
 }
 /* ---------------------------------------------------------------------- */
@@ -9700,7 +9755,7 @@ function renderAccount(wrap){
         ${field("나이", `<input id="account-profile-age" type="number" min="16" max="90" inputmode="numeric" placeholder="예: 35" value="${escapeHtml(String(STATE.profile.age||""))}">`)}
       </div>
       <div class="hstack" style="margin-top:10px;gap:8px;align-items:center;">
-        <button class="btn sm" id="account-profile-save">성별·나이 저장</button>
+        <button class="btn sm" id="account-profile-save">저장</button>
         <span class="reason-line">저장하면 DNA/포디움 비교 기준에 즉시 반영됩니다.</span>
       </div>
     </div>
@@ -9727,7 +9782,7 @@ function renderAccount(wrap){
     if(!["female","male"].includes(gender) || !Number.isFinite(age) || age<16 || age>90){ showToast("성별과 나이를 정확히 입력해주세요"); return; }
     STATE.profile.gender=gender; STATE.profile.age=age;
     await persistNow();
-    showToast("성별·나이가 저장되었습니다");
+    showToast("저장되었습니다.");
     renderAll();
   });
   wrap.querySelector("#sb-signin")?.addEventListener("click",async ()=>{
