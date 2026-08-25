@@ -449,6 +449,7 @@ function indexStatusBand(score){
   return { label:"주요 개선 영역", color:"var(--red)" };
 }
 
+let _pureCache = new Map();
 function memoPure(key, fn){
   if(_pureCache.has(key)) return _pureCache.get(key);
   const v = fn();
