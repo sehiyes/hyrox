@@ -4868,9 +4868,23 @@ function computePeerAnalysisUncached(forceNoFilter){
   // ---- Impact Score (weighted contribution of each bottleneck to total time lost) ----
   const runTimeLoss = runSegs.length===8 ? runSegs.reduce((s,r)=>s+r.timeLoss,0) : null;
   const impactCandidates = [];
-  if(runTimeLoss!=null) impactCandidates.push({ key:"run", label:"Running (8구간 합)", timeLoss:runTimeLoss, weight:IMPACT_WEIGHTS.run });
+  if(runTimeLoss!=null){
+    const runPercentiles=runSegs.filter(s=>Number.isFinite(s.percentile)).map(s=>s.percentile);
+    impactCandidates.push({
+      key:"run", label:"Running (8구간 합)", timeLoss:runTimeLoss, weight:IMPACT_WEIGHTS.run,
+      percentile:runPercentiles.length ? mean(runPercentiles) : null
+    });
+  }
   ["ski","sledPush","sledPull","burpee","row","carry","lunge","wallball"].forEach(k=>{
-    const s=byKey(k); if(s && s.actual!=null) impactCandidates.push({ key:k, label:s.label, timeLoss:s.timeLoss, weight:IMPACT_WEIGHTS[k] });
+    const s=byKey(k);
+    if(s && s.actual!=null){
+      // Carry the SAME peer percentile already displayed in Station별 수행력
+      // into the improvement-priority ranking. No new benchmark/statistic is created.
+      impactCandidates.push({
+        key:k, label:s.label, timeLoss:s.timeLoss, weight:IMPACT_WEIGHTS[k],
+        percentile:Number.isFinite(s.percentile) ? s.percentile : null
+      });
+    }
   });
   const totalWeightedLoss = impactCandidates.reduce((sum,c)=>sum+Math.max(0,c.timeLoss)*c.weight,0);
   const impactList = impactCandidates.map(c=>({ ...c, impactPct: totalWeightedLoss>0 ? (Math.max(0,c.timeLoss)*c.weight/totalWeightedLoss)*100 : 0 }))
