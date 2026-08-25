@@ -6182,6 +6182,7 @@ function renderMyDnaPage(wrap){
       wrap.innerHTML = `<div class="card" style="border:1px solid var(--red);margin-top:12px;">
         <div style="font-weight:800;color:var(--red);">Race DNA 계산을 완료하지 못했습니다.</div>
         <div class="reason-line" style="margin-top:6px;">기록은 유지되어 있습니다. 아래 버튼으로 다시 계산할 수 있습니다.</div>
+        <div class="reason-line" style="margin-top:10px;padding:8px;border-radius:8px;background:var(--surface2);font-family:monospace;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;">오류: ${escapeHtml(String(err?.name||"Error"))} — ${escapeHtml(String(err?.message||err||"알 수 없는 오류"))}</div>
         <button class="btn sm" id="dna-retry" style="margin-top:10px;">다시 계산</button>
       </div>`;
       wrap.querySelector("#dna-retry")?.addEventListener("click",()=>renderAll());
