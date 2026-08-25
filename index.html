@@ -452,6 +452,26 @@ function showToast(msg){
   showToast._tm=setTimeout(()=>t.classList.remove("show"),2200);
 }
 
+function indexStatusBand(score){
+  if(score==null) return { label:"데이터 부족", color:"var(--gray-dim)" };
+  if(score>=90) return { label:"매우 강점", color:"var(--green)" };
+  if(score>=80) return { label:"강점", color:"var(--green)" };
+  if(score>=70) return { label:"양호", color:"var(--low)" };
+  if(score>=60) return { label:"개선 여지", color:"var(--amber)" };
+  return { label:"주요 개선 영역", color:"var(--red)" };
+}
+
+function memoPure(key, fn){
+  if(_pureCache.has(key)) return _pureCache.get(key);
+  const v = fn();
+  _pureCache.set(key, v);
+  return v;
+}
+
+function pureCacheProfileKey(){
+  const p=STATE.profile;
+  return [p.division,p.goalDivision,p.gender,p.goalGender,p.age,p.goalAgeGroup].join("|");
+}
 /* ---------------------------------------------------------------------- */
 /* 2. STORAGE (persistent, artifact-safe: window.storage w/ in-memory fallback) */
 /* ---------------------------------------------------------------------- */
