@@ -379,6 +379,72 @@ const INDEX_META = {
   }
 };
 
+/* ---------------------------------------------------------------------- */
+/* 1. UTILS                                                                */
+/* ---------------------------------------------------------------------- */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const round1=(v)=>Math.round(v*10)/10;
+const uid=()=>Math.random().toString(36).slice(2,10);
+const todayISO=()=>new Date().toISOString().slice(0,10);
+const daysBetween=(a,b)=>Math.round((new Date(b)-new Date(a))/86400000);
+const weeksBetween=(a,b)=>daysBetween(a,b)/7;
+
+function fmtTime(totalSec){
+  if(totalSec==null||isNaN(totalSec))return "--:--";
+  totalSec=Math.round(totalSec);
+  const h=Math.floor(totalSec/3600), m=Math.floor((totalSec%3600)/60), s=totalSec%60;
+  if(h>0)return `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+function parseTimeToSec(str){
+  if(str===undefined||str===null||str==="")return null;
+  const parts=String(str).split(":").map(Number);
+  if(parts.some((p)=>isNaN(p)))return null;
+  if(parts.length===3)return parts[0]*3600+parts[1]*60+parts[2];
+  if(parts.length===2)return parts[0]*60+parts[1];
+  return Number(parts[0]);
+}
+function fmtPace(secPerKm){
+  if(secPerKm==null||isNaN(secPerKm))return "--:--/km";
+  return fmtTime(secPerKm)+"/km";
+}
+// lower-is-better normalization: score = (benchmark/actual)*100, capped [0,100]
+function scoreLowerBetter(actual, benchmark){
+  if(!actual||actual<=0||!benchmark)return null;
+  return clamp((benchmark/actual)*100,0,100);
+}
+// higher-is-better normalization: score = (actual/target)*100, capped [0,100]
+function scoreHigherBetter(actual, target){
+  if(actual==null||!target)return null;
+  return clamp((actual/target)*100,0,100);
+}
+function weightedAvg(pairs){ // [[score,weight], ...] ignoring nulls, renormalizing weights
+  const valid=pairs.filter(p=>p[0]!=null && !isNaN(p[0]));
+  if(!valid.length)return null;
+  const wsum=valid.reduce((s,p)=>s+p[1],0);
+  return valid.reduce((s,p)=>s+p[0]*p[1],0)/wsum;
+}
+function mean(arr){ arr=arr.filter(v=>v!=null&&!isNaN(v)); return arr.length? arr.reduce((a,b)=>a+b,0)/arr.length : null; }
+// linear-interpolation percentile (0..1), used by the event-based Podium benchmark below — a single
+// very fast/slow event never dominates since it's one data point among many events, not a raw row.
+function percentileOf(arr, p){
+  const a=arr.filter(v=>v!=null&&!isNaN(v)).sort((x,y)=>x-y);
+  if(!a.length) return null;
+  if(a.length===1) return a[0];
+  const idx=(a.length-1)*p;
+  const lo=Math.floor(idx), hi=Math.ceil(idx);
+  if(lo===hi) return a[lo];
+  return a[lo] + (a[hi]-a[lo])*(idx-lo);
+}
+function medianOf(arr){ return percentileOf(arr, 0.5); }
+function stdev(arr){
+  arr=arr.filter(v=>v!=null&&!isNaN(v));
+  if(arr.length<2)return 0;
+  const m=mean(arr); return Math.sqrt(mean(arr.map(v=>(v-m)**2)));
+}
+function escapeHtml(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+
 function showToast(msg){
   const t=document.getElementById("toast");
   t.textContent=msg; t.classList.add("show");
