@@ -10,7 +10,7 @@
   // HPS build cache-buster.
   // A new build version forces Safari/GitHub Pages to request this HTML again.
   (function(){
-    var HPS_BUILD_VERSION = "20260820-division-fix-02";
+    var HPS_BUILD_VERSION = "hyrox";
     try {
       var url = new URL(window.location.href);
       if (url.searchParams.get("hpsv") !== HPS_BUILD_VERSION) {
@@ -8797,7 +8797,7 @@ function renderPeerResult(wrap, analysis, allRacesForFilter, token){
       <div class="hstack" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span style="font-size:12px;color:var(--gray-dim);">기준 경기</span>
         <select id="dna-race-filter" style="max-width:260px;">
-          <option value="">전체 (최근 경기 가중 평균)</option>
+          <option value="">최신 기록</option>
           ${allRacesForFilter.map(r=>`<option value="${r.id}" ${DNA_RACE_FILTER===r.id?"selected":""}>${escapeHtml(r.name||r.date)} (${r.date}, ${escapeHtml(normalizeRaceDivision(r.division)||r.division)})</option>`).join("")}
         </select>
       </div>
