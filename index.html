@@ -350,34 +350,22 @@ const BENCH = {
 const WEEKDAYS = ["월","화","수","목","금","토","일"];
 
 const INDEX_META = {
-  running:    { label:"Running Index",              emoji:"🏃", friendly:"러닝 능력",
+  running:    { label:"Running Index",           emoji:"🏃", friendly:"러닝 능력",
                 oneLiner:"HYROX 8km 러닝을 빠르고 안정적으로 유지하는 능력",
                 why:"HYROX 총 시간의 약 절반(8km)이 러닝이므로 가장 큰 비중을 둡니다." },
-  engine:     { label:"Engine Index",                emoji:"❤️", friendly:"심폐 지구력",
+  engine:     { label:"Engine Index",             emoji:"❤️", friendly:"심폐 지구력",
                 oneLiner:"SkiErg·Row·Burpee 등 심폐 부담이 큰 구간에서 높은 강도를 유지하는 능력",
                 why:"SkiErg/Row/Burpee는 심폐 엔진 의존도가 높아 유산소 능력을 대표합니다." },
-  strengthEnd:{ label:"Strength Endurance Index",    emoji:"💪", friendly:"힘 지속력",
+  strengthEnd:{ label:"Strength Endurance Index", emoji:"💪", friendly:"힘 지속력",
                 oneLiner:"Sled Push/Pull·Lunge·Carry 등에서 힘을 반복적으로 유지하는 능력",
                 why:"Sled/Lunge/기초근력은 파워-지구력 복합 요구를 반영합니다." },
-  skill:      { label:"HYROX Skill Index",           emoji:"🎯", friendly:"HYROX 기술·효율",
+  skill:      { label:"HYROX Skill Index",        emoji:"🎯", friendly:"HYROX 기술·효율",
                 oneLiner:"Wall Ball·동작 효율·전환 등 기술적인 경기 수행 능력",
                 why:"Wall Ball·전환 효율은 기술/경기운영 숙련도를 나타냅니다." },
-  async set(key, value){
-    MEM_FALLBACK[key]=value;
-    let persisted=false;
-    try{
-      if(window.storage && window.storage.set){
-        await window.storage.set(key, JSON.stringify(value), false);
-        persisted=true;
-      }
-    }catch(e){
-      // transient platform-side hiccup — MEM_FALLBACK above already keeps data intact for this session,
-      // so this is non-fatal. Log once rather than spamming on every keystroke's debounced autosave.
-      if(!storageWarned){ console.warn("자동저장에 일시적 문제가 있습니다 (세션 내 데이터는 유지됩니다):", e?.message||e); storageWarned=true; }
-    }
-    if(!persisted) lsSet(key, value);
-  }
-};
+  raceExec:   { label:"Race Execution Index",     emoji:"⏱️", friendly:"레이스 운영",
+                oneLiner:"페이스 배분·전환 속도·후반 페이스 유지 등 경기 운영 능력",
+                why:"페이싱 균일성·전환속도는 실전 경기운영 능력을 나타냅니다." },
+};;
 
 /* ---------------------------------------------------------------------- */
 /* 1. UTILS                                                                */
@@ -471,6 +459,545 @@ function memoPure(key, fn){
 function pureCacheProfileKey(){
   const p=STATE.profile;
   return [p.division,p.goalDivision,p.gender,p.goalGender,p.age,p.goalAgeGroup].join("|");
+}
+function bodyMetricChange(field, days=30){
+  const s=sortedBodyMetrics().filter(m=>m[field]!=null);
+  if(s.length<2) return null;
+  const latest=s[s.length-1];
+  const cutoff=new Date(); cutoff.setDate(cutoff.getDate()-days);
+  const cutoffStr=cutoff.toISOString().slice(0,10);
+  const earlierCandidates=s.filter(m=>m.date<=cutoffStr);
+  const compare = earlierCandidates.length? earlierCandidates[earlierCandidates.length-1] : s[0];
+  if(compare.id===latest.id) return null;
+  return { latest:latest[field], compare:compare[field], delta:latest[field]-compare[field], compareDate:compare.date };
+}
+
+function buildSegmentGapAnalysis(){
+  const model=buildRaceSegmentModel();
+  const dRace=daysToRace();
+  const hasRaceDate = dRace!=null;
+  const weeksToRace = hasRaceDate ? clamp(dRace/7, 0.5, 52) : 8; // no race date set -> neutral 8wk assumption, flagged in UI
+  const segments=model.segments.map(s=>calculateSegmentPotential(s, weeksToRace));
+  const totals={
+    conservative: segments.reduce((s,x)=>s+x.conservativeSec,0),
+    realistic:    segments.reduce((s,x)=>s+x.realisticSec,0),
+    aggressive:   segments.reduce((s,x)=>s+x.aggressiveSec,0),
+  };
+  // BUG FIX (audit item #1/#8): this used to always report the 17-segment-model total (model.total)
+  // as "현재 예상 기록", regardless of whether getBaselineTime() — the function the 기록 예측 page
+  // actually uses — would have trusted a fresher single official race time instead. That's exactly
+  // why Goal Setting (segment-model total) and Prediction (fresh-race-first) could disagree even for
+  // the SAME division. Now both read through the identical getCurrentPerformanceBaseline() cascade;
+  // `model`/`model.total` are kept below for the per-segment breakdown (still real and useful), just
+  // no longer used as the top-line number.
+  const currentEstimate = getCurrentPerformanceBaseline(calcHPI()).value;
+  return { segments, totals, weeksToRace, hasRaceDate, currentEstimate, model };
+}
+
+function calcHPI(tier1Only=false){
+  return memoPure("hpi:"+(tier1Only?1:0)+":"+pureCacheProfileKey(), ()=>calcHPIUncached(tier1Only));
+}
+
+function calcRunningIndex(tier1Only=false){
+  const b=bench(); const race=latestRace();
+  const detail=[];
+  let racePaceScore=null;
+  if(race){
+    const runsSec=RUN_KEYS.map(k=>parseTimeToSec(race.runs?.[k])).filter(v=>v!=null);
+    if(runsSec.length){
+      const avgSplit=mean(runsSec);
+      racePaceScore=scoreLowerBetter(avgSplit,b.runKm);
+      detail.push(`최근 대회 평균 러닝 스플릿 ${fmtTime(avgSplit)}/km vs 기준 ${fmtTime(b.runKm)}/km`);
+    }
+  }
+  let pbScore=null;
+  const pb5=parseTimeToSec(STATE.running.pb5k), pb10=parseTimeToSec(STATE.running.pb10k), pbH=parseTimeToSec(STATE.running.pbHalf);
+  const paces=[];
+  if(pb5) paces.push(pb5/5);
+  if(pb10) paces.push(pb10/10);
+  if(pbH) paces.push(pbH/21.0975);
+  if(paces.length){
+    const best=Math.min(...paces);
+    pbScore=scoreLowerBetter(best,b.runKm*0.85);
+    detail.push(`최고 PB 페이스 ${fmtTime(best)}/km`);
+  }
+  const score=weightedAvg([[racePaceScore,0.60],[pbScore,0.40]]);
+  return { score, detail, sub:{racePaceScore,pbScore} };
+}
+
+function calculateTargetGap(){
+  const targetSec=parseTimeToSec(STATE.profile.targetTime);
+  if(!targetSec) return null;
+  const gapAnalysis=buildSegmentGapAnalysis();
+  // Goal-aware override for the AGGREGATE current estimate ONLY (see getGoalAwareBaseline() header) —
+  // when a separate goalDivision is set and differs from the base division, the top-line "현재 예상
+  // 기록"/gap number comes from the same predictDivisionTransition() the Division 전환 예측 page uses,
+  // instead of the raw same-division 17-segment sum. Per-segment breakdown below (which still reflects
+  // the athlete's OWN training data structure) is intentionally left as-is — reallocating gap seconds
+  // across segments the athlete has real data for is still useful context even when the headline number
+  // is division-converted; segmentGoalAware.debug records which path was actually used.
+  // V3 (§14): Division 전환 변환 경로 대신, 목표 Division의 Exact Race Division 컨텍스트에서
+  // 직접 계산한다. Division 전환 예측은 독립 페이지로 그대로 유지된다.
+  const goalDivGap = normalizeRaceDivision(STATE.profile.goalDivision) || "Open Doubles";
+  const baseDivGap = normalizeRaceDivision(STATE.profile.division);
+  const raceOnlyGap=raceOnlyPrediction(goalDivGap);
+  const goalAware = { value:raceOnlyGap.predicted, source:`Race-only Performance (${goalDivGap})`,
+    debug:{path:"race-only-v5", division:goalDivGap, usedConversion:raceOnlyGap.sourceDivisions.some(x=>x!==goalDivGap), hpiExcluded:true} };
+  const currentEstimate = goalAware.debug.usedConversion ? goalAware.value : gapAnalysis.currentEstimate;
+  const totalGapSec=currentEstimate-targetSec; // positive = need to get faster
+
+  if(totalGapSec<=0){
+    return { targetSec, totalGapSec, currentEstimate, alreadyMet:true,
+      segments:[], gapAnalysis, feasibility:"already-met", goalAwareDebug:goalAware.debug };
+  }
+  const {realistic:sumRealistic, aggressive:sumAggressive} = gapAnalysis.totals;
+
+  // P05 ceiling per segment (spec §2/§3/§9) + bounded priority weight (spec §4/§5/§6/§7) — falls back
+  // to this segment's existing aggressiveSec ceiling if no peer benchmark stats are resolvable at all
+  // (e.g. DERIVED_BENCHMARK not yet loaded and no illustrative fallback matched), so nothing here ever
+  // regresses to "no ceiling" just because a lookup came back empty.
+  const withCeiling = gapAnalysis.segments.map(s=>{
+    const p05Sec = getSegmentP05Sec(s.key);
+    const maxImprovementSec = p05Sec!=null ? Math.max(0, s.currentSec-p05Sec) : s.aggressiveSec;
+    const priorityWeight = targetGapPriorityWeight(s);
+    return { ...s, p05Sec, maxImprovementSec, priorityWeight };
+  });
+  const sumP05Ceiling = withCeiling.reduce((sum,s)=>sum+s.maxImprovementSec,0);
+
+  const { pool, unallocatedSec } = waterFillAllocate(
+    withCeiling.map(s=>({ key:s.key, weight:s.priorityWeight, ceiling:s.maxImprovementSec })),
+    totalGapSec
+  );
+  const allocatedByKey = new Map(pool.map(p=>[p.key, p.allocated]));
+  const segments = withCeiling.map(s=>({ ...s, allocatedSec: allocatedByKey.get(s.key)||0, weight: s.priorityWeight }))
+    .sort((a,b)=>b.allocatedSec-a.allocatedSec);
+
+  // feasibility: sumRealistic/sumAggressive stay as informational bands (unchanged meaning — "would a
+  // Conservative/Aggressive training push, summed across all 17 segments, cover this gap"), but the P05
+  // ceiling sum is now the AUTHORITATIVE hard limit (spec §8) — totalGapSec can never actually be placed
+  // beyond it, however generous "aggressive" looked.
+  let feasibility;
+  if(totalGapSec<=sumRealistic) feasibility="realistic";
+  else if(totalGapSec<=sumAggressive) feasibility="aggressive";
+  else if(totalGapSec<=sumP05Ceiling) feasibility="stretch-to-p05";
+  else feasibility="beyond-p05"; // target gap exceeds even the P05(top-5%)-ceiling summed across all 17 segments
+
+  return { targetSec, totalGapSec, currentEstimate, alreadyMet:false,
+    segments, sumRealistic, sumAggressive, sumP05Ceiling, unallocatedSec, feasibility,
+    weeksToRace:gapAnalysis.weeksToRace, hasRaceDate:gapAnalysis.hasRaceDate,
+    goalAwareDebug:goalAware.debug };
+}
+
+function clearLocalDraft(key){ try{ localStorage.removeItem(`hps:draft:${key}`); }catch(e){} }
+
+function compareAllDivisionsV3(){
+  const rows=RACE_DIVISIONS.map(div=>withPredictionContext({mode:"race",division:div},()=>{
+    const ctx=activePredictionContext(), hpi=calcHPI();
+    const a=computeRaceAnchorV3(hpi,ctx);
+    const p=(w)=>predictTime(hpi,w).predicted;
+    const dRace=daysToRace();
+    const topExact=a.recentActual;
+    const topContrib=a.v3.contributions.slice().sort((x,y)=>y.weight-x.weight)[0]||{};
+    return { Division:div,
+      Current:fmtTime(a.value), "4주":fmtTime(p(4)), "8주":fmtTime(p(8)), "12주":fmtTime(p(12)),
+      "RaceDay": dRace!=null? fmtTime(p(clamp(dRace/7,0,20))) : "—",
+      CurrentSource: topContrib.label||a.source,
+      SourceDivision: topContrib.sourceDivision||"—",
+      SourceDate: topContrib.sourceDate||"—",
+      Freshness: topContrib.freshnessWeight!=null? topContrib.freshnessWeight : "—",
+      WorkloadRatio: a.v3.workloadModel.totalRatioVsOpenSingles,
+      ExactRecord: topExact? `${topExact.date} ${fmtTime(topExact.value)}` : "없음" };
+  }));
+  try{ console.table(rows); }catch(e){ console.log(rows); }
+  return rows;
+}
+
+function computePredictionAccuracy(){
+  const races=[...STATE.races].filter(r=>r.officialTime && parseTimeToSec(r.officialTime)!=null).sort((a,b)=>a.date.localeCompare(b.date));
+  const snapshots=[...STATE.predictionHistory].sort((a,b)=>a.date.localeCompare(b.date));
+  const matched=[];
+  snapshots.forEach(snap=>{
+    const nextRace=races.find(r=>r.date>snap.date);
+    if(!nextRace || snap.predictedSec==null) return;
+    const actualSec=parseTimeToSec(nextRace.officialTime);
+    const errorSec=actualSec-snap.predictedSec;                 // signed: positive = actual slower than predicted
+    const absErrorSec=Math.abs(errorSec);
+    const withinRange = (snap.ciLow!=null && snap.ciHigh!=null) ? (actualSec>=snap.ciLow && actualSec<=snap.ciHigh) : null;
+    // PHASE 5 STEP 5-B — shadow-match Candidate V1/V2 against the same actual result, IF this snapshot
+    // happened to capture them (older snapshots recorded before Step 5/5-B won't have these fields —
+    // left as null/undefined, never fabricated). Purely additive: does not touch errorSec/absErrorSec/
+    // withinRange above, which getRangeCalibrationMultiplier() depends on for Production range tuning.
+    const v1ErrorSec = snap.candidateV1Sec!=null ? actualSec-snap.candidateV1Sec : null;
+    const v2ErrorSec = snap.candidateV2Sec!=null ? actualSec-snap.candidateV2Sec : null;
+    matched.push({ snapDate:snap.date, raceDate:nextRace.date, predictedSec:snap.predictedSec, actualSec,
+      errorSec, absErrorSec, withinRange, confidenceLabel:snap.confidenceLabel,
+      candidateV1Sec: snap.candidateV1Sec ?? null, v1ErrorSec, v1AbsErrorSec: v1ErrorSec!=null?Math.abs(v1ErrorSec):null,
+      candidateV2Sec: snap.candidateV2Sec ?? null, v2ErrorSec, v2AbsErrorSec: v2ErrorSec!=null?Math.abs(v2ErrorSec):null });
+  });
+  if(matched.length<2) return { sufficient:false, matchedCount:matched.length, matched };
+  const maeSec = mean(matched.map(m=>m.absErrorSec));
+  const meanErrorSec = mean(matched.map(m=>m.errorSec)); // spec ⑨: Mean Bias — signed, actual-predicted
+  const errSorted=matched.map(m=>m.errorSec).sort((a,b)=>a-b);
+  const mid=Math.floor(errSorted.length/2);
+  const medianErrorSec = errSorted.length%2 ? errSorted[mid] : (errSorted[mid-1]+errSorted[mid])/2;
+  const withRange=matched.filter(m=>m.withinRange!=null);
+  const coverage = withRange.length ? withRange.filter(m=>m.withinRange).length/withRange.length : null;
+  // shadow-backtest aggregates for V1/V2 — only over the subset of matched rows that actually captured
+  // that candidate (real users' history will be a mix of pre/post-Step-5 snapshots for a while)
+  const withV1 = matched.filter(m=>m.v1AbsErrorSec!=null), withV2 = matched.filter(m=>m.v2AbsErrorSec!=null);
+  const shadowV1 = withV1.length ? { n:withV1.length, maeSec: mean(withV1.map(m=>m.v1AbsErrorSec)), biasSec: mean(withV1.map(m=>m.v1ErrorSec)) } : null;
+  const shadowV2 = withV2.length ? { n:withV2.length, maeSec: mean(withV2.map(m=>m.v2AbsErrorSec)), biasSec: mean(withV2.map(m=>m.v2ErrorSec)) } : null;
+  return { sufficient:true, matchedCount:matched.length, matched, maeSec, meanErrorSec, medianErrorSec, coverage, coverageSampleSize:withRange.length,
+    shadowV1, shadowV2 }; // additive fields — nothing above this line changed
+}
+
+function computeStationPriority(){
+  const meta=getStationDataMeta();
+  const b=bench();
+  const hpiResult=calcHPI();
+  const dRace=daysToRace();
+  const weeksToRace = dRace!=null ? clamp(dRace/7,0.5,52) : 8;
+  const maxImpact=Math.max(...Object.values(IMPACT_WEIGHTS));
+  const ageBand = deriveAgeBand(STATE.profile.age);
+  const benchGender = deriveBenchmarkGender();
+  const rows=[];
+  STATIONS.forEach(s=>{
+    const m=meta[s.key];
+    if(!m || !m.value) return; // no real record for this station -> excluded, never fabricated
+    const actualSec=parseTimeToSec(m.value);
+    // Phase 2-2: real Asia/Global Derived Benchmark preferred over the static hardcoded BENCH table,
+    // via the fixed fallback chain (queryDerivedBenchmark) — falls through to the exact previous
+    // behavior (bench()) whenever nothing is imported yet or no group in the chain has enough sample.
+    const derived = queryDerivedBenchmark(STATE.profile.division, benchGender, ageBand, s.key);
+    const benchSec = derived ? derived.p50 : b[s.key];
+    if(!actualSec || !benchSec) return;
+    const gapPct = (actualSec-benchSec)/benchSec; // positive = slower than benchmark
+    const performanceGap = clamp(gapPct,0,1.5)/1.5; // only "slower than bench" counts toward priority
+    const raceImpact = clamp((IMPACT_WEIGHTS[s.key]||5)/maxImpact,0,1);
+    const trainability = STATION_TRAINABILITY[s.key] ?? 0.7;
+    const parentIndex = STATION_PARENT_INDEX[s.key];
+    const urgency = computeUrgency(parentIndex, weeksToRace);
+    const dataConfidence = m.isFresh ? 1.0 : 0.6;
+    const recoveryModifier = computeRecoveryModifier(parentIndex, hpiResult.fatigue);
+    const priorityScore = performanceGap*raceImpact*trainability*urgency*dataConfidence*recoveryModifier*100;
+    rows.push({ key:s.key, label:s.label, actualSec, benchSec, gapPct, priorityScore, isFresh:m.isFresh, ageDays:m.ageDays,
+      benchSource: derived ? derived.benchmark_source : "STATIC_FALLBACK",
+      benchConfidence: derived ? derived.confidence : "LOW",
+      benchSampleN: derived ? derived.sample_n : null });
+  });
+  rows.sort((a,b2)=>b2.priorityScore-a.priorityScore);
+  return rows;
+}
+
+function computeTrainingPriority(){
+  const hpiResult=calcHPI();
+  const maxWeight=Math.max(...Object.values(INDEX_WEIGHTS));
+  const dRace=daysToRace();
+  const weeksToRace = dRace!=null ? clamp(dRace/7,0.5,52) : 8; // no race date set -> neutral assumption, same as §5
+
+  const rows=Object.entries(INDEX_WEIGHTS).map(([key,impactWeight])=>{
+    const score=hpiResult.indices[key].score;
+    const headroom = score!=null ? Math.max(0,100-score) : 50;
+    const trend=indexLongTermTrend(key,8);
+
+    const raceImpact=clamp(impactWeight/maxWeight,0,1);
+    const performanceGap=clamp(headroom/100,0,1);
+    const trainabilityV3=calculateTrainability(key);
+    const urgency=computeUrgency(key,weeksToRace);
+    const specificity=computeSpecificity(key,raceImpact);
+    const recoveryModifier=computeRecoveryModifier(key,hpiResult.fatigue);
+
+    const priorityScore = raceImpact*performanceGap*trainabilityV3*urgency*specificity*recoveryModifier*100;
+
+    return { key, label:INDEX_META[key].label, score, headroom, trend, impactWeight, priorityScore,
+      sufficient: score!=null && score>=85,
+      v3: { raceImpact, performanceGap, trainability:trainabilityV3, urgency, specificity, recoveryModifier } };
+  });
+  rows.sort((a,b)=>b.priorityScore-a.priorityScore);
+  return rows;
+}
+
+function divisionLoadAdjustmentPct(stationKey, sourceIsPro, targetIsPro){
+  if(sourceIsPro===targetIsPro) return 0;
+  const ratio=LOAD_RATIO_OPEN_TO_PRO[stationKey];
+  if(!ratio) return 0;
+  const elasticity=LOAD_ELASTICITY[stationKey] ?? 0.7;
+  if(!sourceIsPro && targetIsPro) return (ratio-1)*elasticity;   // Open -> Pro: heavier, positive (slower)
+  if(sourceIsPro && !targetIsPro) return (1/ratio-1)*elasticity; // Pro -> Open: lighter, negative (faster)
+  return 0;
+}
+
+function estimateSoloStationSec(doublesSec, sharePctRaw){
+  const sharePct = clamp(Number(sharePctRaw)||50, 20, 80);
+  const naiveRatio = 1/(sharePct/100);
+  const typicalSoloRatio = 1.6;
+  const distanceFrom50 = Math.abs(sharePct-50)/50; // 0 at 50%, 1 at the 20/80 clamp edges
+  const blendedRatio = typicalSoloRatio*(1-distanceFrom50*0.5) + naiveRatio*(distanceFrom50*0.5);
+  return doublesSec * clamp(blendedRatio, 1.15, 2.2);
+}
+
+function getStationDataMeta(){
+  const meta={};
+  STATIONS.forEach(s=>{
+    const candidates=collectStationCandidates(s.key);
+    if(!candidates.length){ meta[s.key]=null; return; }
+    const top=candidates[0];
+    const ageDays=daysBetween(top.date,todayISO());
+    const isFresh=ageDays<=STATION_STALE_DAYS;
+    meta[s.key]={ value:top.value, rawValue:top.value, date:top.date, ageDays, isFresh, source:top.source, adjusted:false, adjustPct:0 };
+  });
+  return meta;
+}
+
+function invalidatePureCache(){ _pureCache = new Map(); clearPeerDbFilterCache(); }
+
+function latestBodyMetric(){ const s=sortedBodyMetrics(); return s.length? s[s.length-1] : null; }
+
+function latestStationValues(){
+  const meta=getStationDataMeta();
+  const out={};
+  STATIONS.forEach(s=>{ out[s.key]= meta[s.key]? meta[s.key].value : undefined; });
+  return out;
+}
+
+function loadLocalDraft(key, maxAgeMs=1000*60*60*12){
+  try{
+    const raw=localStorage.getItem(`hps:draft:${key}`);
+    if(!raw) return null;
+    const parsed=JSON.parse(raw);
+    if(!parsed || parsed.value==null) return null;
+    if(Date.now()-parsed.savedAt > maxAgeMs) return null;
+    return parsed.value;
+  }catch(e){ return null; }
+}
+
+function pairRacesForTransition(fromDiv, toDiv, maxPairs=5){
+  const fromRaces=racesByDivision(fromDiv), toRaces=racesByDivision(toDiv);
+  if(!fromRaces.length||!toRaces.length) return [];
+  const pairs=[];
+  toRaces.slice(0,maxPairs).forEach(toRace=>{
+    let best=null, bestGap=Infinity;
+    fromRaces.forEach(fromRace=>{
+      const gap=Math.abs(daysBetween(fromRace.date, toRace.date));
+      if(gap<bestGap){ bestGap=gap; best=fromRace; }
+    });
+    if(best){
+      const d=decomposeRacePair(best, toRace);
+      if(d) pairs.push({ ...d, withinWindow: bestGap<=270 });
+    }
+  });
+  return pairs;
+}
+
+function predictDivisionTransition(fromDiv, toDiv){
+  if(isDoublesDiv(fromDiv) && !isDoublesDiv(toDiv)) return computeDoublesToSingles(fromDiv, toDiv);
+  return computeDivisionTransition(fromDiv, toDiv);
+}
+
+function predictTimeSegmentModel(weeksToRace){
+  const model = buildRaceSegmentModel(); // same current-state model predictTime()'s own Anchor already uses
+  const wtr = weeksToRace!=null ? weeksToRace : (daysToRace()!=null ? clamp(daysToRace()/7,0.5,52) : 8);
+  const projectedSegments = model.segments.map(seg=>projectSegment(seg, wtr));
+  const currentTotalSec = projectedSegments.reduce((s,x)=>s+x.currentSec,0);
+  const projectedTotalSec = projectedSegments.reduce((s,x)=>s+x.projectedSec,0);
+  const totalImprovementSec = round1(currentTotalSec-projectedTotalSec);
+  return { segments:projectedSegments, currentTotalSec:round1(currentTotalSec), projectedTotalSec:round1(projectedTotalSec),
+    totalImprovementSec, weeksToRace:wtr, dataCoverage:model.dataCoverage,
+    modelVersion:"SEGMENT-CANDIDATE-v0.1" }; // distinct from predictTime()'s MODEL_VERSION="FP-1.0" — never conflated
+}
+
+function predictTimeSegmentModelV2(weeksToRace){
+  const model = buildRaceSegmentModel(); // identical 17-segment current-state anchor as V1 — no re-derivation
+  const wtr = weeksToRace!=null ? weeksToRace : (daysToRace()!=null ? clamp(daysToRace()/7,0.5,52) : 8);
+  // segments here only need indexKey+indexTrend (for sumTrend and the decomposition) — reuse the exact
+  // same per-segment resolution calculateSegmentPotential() already does via segmentIndexKey()/indexLongTermTrend()
+  const potentials = model.segments.map(seg=>calculateSegmentPotential(seg, wtr));
+  // bug fix (found via real-code vs offline-simulation mismatch): calculateSegmentPotential() itself
+  // never sets .indexTrend — that field is only added by projectSegment() (V1's function). Calling
+  // indexLongTermTrend() directly here, the same way projectSegment() does, instead of assuming it's
+  // already present on calculateSegmentPotential()'s output.
+  const potentialsWithTrend = potentials.map(p=>({ ...p, indexTrend: indexLongTermTrend(p.indexKey, 8) }));
+  const sumTrend = potentialsWithTrend.reduce((s,x)=>s+(x.indexTrend||0),0);
+  const currentTotalSec = potentialsWithTrend.reduce((s,x)=>s+x.currentSec,0);
+  const totalImprovementSec = round1(V2_COEF.a + V2_COEF.b*sumTrend);
+  // same sanity-bound clamp already used by V1/predictTime() elsewhere — not a new constant
+  const projectedTotalSec = round1(clamp(currentTotalSec-totalImprovementSec, currentTotalSec*0.5, currentTotalSec*1.15));
+  const decomposition = decomposeV2Improvement(potentialsWithTrend, sumTrend); // DISPLAY ONLY — see function header
+  return { currentTotalSec:round1(currentTotalSec), projectedTotalSec, totalImprovementSec, sumTrend:round1(sumTrend),
+    weeksToRace:wtr, decomposition, coefficients:V2_COEF, modelVersion:"SEGMENT-CANDIDATE-V2-v0.1" };
+}
+
+function predictionTrace(division, opts){
+  const div=normalizeRaceDivision(division)||normalizeRaceDivision(STATE.profile.division)||"Open";
+  const weeks=(opts&&opts.weeks!=null)?opts.weeks:0;
+  return withPredictionContext({mode:"race", division:div}, ()=>{
+    const ctx=activePredictionContext();
+    const hpi=calcHPI();
+    const anchor=computeRaceAnchorV3(hpi, ctx);
+    const p0=predictTime(hpi,0);
+    const pFuture=weeks>0? predictTime(hpi,weeks) : null;
+    const dRace=daysToRace();
+    const raceDay = dRace!=null ? predictTime(hpi, clamp(dRace/7,0,20)).predicted : null;
+    const t={
+      requestedDivision:division||STATE.profile.goalDivision||"Open Doubles",
+      exactRaceDivision:ctx.exactDivision,
+      baseDivision:ctx.baseDivision,
+      currentAnchor:fmtTime(anchor.value),
+      currentAnchorSource:anchor.source,
+      currentAnchorDivision:anchor.recentActual? ctx.exactDivision : "(Exact Division 공식기록 없음)",
+      currentAnchorDate:anchor.recentActual? anchor.recentActual.date : null,
+      segmentModelSource:`${anchor.v3.segmentModel.actualCount}/${anchor.v3.segmentModel.segmentCount} 구간 실측 · Exact 근거 ${Math.round(anchor.v3.segmentModel.exactDivisionCoverage*100)}%`,
+      segmentSourceDivisions:anchor.v3.segmentModel.sourceDivisions,
+      freshnessWeights:anchor.v3.contributions.map(c=>`${c.label}[${c.sourceDivision}${c.sourceDate?"/"+c.sourceDate:""}]=${c.freshnessWeight} (share ${c.share}%)`),
+      crossDivisionSignals:anchor.v3.contributions.filter(c=>c.crossDivision)
+        .map(c=>`${c.sourceDivision} ${c.sourceDate} ${fmtTime(c.rawTime)} → ${ctx.exactDivision} 환산 ${fmtTime(c.adjustedTime)}`),
+      workloadModel:anchor.v3.workloadModel,
+      finalCurrent:fmtTime(p0.predicted),
+      futurePrediction:pFuture? fmtTime(pFuture.predicted) : null,
+      raceDayPrediction:raceDay!=null? fmtTime(raceDay) : "(대회일 미설정)",
+      podiumBenchmarkDivision:div,
+      podiumCutoff:"(computePodiumAnalysis() 비동기 — Podium 페이지에서 확인)",
+    };
+    try{
+      console.log("[Prediction Trace]\n"+Object.entries(t).map(([k,v])=>
+        `${k}: ${Array.isArray(v)?"\n  - "+v.join("\n  - "):(typeof v==="object"&&v?JSON.stringify(v):v)}`).join("\n"));
+    }catch(e){}
+    return { trace:t, anchor, prediction:p0 };
+  });
+}
+
+function racesByDivision(div){ return STATE.races.filter(r=>r.division===div).sort((a,b)=>b.date.localeCompare(a.date)); }
+
+function runDivisionRegressionTests(){
+  const res=[]; const log=(n,pass,detail)=>{ res.push({name:n,pass,detail}); console.log(`[DIV-REG] ${pass?"PASS":"FAIL"} — ${n}: ${detail}`); };
+  const snapDiv=STATE.profile.division, snapGoal=STATE.profile.goalDivision;
+  // leakage 정의: 다른 Division 기록이 workload 변환/표기 없이 "그 Division 기록인 척"
+  // 사용되는 것. cross-division signal은 sourceDivision 표기 + 변환을 거치면 허용(§9/§13).
+  const leaks=(model)=>model.segments.filter(s=>{
+    const sd=String(s.sourceDivision||"");
+    if(!RACE_DIVISIONS.includes(sd)) return false;
+    return sd!==model.exactDivision && !s.candidates.some(c=>c.crossDivision && c.sourceDivision===sd);
+  });
+  const modelFor=(div)=>withPredictionContext({mode:"race",division:div},()=>buildRaceSegmentModelV3(activePredictionContext()));
+  try{
+    // TEST 1 / 2 — Open / Pro 선택 시 Pro Doubles 기록이 미표기 직접 사용되면 FAIL
+    ["Open","Pro"].forEach((div,i)=>{
+      const m=modelFor(div);
+      const bad=m.leakage;
+      log(`TEST ${i+1} — ${div}: 타 Division 기록이 미표기/미변환으로 사용되지 않음`, bad.length===0,
+        bad.length? `leak: ${bad.map(b=>`${b.segment}←${b.sourceDivision}(${b.reason})`).join(", ")}`
+          : `exactCov=${Math.round(m.exactDivisionCoverage*100)}% · sourceDivisions=${m.sourceDivisions.join(" | ")}`);
+    });
+    // TEST 3 / 4 — Exact Division 기록 식별. 날짜를 하드코딩하지 않는다: STATE.races에 실제로
+    // 존재하는 해당 Division 기록을 전부 뽑아, 그 (sourceDivision, sourceDate) 조합이 Exact
+    // candidate로 식별되는지 검사한다. 데이터가 바뀌어도 테스트가 따라간다.
+    [["Open Doubles",3],["Pro Doubles",4]].forEach(([div,n])=>{
+      const mine=STATE.races.filter(r=>normalizeRaceDivision(r.division)===div)
+        .map(r=>r.date).sort();
+      if(!mine.length){ log(`TEST ${n} — ${div} 기록 정확 식별`, true, `${div} 기록 없음 — 스킵`); return; }
+      const m=modelFor(div);
+      const seen=new Set();
+      m.segments.forEach(sg=>(sg.candidates||[]).forEach(c=>{
+        if(c.sourceDivision===div && !c.crossDivision && c.sourceDate) seen.add(c.sourceDate);
+      }));
+      // split이 전혀 없는 기록(총시간만)은 segment candidate로 나타날 수 없으므로,
+      // race-level candidate 쪽에서 식별되는지도 함께 본다.
+      const raceLevel=withPredictionContext({mode:"race",division:div},()=>
+        gatherRaceLevelCandidatesV3(activePredictionContext()))
+        .filter(c=>!c.crossDivision && c.sourceDivision===div).map(c=>c.sourceDate);
+      raceLevel.forEach(d=>seen.add(d));
+      const missing=mine.filter(d=>!seen.has(d));
+      log(`TEST ${n} — ${div} 실제 기록 ${mine.length}건 모두 Exact candidate로 식별`, missing.length===0,
+        missing.length? `미식별 날짜: ${missing.join(", ")} (식별된 날짜: ${[...seen].join(", ")||"없음"})`
+          : `식별됨: ${mine.map(d=>`${div}/${d}`).join(", ")}`);
+    });
+    // TEST 5 — Mixed Doubles는 Mixed Doubles 기록만 exact로 사용
+    {
+      const m=modelFor("Mixed Doubles");
+      const badExact=m.segments.filter(s=>s.candidates.some(c=>!c.crossDivision && RACE_DIVISIONS.includes(String(c.sourceDivision)) && c.sourceDivision!=="Mixed Doubles"));
+      log("TEST 5 — Mixed Doubles exact 근거는 Mixed Doubles 기록만", badExact.length===0 && m.leakage.length===0,
+        (badExact.length||m.leakage.length)? `badExact=${badExact.map(s=>s.key).join(",")} leak=${m.leakage.length}`
+          : `exactCov=${Math.round(m.exactDivisionCoverage*100)}% · sourceDivisions=${m.sourceDivisions.join(" | ")}`);
+    }
+    // TEST 6 / 7 — Goal Division milestone context
+    [["Open Doubles",6],["Pro Doubles",7]].forEach(([div,n])=>{
+      STATE.profile.goalDivision=div;
+      const plan=computeGoalPlan();
+      const scen=computeGoalScenarios();
+      const ok = (plan? plan.milestoneDivision===div : true) && scen.scenarioDivision===div;
+      log(`TEST ${n} — Goal=${div}: A/B/C + 4/8/12주 모두 ${div} context`, ok,
+        `scenarioDivision=${scen.scenarioDivision}, milestoneDivision=${plan?plan.milestoneDivision:"(목표시간 미설정)"}`);
+      STATE.profile.goalDivision=snapGoal;
+    });
+    // TEST 8 / 9 — Podium athlete prediction division === podium benchmark division
+    [["Open Doubles",8],["Pro Doubles",9]].forEach(([div,n])=>{
+      const p=predictPodiumForDivision(div,0);
+      log(`TEST ${n} — Podium ${div}: athlete prediction division = benchmark division`,
+        p.predictionDivision===div, `predictionDivision=${p.predictionDivision}, benchmarkDivision=${div}, 예측=${fmtTime(p.predicted)}`);
+    });
+    // TEST 10 — Freshness
+    {
+      const od=STATE.races.filter(r=>normalizeRaceDivision(r.division)==="Open Doubles").sort((a,b)=>b.date.localeCompare(a.date))[0];
+      const pd=STATE.races.filter(r=>normalizeRaceDivision(r.division)==="Pro Doubles").sort((a,b)=>b.date.localeCompare(a.date))[0];
+      if(od&&pd){
+        const odSec=parseTimeToSec(od.officialTime), pdSec=parseTimeToSec(pd.officialTime);
+        const cur=withPredictionContext({mode:"race",division:"Open Doubles"},()=>computeRaceAnchorV3(calcHPI(),activePredictionContext()).value);
+        const notFrozen=Math.abs(cur-odSec)>1;
+        const notCopied=Math.abs(cur-pdSec)>1;
+        log("TEST 10 — Freshness: 오래된 Exact 기록 고정 금지 & 타 Division 기록 복사 금지", notFrozen&&notCopied,
+          `Open Doubles Current=${fmtTime(cur)} / Exact(${od.date})=${fmtTime(odSec)} / Pro Doubles(${pd.date})=${fmtTime(pdSec)}`);
+      } else log("TEST 10 — Freshness", true, "Open Doubles / Pro Doubles 기록 쌍이 없어 스킵");
+    }
+    // TEST 11 — workload 방향성: 같은 능력에서 Pro는 Open보다 느리고, Doubles는 Singles보다 빠르다
+    {
+      const r=(d)=>divisionWorkloadProfile(d).ratioVsRef;
+      const ok = r("Pro")>r("Open") && r("Pro Doubles")>r("Open Doubles")
+              && r("Open Doubles")<r("Open") && r("Pro Doubles")<r("Pro");
+      log("TEST 11 — Race workload 방향성 정합", ok,
+        RACE_DIVISIONS.map(d=>`${d}=${Math.round(r(d)*1000)/1000}`).join(", "));
+    }
+    // TEST 12 — Division을 바꾸면 Current가 실제로 달라진다 (동일값 붙기 방지)
+    {
+      const vals={}; RACE_DIVISIONS.forEach(d=>{ vals[d]=withPredictionContext({mode:"race",division:d},()=>computeRaceAnchorV3(calcHPI(),activePredictionContext()).value); });
+      const uniq=new Set(Object.values(vals).map(v=>Math.round(v)));
+      log("TEST 12 — 5개 Division의 Current가 서로 구분됨", uniq.size===RACE_DIVISIONS.length,
+        RACE_DIVISIONS.map(d=>`${d}=${fmtTime(vals[d])}`).join(", "));
+    }
+    // TEST 13 — 5개 Division 전체 구조적 leakage 검사
+    {
+      const all=RACE_DIVISIONS.map(d=>({ d, m:modelFor(d) }));
+      const bad=all.filter(x=>x.m.leakage.length);
+      log("TEST 13 — 5개 Division 전체 구조적 leakage 0건", bad.length===0,
+        bad.length? bad.map(x=>`${x.d}: ${x.m.leakage.map(b=>b.segment+"←"+b.sourceDivision+"("+b.reason+")").join(",")}`).join(" | ")
+          : all.map(x=>`${x.d} exactCov=${Math.round(x.m.exactDivisionCoverage*100)}%/dataCov=${Math.round(x.m.dataCoverage*100)}%`).join(", "));
+    }
+    // TEST 14 — 4/8/12주가 Current 대비 단조롭게 미래 방향으로 변화하는지
+    {
+      const bad=[];
+      RACE_DIVISIONS.forEach(d=>withPredictionContext({mode:"race",division:d},()=>{
+        const h=calcHPI();
+        const c=predictTime(h,0).predicted, a=predictTime(h,4).predicted,
+              b=predictTime(h,8).predicted, e=predictTime(h,12).predicted;
+        if(!(a<=c+0.5 && b<=a+0.5 && e<=b+0.5)) bad.push(`${d}: ${fmtTime(c)}→${fmtTime(a)}→${fmtTime(b)}→${fmtTime(e)}`);
+      }));
+      log("TEST 14 — 4/8/12주 예측이 Current 대비 단조 개선", bad.length===0,
+        bad.length? `비단조: ${bad.join(" | ")}` : "5개 Division 모두 단조 (개선폭은 실측 추세 크기에 비례)");
+    }
+  } finally {
+    STATE.profile.division=snapDiv; STATE.profile.goalDivision=snapGoal;
+  }
+  const failed=res.filter(r=>!r.pass);
+  console.log(`[DIV-REG] ${res.length-failed.length}/${res.length} passed.`);
+  return { results:res, passed:res.length-failed.length, total:res.length };
+}
+
+function saveLocalDraft(key, value){ try{ localStorage.setItem(`hps:draft:${key}`, JSON.stringify({ value, savedAt:Date.now() })); }catch(e){} }
+
+function segmentIndexKey(seg){
+  if(seg.type==="run") return "running";
+  if(seg.type==="transition") return "raceExec";
+  const groupMap={ engine:"engine", strength:"strengthEnd", skill:"skill" };
+  return groupMap[STATIONS.find(s=>s.key===seg.key)?.group] || "strengthEnd";
 }
 /* ---------------------------------------------------------------------- */
 /* 2. STORAGE (persistent, artifact-safe: window.storage w/ in-memory fallback) */
