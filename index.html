@@ -3470,6 +3470,10 @@ function analyzeBottleneck(hpiResult){
 /* ---------------------------------------------------------------------- */
 // within ONE race: how much did each station's fatigue carry into the run right after it,
 // relative to that race's own average run pace (the "general" baseline for that day)?
+const STATION_RUN_MAP = {
+  ski:{before:1,after:2}, sledPush:{before:2,after:3}, sledPull:{before:3,after:4}, burpee:{before:4,after:5},
+  row:{before:5,after:6}, carry:{before:6,after:7}, lunge:{before:7,after:8}, wallball:{before:8,after:null},
+};
 function computeStationInducedDegradation(race){
   if(!race) return [];
   const runsSec=RUN_KEYS.map(k=>parseTimeToSec(race.runs?.[k]));
