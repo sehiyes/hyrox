@@ -453,6 +453,84 @@ function showToast(msg){
 }
 
 /* ---------------------------------------------------------------------- */
+/* 2. STORAGE (persistent, artifact-safe: window.storage w/ in-memory fallback) */
+/* ---------------------------------------------------------------------- */
+const MEM_FALLBACK = {};
+let storageWarned = false;
+/* BUG FIX — "업로드 이력이 매번 사라짐"
+ *
+ * window.storage 는 이 앱이 Claude artifact 안에서 실행될 때만 존재하는 API다.
+ * GitHub Pages / 자체 호스팅 / file:// 로 열면 window.storage 가 아예 없어서,
+ * 아래 두 함수가 전부 MEM_FALLBACK(= 단순 자바스크립트 객체)으로 떨어졌다.
+ * MEM_FALLBACK 은 페이지를 새로고침하면 통째로 사라진다.
+ *
+ * STATE(hps:state:v1)는 로그인 시 Supabase user_data 로 따로 동기화되기 때문에
+ * 살아남았지만, 업로드 이력(hps:hyroxUploadLog:v1)은 Supabase 동기화 대상이
+ * 아니라서 새로고침 때마다 초기화됐던 것이다.
+ *
+ * 그래서 localStorage 계층을 중간에 추가한다:
+ *   window.storage  (있으면 최우선)  ->  localStorage  ->  MEM_FALLBACK
+ * localStorage 는 용량 한도(~5MB)가 있으므로 실패해도 절대 던지지 않고,
+ * 그 경우 기존처럼 MEM_FALLBACK 으로 세션 내에서만 유지된다.
+ */
+const LS_PREFIX = "hps:ls:";
+function lsGet(key){
+  try{
+    if(typeof localStorage==="undefined") return undefined;
+    const raw=localStorage.getItem(LS_PREFIX+key);
+    return raw==null? undefined : JSON.parse(raw);
+  }catch(e){ return undefined; }
+}
+function lsSet(key, value){
+  try{
+    if(typeof localStorage==="undefined") return false;
+    localStorage.setItem(LS_PREFIX+key, JSON.stringify(value));
+    return true;
+  }catch(e){
+    // QuotaExceededError 등 — EXTERNAL_RACE_DB 처럼 큰 데이터는 여기서 실패할 수 있다.
+    // 실패해도 조용히 넘어간다 (MEM_FALLBACK 과 Supabase 동기화가 각각 제 역할을 한다).
+    if(!lsSet._warned){ console.warn("localStorage 저장 실패(세션 내 데이터는 유지됩니다):", e?.name||e); lsSet._warned=true; }
+    return false;
+  }
+}
+const StorageService = {
+  async get(key, fallback){
+    try{
+      if(window.storage && window.storage.get){
+        const r = await window.storage.get(key, false);
+        return r ? JSON.parse(r.value) : fallback;
+      }
+    }catch(e){ /* key not found or storage unavailable */ }
+    if(key in MEM_FALLBACK) return MEM_FALLBACK[key];
+    const fromLs = lsGet(key);
+    if(fromLs!==undefined){ MEM_FALLBACK[key]=fromLs; return fromLs; }
+    return fallback;
+  },
+  async set(key, value){
+    MEM_FALLBACK[key]=value;
+    let persisted=false;
+    try{
+      if(window.storage && window.storage.set){
+        await window.storage.set(key, JSON.stringify(value), false);
+        persisted=true;
+      }
+    }catch(e){
+      // transient platform-side hiccup — MEM_FALLBACK above already keeps data intact for this session,
+      // so this is non-fatal. Log once rather than spamming on every keystroke's debounced autosave.
+      if(!storageWarned){ console.warn("자동저장에 일시적 문제가 있습니다 (세션 내 데이터는 유지됩니다):", e?.message||e); storageWarned=true; }
+    }
+    if(!persisted) lsSet(key, value);
+  }
+};
+
+function showToast(msg){
+  const t=document.getElementById("toast");
+  t.textContent=msg; t.classList.add("show");
+  clearTimeout(showToast._tm);
+  showToast._tm=setTimeout(()=>t.classList.remove("show"),2200);
+}
+
+/* ---------------------------------------------------------------------- */
 /* 2b. SUPABASE AUTH + CLOUD SYNC (optional — GitHub Pages / self-hosted)  */
 /*     Fill in SUPABASE_URL / SUPABASE_ANON_KEY (both are safe to expose   */
 /*     client-side; access is enforced by Row Level Security policies on   */
