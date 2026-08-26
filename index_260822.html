@@ -7136,8 +7136,8 @@ function renderGoal(wrap){
   wrap.innerHTML = `
     <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">예측</h1></div>
     <div class="tabs">
-      <div class="tab ${GOAL_TAB==="singles"?"active":""}" data-goal-tab="singles">Singles</div>
-      <div class="tab ${GOAL_TAB==="doubles"?"active":""}" data-goal-tab="doubles">Doubles</div>
+      <div class="tab ${GOAL_TAB==="singles"?"active":""}" data-goal-tab="singles">목표 설정</div>
+      <div class="tab ${GOAL_TAB==="doubles"?"active":""}" data-goal-tab="doubles">파트너 선택</div>
     </div>
     <div id="goal-tab-body"></div>
   `;
@@ -7469,6 +7469,28 @@ function renderGoalDoublesTab(wrap){
     return;
   }
 
+  if(!partner.gender){
+    wrap.innerHTML = `
+      <div class="card">
+        <h2 class="section-title">👥 파트너: ${escapeHtml(partner.name||"파트너")}</h2>
+        <div class="reason-line" style="margin-top:4px;">${partner.age?`${escapeHtml(String(partner.age))}세 · `:""}${partner.division?`${escapeHtml(partner.division)} · `:""}${partner.races?.length||0}건의 기록 보유</div>
+      </div>
+      <div class="card">
+        <h2 class="section-title">⚠️ 성별을 확인해주세요</h2>
+        <p class="lead" style="margin:6px 0 12px;">불러온 기록이 Mixed Doubles라 개인 성별을 자동으로 판단할 수 없었습니다 — 팀 Division 계산을 위해 직접 선택해주세요.</p>
+        <div class="hstack" style="gap:8px;">
+          <div class="chip" data-dbl-partner-gender="male" style="cursor:pointer;padding:9px 18px;">남성</div>
+          <div class="chip" data-dbl-partner-gender="female" style="cursor:pointer;padding:9px 18px;">여성</div>
+        </div>
+      </div>
+    `;
+    wrap.querySelectorAll("[data-dbl-partner-gender]").forEach(chip=>chip.addEventListener("click",()=>{
+      STATE.doublesPartner.gender=chip.dataset.dblPartnerGender;
+      persist(); renderAll();
+    }));
+    return;
+  }
+
   const sameGender = upv4NormGender(STATE.profile.gender)===upv4NormGender(partner.gender);
   const result = computeDoublesTeamPrediction();
   wrap.innerHTML = `
@@ -7761,6 +7783,19 @@ function bindDoublesPartnerSearch(wrap){
     b.addEventListener("click",()=>pickDoublesPartnerFromSearch(b.dataset.dblPartnerPick));
   });
 }
+// bug fix: rows[0].r.g isn't always the athlete's own gender — a Mixed Doubles race is tagged
+// with a team-level "Mixed" gender in the source DB (see reconcileDivisionWithGender's g.includes
+// ("mixed") check above), not the individual athlete's actual sex. Blindly reading rows[0]'s gender
+// meant picking a partner whose FIRST found race happened to be Mixed Doubles silently defaulted to
+// "male" regardless of their real gender. Now scans ALL of the athlete's found races for the first
+// one that actually states an individual gender, skipping any "Mixed"-tagged team entries.
+function parseIndividualGenderRaw(raw){
+  const g=String(raw||"").trim().toLowerCase();
+  if(!g || g.includes("mixed")) return null;
+  if(g.includes("female")||g.includes("woman")||g==="w"||g==="f") return "female";
+  if(g.includes("male")||g.includes("man")||g==="m") return "male";
+  return null;
+}
 function pickDoublesPartnerFromSearch(name){
   const rows=DOUBLES_PARTNER_SEARCH_RESULTS.filter(x=>x.r.n===name);
   if(!rows.length) return;
@@ -7771,8 +7806,11 @@ function pickDoublesPartnerFromSearch(name){
     const validDate = r.dt && /^\d{4}-\d{2}-\d{2}$/.test(r.dt) ? r.dt : todayISO();
     return { id:uid(), date:validDate, division:reconcileDivisionWithGender(r.d||DIVISIONS[0], r.g), officialTime:r.t||"", runs, stations, transition:r.z||"" };
   });
-  const g=String(rows[0].r.g||"").toLowerCase();
-  const gender = (g.includes("female")||g.includes("woman")||g==="w"||g==="f") ? "female" : "male";
+  let gender=null;
+  for(const x of rows){ gender=parseIndividualGenderRaw(x.r.g); if(gender) break; }
+  // every found race was Mixed Doubles (team-level gender tag only) — can't infer the athlete's
+  // actual gender from the DB, so leave it unset rather than silently guessing "male". The Doubles
+  // tab shows a required gender picker below until this is confirmed.
   STATE.doublesPartner = {
     id:uid(), name, gender,
     age:"", ageGroupDisplay: rows[0].r.a||"", // HPS 검색은 나이대(예: 35-39)만 제공 — 정확한 나이가 아니므로
@@ -7782,7 +7820,9 @@ function pickDoublesPartnerFromSearch(name){
     source:"hps_search"
   };
   DOUBLES_PARTNER_SEARCH_QUERY=""; DOUBLES_PARTNER_SEARCH_RESULTS=[]; GOAL_DOUBLES_MANUAL_MODE=false;
-  persist(); showToast(`${name}님을 파트너로 선택했습니다`); renderAll();
+  persist();
+  showToast(gender ? `${name}님을 파트너로 선택했습니다` : `${name}님을 파트너로 선택했습니다 — 성별을 확인해주세요`);
+  renderAll();
 }
 
 function renderDoublesPartnerManualForm(){
