@@ -7477,7 +7477,7 @@ function renderGoalDoublesTab(wrap){
       </div>
       <div class="card">
         <h2 class="section-title">⚠️ 성별을 확인해주세요</h2>
-        <p class="lead" style="margin:6px 0 12px;">불러온 기록이 Mixed Doubles라 개인 성별을 자동으로 판단할 수 없었습니다 — 팀 Division 계산을 위해 직접 선택해주세요.</p>
+        <p class="lead" style="margin:6px 0 12px;">팀 Division 계산을 위해 성별을 선택해주세요.</p>
         <div class="hstack" style="gap:8px;">
           <div class="chip" data-dbl-partner-gender="male" style="cursor:pointer;padding:9px 18px;">남성</div>
           <div class="chip" data-dbl-partner-gender="female" style="cursor:pointer;padding:9px 18px;">여성</div>
@@ -7714,14 +7714,14 @@ function renderDoublesPartnerSearchCard(){
   const ready=hyroxDbReady();
   return `
     <div class="card" style="border-left:3px solid var(--orange);">
-      <h2 class="section-title">🔎 HPS 선수 검색</h2>
+      <h2 class="section-title">🔎 선수 검색</h2>
       <p class="lead" style="margin:6px 0 10px;">파트너의 실제 HYROX 기록을 이름으로 검색해서 불러올 수 있습니다.</p>
       <div class="hstack" style="gap:8px;align-items:stretch;">
-        <input id="dbl-partner-search" style="flex:1;min-width:0;" placeholder="예: 김철수" value="${escapeHtml(DOUBLES_PARTNER_SEARCH_QUERY)}" ${ready?"":"disabled"}>
+        <input id="dbl-partner-search" style="flex:1;min-width:0;" placeholder="예: 김 철수 or 철수" value="${escapeHtml(DOUBLES_PARTNER_SEARCH_QUERY)}" ${ready?"":"disabled"}>
         <button class="btn sm" id="dbl-partner-search-btn" ${ready?"":"disabled"}>검색</button>
       </div>
       <div id="dbl-partner-status" style="margin-top:8px;font-size:12px;color:var(--gray);">
-        ${ready?"이름 일부만 입력해도 검색됩니다.":"Supabase 백데이터에 연결하는 중…"}
+        ${ready?"이름 일부만 입력해도 검색 됩니다. (Full Name 검색 시, 성과 이름은 띄어쓰기 필수)":"Supabase 백데이터에 연결하는 중…"}
       </div>
       <div id="dbl-partner-results" style="margin-top:10px;">
         ${ready && DOUBLES_PARTNER_SEARCH_QUERY ? renderDoublesPartnerSearchResults() : ""}
@@ -7791,9 +7791,13 @@ function bindDoublesPartnerSearch(wrap){
 // one that actually states an individual gender, skipping any "Mixed"-tagged team entries.
 function parseIndividualGenderRaw(raw){
   const g=String(raw||"").trim().toLowerCase();
-  if(!g || g.includes("mixed")) return null;
-  if(g.includes("female")||g.includes("woman")||g==="w"||g==="f") return "female";
-  if(g.includes("male")||g.includes("man")||g==="m") return "male";
+  if(!g || g.includes("mixed") || g.includes("혼성")) return null;
+  // bug fix: only English "female"/"male"/"f"/"m" were checked, but the source DB stores gender
+  // in Korean ("여"/"남"/"여성"/"남성") for at least some rows — those all failed to match and
+  // fell through to "unknown", incorrectly triggering the gender-confirmation screen even for
+  // races that DID clearly state a gender. Female checked first since "female" contains "male".
+  if(g.includes("female")||g.includes("woman")||g==="w"||g==="f"||g.includes("여")) return "female";
+  if(g.includes("male")||g.includes("man")||g==="m"||g.includes("남")) return "male";
   return null;
 }
 function pickDoublesPartnerFromSearch(name){
