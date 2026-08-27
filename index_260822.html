@@ -743,15 +743,6 @@ function defaultState(){
     // defaulting to "Open", since that could silently misrepresent a legacy Pro simulation).
     simulationTests:[], // {id,date,type:"full"|"half"|"custom",division:"Open"|"Pro",runs:{1..8:{distanceM,time}},stations:{key:{amount,time}},transition,totalTime,source}
     settings:{ predictionSensitivity:"recommended" },
-    // Doubles Team Engine: a Doubles partner's OWN data, structurally separate from STATE.races
-    // (this app's Singles/solo record store) — never merged into it, so nothing in the existing
-    // Singles engine (Race DNA, Race-only prediction, Podium) can ever accidentally read a
-    // partner's races as if they were the athlete's own. gender/age/division here are the
-    // partner's own reported values, used only as reference context — the Doubles Team Division
-    // actually used for calculation is chosen by the user on the Doubles tab, independent of
-    // either athlete's individual division.
-    doublesPartner: null, // null | { id, name, gender, age, division, races:[], simulationTests:[], running:{...} }
-    doublesTeam: { division:null, splitPct:{}, splitMode:"default", ageGroup:"" }, // splitPct: {stationKey: myPct 0-100}, empty = 50:50 default
   };
 }
 
@@ -929,12 +920,7 @@ function withPredictionContext(opts, fn){
   const mode = (opts && opts.mode==="race") ? "race" : "hpi";
   const exact = normalizeRaceDivision(opts && opts.division)
              || normalizeRaceDivision(STATE.profile.goalDivision) || "Open Doubles";
-  // feature (Doubles Team Engine): opts.gender/opts.age let a caller (e.g. computing a Doubles
-  // partner's own benchmark fallback) temporarily override WHOSE demographic getSegmentBenchmarkSec()
-  // matches against, instead of always reading STATE.profile. Omitted for every existing call site,
-  // so getSegmentBenchmarkSec() falls through to STATE.profile exactly as before.
-  PRED_CTX_STACK.push({ mode, exactDivision:exact, baseDivision:divisionBase(exact)||"Open", implicit:false,
-    gender: opts && opts.gender || null, age: opts && opts.age!=null ? opts.age : null });
+  PRED_CTX_STACK.push({ mode, exactDivision:exact, baseDivision:divisionBase(exact)||"Open", implicit:false });
   try{ return fn(); } finally { PRED_CTX_STACK.pop(); }
 }
 // 후보 데이터 필터의 단일 진입점. race 모드 = 정확 일치, hpi 모드 = base 일치.
@@ -1925,18 +1911,11 @@ function upv4ResolveAthleteGender(race){
 */
 function resolveUnifiedPerformance(goalDivision, options={}){
   const goal=normalizeRaceDivision(goalDivision)||goalDivision;
-  // feature (Doubles Team Engine): options.races/options.simulations let a caller resolve an
-  // ARBITRARY athlete's data (e.g. a Doubles partner's own race history) through this exact same
-  // pipeline, instead of always reading STATE.races/STATE.simulationTests. Omitting them keeps the
-  // original Singles behavior byte-for-byte. options.forceGender likewise overrides per-race
-  // gender resolution — needed because upv4ResolveAthleteGender() falls back to the CURRENT
-  // profile's gender when a race carries no explicit athleteGender, which would silently use my
-  // own gender for a partner's races unless we pin it explicitly.
-  const races=(options.races || STATE?.races || []).filter(r=>r && r.date);
+  const races=(STATE?.races||[]).filter(r=>r && r.date);
   // feature: Full Simulation now also feeds this pool (see upv4SimulationSegmentValue's header
   // comment) — an athlete with zero real races but a real Full Simulation should still get
   // segment data here, so the emptiness guard below now checks both sources.
-  const sims=(options.simulations || STATE?.simulationTests || []).filter(s=>s && s.date);
+  const sims=(STATE?.simulationTests||[]).filter(s=>s && s.date);
   if(!goal || (!races.length && !sims.length)) return {goalDivision:goal,segments:{},records:[],confidence:"NONE"};
 
   const records=[];
@@ -1950,7 +1929,7 @@ function resolveUnifiedPerformance(goalDivision, options={}){
   for(const race of races){
     const source=normalizeRaceDivision(race.division)||race.division;
     if(hasSameFormatEvidence && source && upv4IsDoubles(source)!==goalIsDoubles) continue;
-    const gender=options.forceGender || upv4ResolveAthleteGender(race);
+    const gender=upv4ResolveAthleteGender(race);
 
     /* Mixed is gender-aware for conversion, but remains Mixed Doubles as source. */
     let best=null;
@@ -2008,7 +1987,7 @@ function resolveUnifiedPerformance(goalDivision, options={}){
   for(const sim of sims){
     const source=sim.division==="Pro" ? "Pro" : "Open";
     if(hasSameFormatEvidence && upv4IsDoubles(source)!==goalIsDoubles) continue;
-    const gender=options.forceGender || upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
+    const gender=upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
     for(const segment of UPV4_SEGMENTS){
       const raw=upv4SimulationSegmentValue(sim,segment);
       if(raw==null) continue;
@@ -2090,7 +2069,7 @@ function getRaceOnlyBenchmarkSegmentSec(goalDiv, segment){
 /* total; Division conversion is applied to that total when available.     */
 /* No HPI / recovery / body metrics / 1RM / training data are used here.   */
 /* ---------------------------------------------------------------------- */
-function raceOnlyOfficialTimeAnchors(goalDivision, options={}){
+function raceOnlyOfficialTimeAnchors(goalDivision){
   const goal=normalizeRaceDivision(goalDivision)||goalDivision;
   // bug fix: this used to source rows from resolveUnifiedPerformance's per-segment `records`,
   // which only ever contains a race at all if at least one Run/Station/Transition split was
@@ -2098,17 +2077,14 @@ function raceOnlyOfficialTimeAnchors(goalDivision, options={}){
   // splits, which is a completely normal way to log a result — produced zero records and was
   // therefore invisible here, even though the official time itself is real, standalone evidence.
   // Reading straight from STATE.races makes every logged official time count, split data or not.
-  // feature (Doubles Team Engine): options.races/options.simulations/options.forceGender mirror the
-  // same override added to resolveUnifiedPerformance() — omitted, this is byte-for-byte the
-  // original STATE-reading behavior.
-  const rows=(options.races || STATE?.races || []).filter(r=>r && r.date && parseTimeToSec(r.officialTime)!=null);
+  const rows=(STATE?.races||[]).filter(r=>r && r.date && parseTimeToSec(r.officialTime)!=null);
   const byRace=new Map();
   rows.forEach(race=>{
     const official=parseTimeToSec(race.officialTime);
     if(!Number.isFinite(official) || official<=0) return;
     const source=normalizeRaceDivision(race.division)||race.division;
     if(!source) return;
-    const gender=options.forceGender || upv4ResolveAthleteGender(race);
+    const gender=upv4ResolveAthleteGender(race);
     const key=[race.date||"", source, official, gender].join("|");
     if(byRace.has(key)) return;
     byRace.set(key,{date:race.date,sourceDivision:source,officialTime:official,gender,isSimulation:false});
@@ -2119,12 +2095,12 @@ function raceOnlyOfficialTimeAnchors(goalDivision, options={}){
   // equivalent total (it's not clear what portion of the race it actually represents), so it's
   // excluded here entirely — the same partial attempt's individual completed segments still feed
   // resolveUnifiedPerformance's per-segment blend, just not this whole-race anchor.
-  (options.simulations || STATE?.simulationTests || []).filter(s=>s && s.date && parseTimeToSec(s.totalTime)!=null).forEach(sim=>{
+  (STATE?.simulationTests||[]).filter(s=>s && s.date && parseTimeToSec(s.totalTime)!=null).forEach(sim=>{
     if(simulationValidStationPrefix(sim)<8) return;
     const official=parseTimeToSec(sim.totalTime);
     if(!Number.isFinite(official) || official<=0) return;
     const source=sim.division==="Pro" ? "Pro" : "Open";
-    const gender=options.forceGender || upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
+    const gender=upv4NormGender(STATE?.profile?.goalGender || STATE?.profile?.gender);
     const key=["sim", sim.date||"", source, official, gender].join("|");
     if(byRace.has(key)) return;
     byRace.set(key,{date:sim.date,sourceDivision:source,officialTime:official,gender,isSimulation:true});
@@ -2179,13 +2155,9 @@ function raceOnlyOfficialTimeAnchors(goalDivision, options={}){
   };
 }
 
-function raceOnlyPrediction(targetDivision, options={}){
+function raceOnlyPrediction(targetDivision){
   const goal=normalizeRaceDivision(targetDivision)||"Open Doubles";
-  // feature (Doubles Team Engine): options.races/simulations/forceGender/running/age let this exact
-  // function resolve an ARBITRARY athlete (e.g. a Doubles partner) instead of always STATE — omitted,
-  // this is byte-for-byte the original Singles/STATE-reading behavior.
-  const u=resolveUnifiedPerformance(goal, options);
-  const running = options.running || STATE.running;
+  const u=resolveUnifiedPerformance(goal);
   const order=["runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"];
   const parts=[];
   let actualCount=0;
@@ -2193,13 +2165,13 @@ function raceOnlyPrediction(targetDivision, options={}){
     let v=u.segments?.[seg]?.value;
     let source=u.segments?.[seg] ? (u.segments[seg].allSimulation ? "Full Simulation 기반" : "실제 대회/Division 환산") : null;
     if(v==null && seg==="runTotal"){
-      const pb10=parseTimeToSec(running.pb10k || running.tt10k);
+      const pb10=parseTimeToSec(STATE.running.pb10k || STATE.running.tt10k);
       if(pb10){ v=(pb10/10+30)*8; source="10K TT/PB +30초/km · 8km"; }
       else {
         const fallback = [
-          {km:5, time:running.pb5k || running.tt5k, label:"5K TT/PB"},
-          {km:3, time:running.tt3k, label:"3K TT"},
-          {km:1, time:running.tt1k, label:"1K TT"}
+          {km:5, time:STATE.running.pb5k || STATE.running.tt5k, label:"5K TT/PB"},
+          {km:3, time:STATE.running.tt3k, label:"3K TT"},
+          {km:1, time:STATE.running.tt1k, label:"1K TT"}
         ].map(x=>({...x, sec:parseTimeToSec(x.time)})).find(x=>x.sec);
         if(fallback){
           v=(fallback.sec/fallback.km+30)*8;
@@ -2207,16 +2179,7 @@ function raceOnlyPrediction(targetDivision, options={}){
         }
       }
     }
-    if(v==null){
-      // feature (Doubles Team Engine): route the benchmark fallback through the SAME
-      // gender/age-aware context used above, so a partner's benchmark fallback matches their own
-      // demographic rather than the logged-in athlete's — options.forceGender/options.age only, no
-      // change to the existing Singles call (which passes neither).
-      v = (options.forceGender || options.age!=null)
-        ? withPredictionContext({mode:"race", division:goal, gender:options.forceGender, age:options.age}, ()=>getRaceOnlyBenchmarkSegmentSec(goal,seg))
-        : getRaceOnlyBenchmarkSegmentSec(goal,seg);
-      source="동일 조건 benchmark";
-    }
+    if(v==null){ v=getRaceOnlyBenchmarkSegmentSec(goal,seg); source="동일 조건 benchmark"; }
     if(v!=null){
       parts.push({segment:seg,value:v,source});
       if(u.segments?.[seg]) actualCount++;
@@ -2232,7 +2195,7 @@ function raceOnlyPrediction(targetDivision, options={}){
      converted through the empirical TOTAL matrix as the race-time center.
      Segment detail remains available for DNA/diagnostics, but cannot override
      the official total anchor in this sparse-evidence case. */
-  const officialAnchor=raceOnlyOfficialTimeAnchors(goal, options);
+  const officialAnchor=raceOnlyOfficialTimeAnchors(goal);
   let total=segmentTotal;
   let predictionSource=`Race-only Performance (${goal})`;
   let anchorNote=null;
@@ -2427,14 +2390,8 @@ const SEGMENT_LIST = [
 // data (actual/actual-adjusted/actual-stale/estimated-training-pace) is untouched and still always
 // wins — this only changes what fills in for segments with NO personal data at all.
 function getSegmentBenchmarkSec(segmentKey){
-  // feature (Doubles Team Engine): use the active prediction context's gender/age override when
-  // present (see withPredictionContext), so a partner's benchmark fallback matches THEIR
-  // demographic — otherwise unchanged, falling through to STATE.profile as always. ctx.gender is
-  // "male"/"female" (this app's usual convention); deriveBenchmarkGender()'s own "M"/"W"/"MIXED"
-  // convention is only used when no explicit override is active.
-  const ctx=activePredictionContext();
-  const ageBand = deriveAgeBand(ctx.age!=null ? ctx.age : STATE.profile.age);
-  const benchGender = ctx.gender ? (ctx.gender==="female"?"W":"M") : deriveBenchmarkGender();
+  const ageBand = deriveAgeBand(STATE.profile.age);
+  const benchGender = deriveBenchmarkGender();
   const derived = queryDerivedBenchmark(currentPredictionDivision(), benchGender, ageBand, segmentKey);
   if(derived && derived.p50) return { sec:derived.p50, source:derived.benchmark_source, sampleN:derived.sample_n, confidence:derived.confidence };
   return null;
@@ -4374,18 +4331,9 @@ async function computePodiumComparisonGroup(eventName, division, gender, ageGrou
     return result;
   }
   const built = buildPodiumBenchmarkFromEventPodiums(chosen.eventPodiums, "median");
-  // feature (예상 순위): computeEventPodiums() only kept each event's top-3 — everything needed
-  // for an actual rank/percentile estimate (the full field of valid times, and how many finishers
-  // each qualifying event had) was already being fetched and then thrown away. Exposing it here
-  // doesn't change anything for existing callers (podium/probability/gap are untouched) — it just
-  // stops discarding data that was already in memory, so computePodiumRankEstimate() below can use it.
-  const fieldTimes = chosen.validRows.map(r=>r.overall_time).filter(t=>t!=null).sort((a,b)=>a-b);
-  const avgFieldSize = chosen.eventPodiums.length
-    ? chosen.eventPodiums.reduce((s,e)=>s+e.n,0)/chosen.eventPodiums.length : null;
   const result = { ...built, scope:"division-gender-age", n:chosen.validRows.length, division,
     gender:division==="Mixed Doubles" ? "MIXED" : gender, ageGroup,
-    sourceDivision:division, tier:chosen.tier, ageGroupUsed:chosen.ageGroupUsed, dataWindow:podiumWindow, regionScope:"global",
-    fieldTimes, avgFieldSize };
+    sourceDivision:division, tier:chosen.tier, ageGroupUsed:chosen.ageGroupUsed, dataWindow:podiumWindow, regionScope:"global" };
   logPodiumTrace(result, chosen.validRows.length);
   return result;
 }
@@ -6558,10 +6506,9 @@ function renderHyroxImportConfirmModal(){
     RC_OCR_CONF=null;
     const data={...d};
     HYROX_IMPORT_DRAFT=null; HYROX_DB_SELECTED=null;
-    // bug fix: this used to clear HYROX_DB_QUERY/HYROX_DB_RESULTS here. Keeping them means the
-    // same search results are still there afterward (e.g. to add another of this athlete's races,
-    // or a different person from the same search) instead of forcing a re-search from scratch —
-    // matching the same fix already applied to the Doubles partner search.
+    // 기록 추가까지 마쳤으면 검색 결과/검색어를 비운다 (같은 선수를 중복 등록하기 쉬운 상태로
+    // 남겨두지 않기 위해).
+    HYROX_DB_QUERY=""; HYROX_DB_RESULTS=[];
     // reuses the exact same duplicate-check + save pipeline as the manual "기록 추가" form
     // (raceDuplicateExists / showRaceDuplicateConfirm / finalizeAddRace) so both entry paths
     // end up writing to STATE.races identically.
@@ -6603,7 +6550,7 @@ function renderHyroxSearchResults(){
   if(!HYROX_DB_RESULTS.length){
     return `<div class="empty-note">검색 결과가 없습니다. 이름의 일부만 입력해보세요.</div>`;
   }
-  const rows=HYROX_DB_RESULTS.map((x,i)=>{
+  return HYROX_DB_RESULTS.map((x,i)=>{
     const r=x.r;
     return `
       <div style="padding:11px 0;border-top:1px solid var(--line);">
@@ -6620,9 +6567,6 @@ function renderHyroxSearchResults(){
       </div>
     `;
   }).join("");
-  // 검색 결과가 많아도 화면엔 3건 정도 높이만 보이도록 하고, 나머지는 이 영역 안에서만 스크롤해서
-  // 볼 수 있게 한다 (페이지 전체 스크롤과 분리) — Doubles 파트너 검색과 동일한 처리.
-  return `<div style="max-height:280px;overflow-y:auto;">${rows}</div>`;
 }
 
 function bindHyroxNameSearch(wrap){
@@ -7088,23 +7032,6 @@ function probToQualLabel(prob){
   if(prob>=25) return { emoji:"🟠", label:"공격적 목표" };
   return { emoji:"🔴", label:"현재 데이터 기준 어려움" };
 }
-// 예상 순위 (근사치). computePodiumComparisonGroup()이 노출하는 benchmark.fieldTimes(비교군 전체
-// 유효 기록)와 benchmark.avgFieldSize(비교군에 포함된 대회들의 평균 완주 인원)를 이용한다.
-// 백분위(전체 필드 대비 이 기록보다 느린 참가자 비율)는 실제 데이터 그대로라 정확하지만, 그걸
-// "N위"라는 절대 순위로 바꾸는 과정은 대회마다 참가자 수가 다르다는 걸 평균으로 근사하는 것이므로
-// 참고용입니다 — UI에서 반드시 "근사치"라고 표시해야 합니다.
-function computePodiumRankEstimate(predictedSec, ciLow, ciHigh, benchmark){
-  const times=benchmark?.fieldTimes, avgFieldSize=benchmark?.avgFieldSize;
-  if(!times || !times.length || !avgFieldSize) return null;
-  const percentileAt = sec => (times.filter(t=>t>sec).length/times.length)*100;
-  const rankAt = sec => Math.max(1, Math.round((1-percentileAt(sec)/100)*avgFieldSize)+1);
-  const rankA=rankAt(ciLow), rankB=rankAt(ciHigh);
-  return {
-    percentile: percentileAt(predictedSec),
-    rankLow: Math.min(rankA,rankB), rankHigh: Math.max(rankA,rankB),
-    n: times.length, avgFieldSize
-  };
-}
 // general momentum read (NOT tied to a specific target) — driven directly by the measured HPI
 // trend rather than an invented "improvement probability %".
 // the "근거" bullet list that must always accompany a qualitative feasibility label (spec §7 example
@@ -7133,24 +7060,7 @@ const FEASIBILITY_META = {
 // per-category (run/station/roxzone) breakdown for the click-to-expand detail (spec):
 // 현재 예상 기록 → 목표 기록 → 필요한 개선 → 현실적 단축 목표. Returns null when segment-level data
 // isn't available (e.g. proportional fallback decomposition) — never fabricates a range in that case.
-// spec (Doubles Team Engine): 목표 설정 페이지가 Singles/Doubles 탭으로 나뉜다. Singles는 기존
-// renderGoal 본문을 그대로 renderGoalSinglesTab으로 옮긴 것 — 로직은 한 줄도 바뀌지 않았다.
-let GOAL_TAB = "singles";
 function renderGoal(wrap){
-  wrap.innerHTML = `
-    <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">예측</h1></div>
-    <div class="tabs">
-      <div class="tab ${GOAL_TAB==="singles"?"active":""}" data-goal-tab="singles">목표 설정</div>
-      <div class="tab ${GOAL_TAB==="doubles"?"active":""}" data-goal-tab="doubles">파트너 선택</div>
-    </div>
-    <div id="goal-tab-body"></div>
-  `;
-  wrap.querySelectorAll("[data-goal-tab]").forEach(t=>t.addEventListener("click",()=>{ GOAL_TAB=t.dataset.goalTab; renderAll(); }));
-  const body=wrap.querySelector("#goal-tab-body");
-  if(GOAL_TAB==="doubles") renderGoalDoublesTab(body);
-  else renderGoalSinglesTab(body);
-}
-function renderGoalSinglesTab(wrap){
   const p=STATE.profile;
   const effectiveGoalDiv = normalizeRaceDivision(p.goalDivision) || "Open Doubles";
   const effectiveGoalAgeGroup = p.goalAgeGroup || getAgeGroup(Number(p.age));
@@ -7161,6 +7071,7 @@ function renderGoalSinglesTab(wrap){
   try{ if(p.targetTime) plan=computeGoalPlan(); }catch(e){ console.error("[Goal Render Error]",e); plan=null; }
   const safeMeta = plan ? (FEASIBILITY_META[plan.feasibility]||FEASIBILITY_META.challenge) : null;
   wrap.innerHTML=`
+    <div><div class="eyebrow">🎯 GOAL SETTING</div><h1 class="page-title">목표 설정</h1></div>
     <div class="card">
       <div class="grid grid-3">
         ${field("목표 Division",`<select id="goal-target-division">${DIVISIONS.map(d=>`<option value="${d}" ${effectiveGoalDiv===d?"selected":""}>${d}</option>`).join("")}</select>`)}
@@ -7338,611 +7249,6 @@ function renderGoalSinglesTab(wrap){
     const age=wrap.querySelector("#goal-age-group")?.value;
     if(age!=null) STATE.profile.goalAgeGroup=age===getAgeGroup(Number(STATE.profile.age))?"":age;
     persist(); showToast("목표가 저장되었습니다"); renderAll();
-  });
-}
-
-/* ---------------------------------------------------------------------- */
-/* 19b. DOUBLES TEAM ENGINE                                                */
-/*     Completely separate from the Singles engine above: never reads or   */
-/*     writes STATE.races, never touches computePeerAnalysis/HPI. Reuses   */
-/*     resolveUnifiedPerformance()/raceOnlyPrediction()/                   */
-/*     raceOnlyOfficialTimeAnchors() through their new options.races/      */
-/*     forceGender/age overrides — same conversion, same tier-floor, same  */
-/*     Mixed-Doubles-bridge, same Full-Simulation-blend logic a Singles    */
-/*     athlete gets, just resolved against the partner's own data bundle   */
-/*     instead of STATE.                                                   */
-/* ---------------------------------------------------------------------- */
-let GOAL_DOUBLES_MANUAL_MODE = false;
-let DOUBLES_PARTNER_SEARCH_QUERY = "";
-let DOUBLES_PARTNER_SEARCH_RESULTS = [];
-let DOUBLES_PARTNER_MANUAL_DRAFT = null;
-
-// Same-gender pair -> the user's explicit Open/Pro choice decides the tier. Different-gender pair
-// -> always Mixed Doubles (this app's DIVISIONS has no separate Open/Pro Mixed tier), so the tier
-// choice doesn't apply/isn't shown.
-function deriveDoublesTeamDivision(myGender, partnerGender, selectedTier){
-  const same = upv4NormGender(myGender)===upv4NormGender(partnerGender);
-  if(!same) return "Mixed Doubles";
-  return selectedTier==="Pro" ? "Pro Doubles" : "Open Doubles";
-}
-
-// Station reps split by role (default 50:50, STATE.doublesTeam.splitPct overrides per station).
-// Running (and, for lack of any spec'd alternative, Roxzone transition time — both are "moving as a
-// team" segments rather than divisible work) are NOT split: the team is bound by whichever partner
-// is slower, so the combined value is the SLOWER (larger) of the two individually-resolved values.
-// Doubles Running pace-combination: "느린 선수 Pace 가중" 테이블. 파트너가 실제 Doubles 기록을
-// 보유했는지(둘이 같이 뛰어본 경험 반영, 완화됨) vs Singles 기록만 있는지(더 크게 반영)에 따라
-// 다른 테이블을 쓰고, 두 선수의 페이스 차이(초/km) 구간별로 "느린 쪽에 얼마나 가중치를 둘지" 결정.
-const DOUBLES_RUN_PACE_WEIGHT_SINGLES_ONLY = [
-  {max:10, w:0.55}, {max:20, w:0.65}, {max:30, w:0.75}, {max:45, w:0.85}, {max:Infinity, w:0.90}
-];
-const DOUBLES_RUN_PACE_WEIGHT_HAS_DOUBLES = [
-  {max:10, w:0.55}, {max:20, w:0.60}, {max:30, w:0.65}, {max:45, w:0.70}, {max:Infinity, w:0.70}
-];
-function doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData){
-  const table = partnerHasDoublesData ? DOUBLES_RUN_PACE_WEIGHT_HAS_DOUBLES : DOUBLES_RUN_PACE_WEIGHT_SINGLES_ONLY;
-  return (table.find(r=>paceDiffSecKm<=r.max) || table[table.length-1]).w;
-}
-// 파트너의 "현재 Running 기준값" — 동일 유형 기록이 여러 개면 최근 최대 3개를 최근일수록 더 크게
-// 가중(3:2:1 / 2:1 / 1)해 반영한다. 각 기록의 변환은 새로 만들지 않고 resolveUnifiedPerformance를
-// 기록 1건씩 넣어 그대로 재사용 — Division 변환/Same-format 우선/Tier Floor 등 기존 로직이 각
-// 기록에 동일하게 적용된다. 실제 대회 러닝 스플릿이 있는 기록이 하나도 없으면 null을 반환해
-// (Running TT/PB → benchmark로 이어지는) 기존 fallback 경로를 그대로 쓰도록 한다.
-function computeDoublesPartnerRunningBasis(teamDivision){
-  const partner=STATE.doublesPartner;
-  if(!partner) return null;
-  const gender=upv4NormGender(partner.gender);
-  const perRace=(partner.races||[]).map(race=>{
-    const u=resolveUnifiedPerformance(teamDivision, { races:[race], simulations:[], forceGender:gender });
-    const seg=u.segments?.runTotal;
-    if(!seg) return null;
-    return { date:race.date||"", paceSecKm:seg.value/RUN_KEYS.length };
-  }).filter(Boolean).sort((a,b)=>b.date.localeCompare(a.date)); // 최신순
-  if(!perRace.length) return null;
-
-  const recent=perRace.slice(0,3);
-  const weights = recent.length===3 ? [3,2,1] : recent.length===2 ? [2,1] : [1];
-  const sumW=weights.reduce((a,b)=>a+b,0);
-  const pace=recent.reduce((s,r,i)=>s+r.paceSecKm*weights[i],0)/sumW;
-
-  // 편차(일관성) — 1차 구현은 UI 없이 계산만. 나중에 신뢰도 표시에 재사용 가능하도록 남겨둔다.
-  const paces=recent.map(r=>r.paceSecKm);
-  const meanPace=paces.reduce((a,b)=>a+b,0)/paces.length;
-  const stdevSecKm=Math.sqrt(paces.reduce((s,p)=>s+(p-meanPace)**2,0)/paces.length);
-  const spreadSecKm=Math.max(...paces)-Math.min(...paces);
-
-  return { pace, n:recent.length, records:recent, stdevSecKm, spreadSecKm };
-}
-function computeDoublesTeamPrediction(){
-  const partner=STATE.doublesPartner;
-  if(!partner) return null;
-  const sameGender = upv4NormGender(STATE.profile.gender)===upv4NormGender(partner.gender);
-  const selectedTier = STATE.doublesTeam.division;
-  if(sameGender && !selectedTier) return { needsTierChoice:true, sameGender, teamDivision:null };
-  const teamDivision = deriveDoublesTeamDivision(STATE.profile.gender, partner.gender, selectedTier);
-
-  const myPred = raceOnlyPrediction(teamDivision);
-  const partnerAge = Number(partner.age);
-  const partnerPred = raceOnlyPrediction(teamDivision, {
-    races: partner.races||[],
-    simulations: partner.simulationTests||[],
-    running: partner.running||{},
-    forceGender: upv4NormGender(partner.gender),
-    age: Number.isFinite(partnerAge) && partnerAge>0 ? partnerAge : null,
-  });
-  // "상대 선수(파트너)가 Doubles 기록을 보유했는가" — 나 자신의 Doubles 경험 여부는 이 계산에서
-  // 보지 않는다(스펙 그대로: 상대 선수 기준).
-  const partnerHasDoublesData = (partner.races||[]).some(r=>upv4IsDoubles(normalizeRaceDivision(r.division)||r.division));
-  const partnerRunBasis = computeDoublesPartnerRunningBasis(teamDivision);
-
-  const splitPct = STATE.doublesTeam.splitPct||{};
-  const order=["runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"];
-  const myMap=Object.fromEntries(myPred.parts.map(p=>[p.segment,p]));
-  const partnerMap=Object.fromEntries(partnerPred.parts.map(p=>[p.segment,p]));
-  const parts=order.map(seg=>{
-    const mine=myMap[seg], theirs=partnerMap[seg];
-    if(!mine || !theirs) return null; // missing on either side (rare — no benchmark coverage at all)
-    if(seg==="runTotal"){
-      // 페이스(초/km) 차이 + 파트너의 Doubles 보유 여부로 "느린 선수 가중"을 구해 함께 달리는
-      // 팀 페이스를 추정한다 — 단순히 더 느린 쪽 기록을 그대로 쓰지 않는다. 파트너 쪽 페이스는
-      // (실제 러닝 스플릿이 있는 기록이 있다면) 최근 최대 3개 기록의 가중평균을 사용한다.
-      const myPaceSecKm=mine.value/RUN_KEYS.length;
-      const partnerPaceSecKm=partnerRunBasis ? partnerRunBasis.pace : theirs.value/RUN_KEYS.length;
-      const paceDiffSecKm=Math.abs(myPaceSecKm-partnerPaceSecKm);
-      const slowerWeight=doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData);
-      const fasterPace=Math.min(myPaceSecKm,partnerPaceSecKm), slowerPace=Math.max(myPaceSecKm,partnerPaceSecKm);
-      const teamPaceSecKm=fasterPace*(1-slowerWeight) + slowerPace*slowerWeight;
-      const value=teamPaceSecKm*RUN_KEYS.length;
-      return { segment:seg, value, mode:"run-weighted", mySec:mine.value, partnerSec:partnerPaceSecKm*RUN_KEYS.length,
-        mySource:mine.source, partnerSource:theirs.source, paceDiffSecKm, slowerWeight, partnerHasDoublesData, partnerRunBasis };
-    }
-    if(seg==="roxzone"){
-      const value=Math.max(mine.value, theirs.value);
-      return { segment:seg, value, mode:"shared-slower", mySec:mine.value, partnerSec:theirs.value, mySource:mine.source, partnerSource:theirs.source };
-    }
-    const stationKey=UPV4_SEGMENT_TO_STATION_KEY[seg];
-    const myPct=(splitPct[stationKey]!=null ? Number(splitPct[stationKey]) : 50)/100;
-    const value=mine.value*myPct + theirs.value*(1-myPct);
-    return { segment:seg, value, mode:"split", myPct:myPct*100, mySec:mine.value, partnerSec:theirs.value, mySource:mine.source, partnerSource:theirs.source };
-  }).filter(Boolean);
-
-  const predicted=parts.reduce((s,x)=>s+x.value,0);
-  // Team uncertainty range: conservatively add both members' own half-widths (from their
-  // individually-resolved raceOnlyPrediction confidence) rather than inventing a new model —
-  // the team can never be MORE certain than either member's own individual prediction is.
-  const myHalfWidth = myPred.ciHigh - myPred.predicted;
-  const partnerHalfWidth = partnerPred.ciHigh - partnerPred.predicted;
-  const halfWidth = myHalfWidth + partnerHalfWidth;
-  const ciLow = Math.max(0, predicted - halfWidth);
-  const ciHigh = predicted + halfWidth;
-  const CONF_RANK={LOW:0,MEDIUM:1,HIGH:2};
-  const confidence = CONF_RANK[myPred.confidence] <= CONF_RANK[partnerPred.confidence] ? myPred.confidence : partnerPred.confidence;
-  return { needsTierChoice:false, sameGender, teamDivision, predicted, ciLow, ciHigh, confidence, parts, myPred, partnerPred };
-}
-
-// Team Age Group for the Doubles Podium DB comparison: average of both athletes' ages by default
-// (STATE.doublesTeam.ageGroup lets the user override this with an explicit choice instead).
-function computeDoublesTeamAgeGroup(){
-  if(STATE.doublesTeam.ageGroup) return STATE.doublesTeam.ageGroup;
-  const partner=STATE.doublesPartner;
-  const myAge=Number(STATE.profile.age);
-  const partnerAge=Number(partner?.age);
-  if(Number.isFinite(myAge) && myAge>0 && Number.isFinite(partnerAge) && partnerAge>0){
-    return getAgeGroup(Math.round((myAge+partnerAge)/2));
-  }
-  return getAgeGroup(myAge); // partner age unknown (e.g. HPS-search-imported without a numeric age) — fall back to my own
-}
-
-// Doubles Podium: reuses computePodiumBenchmark()/computePodiumProbability()/probToQualLabel() —
-// the exact same real-participant-DB comparison the Singles engine uses — filtered by the TEAM's
-// division/ageGroup instead of the individual athlete's. Gender is irrelevant for Mixed Doubles
-// (computePodiumComparisonGroup already ignores it for that division), so passing either is fine.
-async function computeDoublesTeamPodium(){
-  const teamResult=computeDoublesTeamPrediction();
-  if(!teamResult || teamResult.needsTierChoice) return null;
-  const ageGroup=computeDoublesTeamAgeGroup();
-  const genderForFilter=upv4NormGender(STATE.profile.gender);
-  const benchmark=await computePodiumBenchmark(null, teamResult.teamDivision, genderForFilter, ageGroup);
-  const base={ teamDivision:teamResult.teamDivision, predicted:teamResult.predicted, ageGroup, benchmark };
-  if(benchmark.scope==="insufficient") return { ...base, status:"insufficient" };
-  const cutoff=benchmark.podium[Math.min(2, benchmark.podium.length-1)];
-  const probability=computePodiumProbability(teamResult.predicted, teamResult.ciLow, teamResult.ciHigh, cutoff);
-  const rankEstimate=computePodiumRankEstimate(teamResult.predicted, teamResult.ciLow, teamResult.ciHigh, benchmark);
-  return { ...base, status:"ok", cutoff, probability, qual:probToQualLabel(probability), gapSec:teamResult.predicted-cutoff, rankEstimate };
-}
-
-function renderGoalDoublesTab(wrap){
-  const partner=STATE.doublesPartner;
-  if(!partner){
-    wrap.innerHTML = `
-      <div class="card">
-        <h2 class="section-title">👥 파트너</h2>
-        <p class="lead" style="margin:6px 0 12px;">파트너를 선택하면 팀 예상 기록이 바로 계산됩니다. 역할 분배는 나중에 필요할 때만 조정하면 됩니다.</p>
-      </div>
-      ${renderDoublesPartnerSearchCard()}
-      <div class="card">
-        <div class="row-between"><h2 class="section-title">✍️ 파트너 기록 직접 입력</h2>
-          <span class="chip" id="dbl-manual-toggle" style="cursor:pointer;">${GOAL_DOUBLES_MANUAL_MODE?"검색으로 돌아가기":"직접 입력하기"}</span>
-        </div>
-        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
-      </div>
-    `;
-    bindDoublesPartnerSearch(wrap);
-    wrap.querySelector("#dbl-manual-toggle")?.addEventListener("click",()=>{ GOAL_DOUBLES_MANUAL_MODE=!GOAL_DOUBLES_MANUAL_MODE; renderAll(); });
-    if(GOAL_DOUBLES_MANUAL_MODE) bindDoublesPartnerManualForm(wrap);
-    return;
-  }
-
-  if(!partner.gender){
-    wrap.innerHTML = `
-      <div class="card">
-        <h2 class="section-title">👥 파트너: ${escapeHtml(partner.name||"파트너")}</h2>
-        <div class="reason-line" style="margin-top:4px;">${partner.age?`${escapeHtml(String(partner.age))}세 · `:""}${partner.division?`${escapeHtml(partner.division)} · `:""}${partner.races?.length||0}건의 기록 보유</div>
-      </div>
-      <div class="card">
-        <h2 class="section-title">⚠️ 성별을 확인해주세요</h2>
-        <p class="lead" style="margin:6px 0 12px;">팀 Division 계산을 위해 성별을 선택해주세요.</p>
-        <div class="hstack" style="gap:8px;">
-          <div class="chip" data-dbl-partner-gender="male" style="cursor:pointer;padding:9px 18px;">남성</div>
-          <div class="chip" data-dbl-partner-gender="female" style="cursor:pointer;padding:9px 18px;">여성</div>
-        </div>
-      </div>
-    `;
-    wrap.querySelectorAll("[data-dbl-partner-gender]").forEach(chip=>chip.addEventListener("click",()=>{
-      STATE.doublesPartner.gender=chip.dataset.dblPartnerGender;
-      persist(); renderAll();
-    }));
-    return;
-  }
-
-  const sameGender = upv4NormGender(STATE.profile.gender)===upv4NormGender(partner.gender);
-  const result = computeDoublesTeamPrediction();
-  wrap.innerHTML = `
-    <div class="card">
-      <div class="row-between">
-        <h2 class="section-title">👥 파트너: ${escapeHtml(partner.name||"파트너")}</h2>
-        <span class="chip" id="dbl-partner-remove" style="cursor:pointer;color:var(--red);">파트너 제거</span>
-      </div>
-      <div class="reason-line" style="margin-top:4px;">${partner.gender==="female"?"여성":"남성"}${partner.age?` · ${escapeHtml(String(partner.age))}세`:""}${partner.division?` · ${escapeHtml(partner.division)}`:""} · ${partner.races?.length||0}건의 기록 보유</div>
-    </div>
-    <div class="card">
-      <h2 class="section-title">팀 Division</h2>
-      ${sameGender ? `
-        <p class="lead" style="margin:6px 0 10px;">같은 성별 파트너입니다 — 어느 Division으로 출전할지 선택해주세요.</p>
-        <div class="hstack" style="gap:8px;">
-          <div class="chip ${STATE.doublesTeam.division==="Open"?"on":""}" data-dbl-tier="Open" style="cursor:pointer;padding:9px 18px;">Open</div>
-          <div class="chip ${STATE.doublesTeam.division==="Pro"?"on":""}" data-dbl-tier="Pro" style="cursor:pointer;padding:9px 18px;">Pro</div>
-        </div>
-      ` : `<p class="lead" style="margin:6px 0;">서로 다른 성별 파트너입니다 — <b style="color:var(--orange);">Mixed Doubles</b>로 자동 결정됩니다.</p>`}
-    </div>
-    ${result?.needsTierChoice ? `<div class="card"><div class="empty-note">위에서 팀 Division(Open/Pro)을 선택하면 팀 예상 기록이 계산됩니다.</div></div>` : ""}
-    ${result && !result.needsTierChoice ? renderDoublesTeamResultCard(result, partner) : ""}
-    ${result && !result.needsTierChoice ? renderDoublesSplitSection(partner) : ""}
-    ${result && !result.needsTierChoice ? renderDoublesPodiumSection() : ""}
-  `;
-  wrap.querySelector("#dbl-partner-remove")?.addEventListener("click",()=>{
-    if(!confirm("파트너 정보를 삭제할까요? (팀 Division/역할 분배 설정도 함께 초기화됩니다)")) return;
-    STATE.doublesPartner=null; STATE.doublesTeam={division:null,splitPct:{},splitMode:"default",ageGroup:""};
-    DOUBLES_PODIUM_SHOWN=false; DOUBLES_PODIUM_RESULT=null;
-    persist(); renderAll();
-  });
-  wrap.querySelectorAll("[data-dbl-tier]").forEach(chip=>chip.addEventListener("click",()=>{
-    STATE.doublesTeam.division=chip.dataset.dblTier;
-    DOUBLES_PODIUM_SHOWN=false; DOUBLES_PODIUM_RESULT=null; // team division changed — old podium result no longer applies
-    persist(); renderAll();
-  }));
-  if(result && !result.needsTierChoice) bindDoublesSplitSection(wrap);
-  if(result && !result.needsTierChoice) bindDoublesPodiumSection(wrap);
-}
-
-// P2: role split (역할 분배) — spec §9~10: optional, defaults to 50:50, never forced on the user.
-// Running is excluded from the split entirely (computeDoublesTeamPrediction already always combines
-// it as "shared-slower", regardless of splitMode) — only the 8 stations are adjustable here.
-function renderDoublesSplitSection(partner){
-  const mode=STATE.doublesTeam.splitMode||"default";
-  const splitPct=STATE.doublesTeam.splitPct||{};
-  return `
-    <div class="card">
-      <h2 class="section-title">⚙️ 역할 분배</h2>
-      <p class="lead" style="margin:6px 0 10px;">선택사항입니다 — 기본 50:50으로도 팀 예상 기록은 이미 계산되어 있습니다. Running은 함께 수행하는 구간이라 분배 대상이 아닙니다.</p>
-      <div class="hstack" style="gap:8px;">
-        <div class="chip ${mode==="default"?"on":""}" data-dbl-split-mode="default" style="cursor:pointer;padding:9px 18px;">기본 50:50</div>
-        <div class="chip ${mode==="custom"?"on":""}" data-dbl-split-mode="custom" style="cursor:pointer;padding:9px 18px;">직접 설정</div>
-      </div>
-      ${mode==="custom" ? `
-        <div style="margin-top:14px;">
-          ${STATIONS.map(s=>{
-            const myPct=splitPct[s.key]!=null?Number(splitPct[s.key]):50;
-            return `<div style="margin-top:${STATIONS.indexOf(s)===0?"0":"14"}px;">
-              <div class="row-between" style="margin-bottom:4px;">
-                <span style="font-size:12.5px;font-weight:700;">${s.label}</span>
-                <span class="reason-line">나 ${myPct}% · ${escapeHtml(partner.name||"파트너")} ${100-myPct}%</span>
-              </div>
-              <input type="range" min="0" max="100" step="5" value="${myPct}" data-dbl-split-station="${s.key}" style="width:100%;">
-            </div>`;
-          }).join("")}
-        </div>
-      ` : ""}
-    </div>
-  `;
-}
-function bindDoublesSplitSection(wrap){
-  wrap.querySelectorAll("[data-dbl-split-mode]").forEach(chip=>chip.addEventListener("click",()=>{
-    const mode=chip.dataset.dblSplitMode;
-    STATE.doublesTeam.splitMode=mode;
-    if(mode==="default") STATE.doublesTeam.splitPct={}; // reset to a clean 50:50 — no stale custom values left lurking
-    DOUBLES_PODIUM_SHOWN=false; DOUBLES_PODIUM_RESULT=null; // prediction changed — old podium result no longer applies
-    persist(); renderAll();
-  }));
-  wrap.querySelectorAll("[data-dbl-split-station]").forEach(slider=>{
-    slider.addEventListener("input",()=>{
-      // live-update the label while dragging, without a full re-render (keeps the slider itself
-      // from losing focus/position mid-drag)
-      const row=slider.previousElementSibling;
-      const key=slider.dataset.dblSplitStation;
-      const stLabel=STATIONS.find(s=>s.key===key)?.label||key;
-      const partnerName=STATE.doublesPartner?.name||"파트너";
-      if(row) row.innerHTML=`<span style="font-size:12.5px;font-weight:700;">${escapeHtml(stLabel)}</span><span class="reason-line">나 ${slider.value}% · ${escapeHtml(partnerName)} ${100-Number(slider.value)}%</span>`;
-    });
-    slider.addEventListener("change",()=>{
-      STATE.doublesTeam.splitPct[slider.dataset.dblSplitStation]=Number(slider.value);
-      DOUBLES_PODIUM_SHOWN=false; DOUBLES_PODIUM_RESULT=null;
-      persist(); renderAll();
-    });
-  });
-}
-
-let DOUBLES_PODIUM_SHOWN=false, DOUBLES_PODIUM_RESULT=null, DOUBLES_PODIUM_CALC_IN_FLIGHT=false;
-function renderDoublesPodiumSection(){
-  const myAge=Number(STATE.profile.age), partnerAge=Number(STATE.doublesPartner?.age);
-  const bothAgesKnown=Number.isFinite(myAge)&&myAge>0&&Number.isFinite(partnerAge)&&partnerAge>0;
-  const currentAgeGroup=computeDoublesTeamAgeGroup();
-  return `
-    <div class="card">
-      <h2 class="section-title">🏆 Doubles 포디움</h2>
-      <div class="field" style="margin-top:8px;max-width:260px;">
-        <label>비교 연령대${bothAgesKnown && !STATE.doublesTeam.ageGroup ? " (두 선수 평균)" : ""}</label>
-        <select id="dbl-age-group">${AGE_GROUPS.map(a=>`<option value="${a}" ${currentAgeGroup===a?"selected":""}>${a}</option>`).join("")}</select>
-      </div>
-      <div style="margin-top:12px;"><button class="btn" id="dbl-podium-btn" style="width:100%;justify-content:center;">🏆 Doubles 포디움 가능성은?</button></div>
-      <div id="dbl-podium-result"></div>
-    </div>
-  `;
-}
-function bindDoublesPodiumSection(wrap){
-  wrap.querySelector("#dbl-age-group")?.addEventListener("change",e=>{
-    STATE.doublesTeam.ageGroup = e.target.value;
-    DOUBLES_PODIUM_SHOWN=false; DOUBLES_PODIUM_RESULT=null;
-    persist(); renderAll();
-  });
-  wrap.querySelector("#dbl-podium-btn")?.addEventListener("click",async()=>{
-    if(DOUBLES_PODIUM_CALC_IN_FLIGHT) return;
-    const btn=wrap.querySelector("#dbl-podium-btn");
-    DOUBLES_PODIUM_CALC_IN_FLIGHT=true;
-    if(btn){ btn.disabled=true; btn.style.opacity=".65"; btn.textContent="🏆 포디움 가능성을 계산하는 중…"; }
-    const el=wrap.querySelector("#dbl-podium-result");
-    if(el) el.innerHTML=`
-      <div style="text-align:center;padding:24px 0 8px;">
-        <div class="hps-podium-spinner"></div>
-        <p style="font-size:14px;font-weight:700;margin-top:14px;">실제 Doubles 참가자 데이터를 조회하는 중…</p>
-      </div>
-      <style>
-        .hps-podium-spinner{width:36px;height:36px;margin:0 auto;border-radius:50%;
-          border:4px solid var(--surface2);border-top-color:var(--orange);
-          animation:hpsPodiumSpin 0.8s linear infinite;}
-        @keyframes hpsPodiumSpin{to{transform:rotate(360deg);}}
-      </style>`;
-    DOUBLES_PODIUM_SHOWN=true;
-    await new Promise(resolve=>setTimeout(resolve,50));
-    if(!(CURRENT_PAGE==="goal" && GOAL_TAB==="doubles")) return;
-    try{ DOUBLES_PODIUM_RESULT=await computeDoublesTeamPodium(); }
-    catch(e){ DOUBLES_PODIUM_RESULT={status:"error", error:String(e?.message||e)}; }
-    finally{ DOUBLES_PODIUM_CALC_IN_FLIGHT=false; }
-    if(!(CURRENT_PAGE==="goal" && GOAL_TAB==="doubles")) return;
-    const liveWrap=document.getElementById("main-content") || wrap;
-    renderDoublesPodiumResult(liveWrap);
-    liveWrap.querySelector("#dbl-podium-btn")?.removeAttribute("disabled");
-    const liveBtn=liveWrap.querySelector("#dbl-podium-btn");
-    if(liveBtn){ liveBtn.style.opacity="1"; liveBtn.textContent="🏆 Doubles 포디움 가능성은?"; }
-  });
-  if(DOUBLES_PODIUM_SHOWN) renderDoublesPodiumResult(wrap);
-}
-function renderDoublesPodiumResult(wrap){
-  const el=wrap.querySelector("#dbl-podium-result");
-  if(!el) return;
-  const r=DOUBLES_PODIUM_RESULT;
-  if(!r){ el.innerHTML=""; return; }
-  if(r.status==="error"){
-    el.innerHTML=`<div class="reason-line" style="margin-top:10px;color:var(--red);">계산 중 문제가 발생했습니다: ${escapeHtml(r.error||"")}</div>`;
-    return;
-  }
-  if(r.status==="insufficient"){
-    el.innerHTML=`<div class="reason-line" style="margin-top:10px;">${escapeHtml(r.teamDivision)} · ${escapeHtml(r.ageGroup)} 기준 실제 Doubles 참가자 데이터가 <b style="color:var(--amber);">부족합니다.</b> 데이터가 더 쌓이면 포디움 기준을 계산해드립니다.</div>`;
-    return;
-  }
-  const medalEmoji=["🥇","🥈","🥉"];
-  const gapPositive=r.gapSec>0;
-  el.innerHTML=`
-    <div style="text-align:center;padding:18px 0 6px;">
-      <div style="font-family:var(--font-display);font-size:48px;font-weight:800;color:var(--orange);">${round1(r.probability)}%</div>
-      <div style="font-size:11px;letter-spacing:1px;color:var(--gray-dim);margin-top:2px;">PODIUM CHANCE</div>
-      <div style="display:inline-block;margin-top:8px;padding:5px 14px;border-radius:20px;background:var(--surface2);font-size:13px;font-weight:700;">${r.qual.emoji} ${r.qual.label}</div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:center;margin-top:12px;">
-      <div><div style="font-size:10.5px;color:var(--gray-dim);">팀 예상 기록</div><div class="mono" style="font-size:16px;font-weight:700;margin-top:3px;">${fmtTime(r.predicted)}</div></div>
-      <div><div style="font-size:10.5px;color:var(--gray-dim);">포디움 Gap (3위 기준)</div><div class="mono" style="font-size:16px;font-weight:700;margin-top:3px;color:${gapPositive?'var(--red)':'var(--green)'};">${gapPositive?"+":"-"}${fmtTime(Math.abs(r.gapSec))}</div></div>
-    </div>
-    ${r.rankEstimate ? `
-    <div class="divider" style="margin:14px 0;"></div>
-    <div style="text-align:center;">
-      <div style="font-size:10.5px;color:var(--gray-dim);">전체 참가자(${r.rankEstimate.n}명) 대비</div>
-      <div class="mono" style="font-size:20px;font-weight:800;color:var(--white);margin-top:3px;">상위 ${round1(100-r.rankEstimate.percentile)}%</div>
-      <div class="reason-line" style="margin-top:6px;">예상 순위 (근사치): <b style="color:var(--white);">${r.rankEstimate.rankLow===r.rankEstimate.rankHigh ? `${r.rankEstimate.rankLow}위` : `${r.rankEstimate.rankLow}-${r.rankEstimate.rankHigh}위권`}</b></div>
-      <div class="reason-line" style="margin-top:4px;color:var(--gray-dim);font-size:11px;">대회별 평균 완주 인원(${Math.round(r.rankEstimate.avgFieldSize)}명 기준)으로 환산한 값이라 참고용입니다 — 위 백분위가 더 정확한 지표입니다.</div>
-    </div>
-    ` : ""}
-    <div class="divider" style="margin:14px 0;"></div>
-    ${r.benchmark.podium.map((t,i)=>`<div class="row-between" style="padding:5px 0;"><span style="font-size:13px;">${medalEmoji[i]||"　"} ${i+1}위</span><span class="mono" style="font-weight:700;">${fmtTime(t)}</span></div>`).join("")}
-    <div class="reason-line" style="margin-top:8px;">기준: ${escapeHtml(r.teamDivision)} · ${escapeHtml(r.ageGroup)} · 실제 참가자 DB (최근 6개월)</div>
-  `;
-}
-
-function renderDoublesTeamResultCard(result, partner){
-  const teamDivLabel = result.teamDivision;
-  return `
-    <div class="card" style="border-left:3px solid var(--orange);">
-      <div class="eyebrow gray">👥 TEAM PREDICTION</div>
-      <div style="font-family:var(--font-display);font-weight:800;font-size:42px;color:var(--white);margin-top:6px;">${fmtTime(result.predicted)}</div>
-      <div class="reason-line" style="margin-top:6px;">${escapeHtml(teamDivLabel)} 기준 팀 예상 기록</div>
-    </div>
-    <div class="card">
-      <h2 class="section-title">기록 구성</h2>
-      <div class="grid grid-2" style="margin-top:8px;">
-        <div>
-          <div class="eyebrow gray">나</div>
-          ${result.myPred.parts.map(p=>`<div class="kv" style="padding:3px 0;"><span class="k" style="font-size:11.5px;">${STATION_LABEL_MAP[p.segment]||p.segment}</span><span class="v mono" style="font-size:11.5px;">${fmtTime(p.value)}</span></div>`).join("")}
-        </div>
-        <div>
-          <div class="eyebrow gray">${escapeHtml(partner.name||"파트너")}</div>
-          ${result.partnerPred.parts.map(p=>`<div class="kv" style="padding:3px 0;"><span class="k" style="font-size:11.5px;">${STATION_LABEL_MAP[p.segment]||p.segment}</span><span class="v mono" style="font-size:11.5px;">${fmtTime(p.value)}</span></div>`).join("")}
-        </div>
-      </div>
-      <p class="reason-line" style="margin-top:10px;">Running/Roxzone은 함께 수행(더 느린 쪽 기준), Station은 기본 50:50으로 분담해 계산했습니다.</p>
-    </div>
-  `;
-}
-const STATION_LABEL_MAP = { runTotal:"Running (8구간 합)", roxzone:"Roxzone", ski:"SkiErg", sledPush:"Sled Push", sledPull:"Sled Pull",
-  bbj:"Burpee Broad Jump", row:"Row", farmers:"Farmer Carry", lunges:"Sandbag Lunge", wallBalls:"Wall Ball" };
-
-function renderDoublesPartnerSearchCard(){
-  const ready=hyroxDbReady();
-  return `
-    <div class="card" style="border-left:3px solid var(--orange);">
-      <h2 class="section-title">🔎 선수 검색</h2>
-      <p class="lead" style="margin:6px 0 10px;">파트너의 실제 HYROX 기록을 이름으로 검색해서 불러올 수 있습니다.</p>
-      <div class="hstack" style="gap:8px;align-items:stretch;">
-        <input id="dbl-partner-search" style="flex:1;min-width:0;" placeholder="예: 김 철수 or 철수" value="${escapeHtml(DOUBLES_PARTNER_SEARCH_QUERY)}" ${ready?"":"disabled"}>
-        <button class="btn sm" id="dbl-partner-search-btn" ${ready?"":"disabled"}>검색</button>
-      </div>
-      <div id="dbl-partner-status" style="margin-top:8px;font-size:12px;color:var(--gray);">
-        ${ready?"이름 일부만 입력해도 검색 됩니다. (Full Name 검색 시, 성과 이름은 띄어쓰기 필수)":"Supabase 백데이터에 연결하는 중…"}
-      </div>
-      <div id="dbl-partner-results" style="margin-top:10px;">
-        ${ready && DOUBLES_PARTNER_SEARCH_QUERY ? renderDoublesPartnerSearchResults() : ""}
-      </div>
-    </div>
-  `;
-}
-function renderDoublesPartnerSearchResults(){
-  if(!DOUBLES_PARTNER_SEARCH_RESULTS.length) return `<div class="empty-note">검색 결과가 없습니다. 이름의 일부만 입력해보세요.</div>`;
-  // Group by athlete name — picking any one result imports ALL of that same name's races found.
-  const byName=new Map();
-  DOUBLES_PARTNER_SEARCH_RESULTS.forEach((x,i)=>{
-    const key=x.r.n;
-    if(!byName.has(key)) byName.set(key,{first:i, rows:[]});
-    byName.get(key).rows.push(x);
-  });
-  const rows=[...byName.entries()].map(([name,g])=>{
-    const r=g.rows[0].r;
-    return `
-      <div style="padding:11px 0;border-top:1px solid var(--line);">
-        <div class="row-between" style="gap:10px;">
-          <div style="min-width:0;">
-            <div style="font-weight:800;color:var(--white);">${escapeHtml(name)}</div>
-            <div class="reason-line" style="margin-top:3px;">${escapeHtml(hyroxSourceBadge(r))}${r.t?` · <b style="color:var(--white);">${escapeHtml(r.t)}</b>`:""}</div>
-            <div class="reason-line" style="margin-top:3px;">HYROX 기록 ${g.rows.length}건</div>
-          </div>
-          <button class="btn sm" data-dbl-partner-pick="${escapeHtml(name)}">파트너로 선택</button>
-        </div>
-      </div>
-    `;
-  }).join("");
-  // 검색 결과가 3건보다 많아도 화면엔 3건 정도 높이만 보이도록 하고, 나머지는 이 영역 안에서만
-  // 스크롤해서 볼 수 있게 한다 (페이지 전체 스크롤과 분리).
-  return `<div style="max-height:280px;overflow-y:auto;">${rows}</div>`;
-}
-function bindDoublesPartnerSearch(wrap){
-  const input=wrap.querySelector("#dbl-partner-search");
-  const btn=wrap.querySelector("#dbl-partner-search-btn");
-  const runSearch=async()=>{
-    const q=input?.value.trim()||"";
-    DOUBLES_PARTNER_SEARCH_QUERY=q;
-    if(q.length<2){
-      DOUBLES_PARTNER_SEARCH_RESULTS=[];
-      const st=wrap.querySelector("#dbl-partner-status");
-      if(st) st.textContent="이름을 2글자 이상 입력해주세요.";
-      const rs=wrap.querySelector("#dbl-partner-results");
-      if(rs) rs.innerHTML="";
-      return;
-    }
-    try{
-      if(!hyroxDbReady()) await ensureHyroxSearchDb();
-      DOUBLES_PARTNER_SEARCH_RESULTS=await searchHyroxByName(q,20);
-      renderAll();
-    }catch(e){
-      const st=wrap.querySelector("#dbl-partner-status");
-      if(st){ st.style.color="var(--red)"; st.textContent="검색 실패: "+(e.message||e); }
-    }
-  };
-  btn?.addEventListener("click",runSearch);
-  input?.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); runSearch(); }});
-  wrap.querySelectorAll("[data-dbl-partner-pick]").forEach(b=>{
-    b.addEventListener("click",()=>pickDoublesPartnerFromSearch(b.dataset.dblPartnerPick));
-  });
-}
-// bug fix: rows[0].r.g isn't always the athlete's own gender — a Mixed Doubles race is tagged
-// with a team-level "Mixed" gender in the source DB (see reconcileDivisionWithGender's g.includes
-// ("mixed") check above), not the individual athlete's actual sex. Blindly reading rows[0]'s gender
-// meant picking a partner whose FIRST found race happened to be Mixed Doubles silently defaulted to
-// "male" regardless of their real gender. Now scans ALL of the athlete's found races for the first
-// one that actually states an individual gender, skipping any "Mixed"-tagged team entries.
-function parseIndividualGenderRaw(raw){
-  const g=String(raw||"").trim().toLowerCase();
-  if(!g || g.includes("mixed") || g.includes("혼성")) return null;
-  // bug fix: only English "female"/"male"/"f"/"m" were checked, but the source DB stores gender
-  // in Korean ("여"/"남"/"여성"/"남성") for at least some rows — those all failed to match and
-  // fell through to "unknown", incorrectly triggering the gender-confirmation screen even for
-  // races that DID clearly state a gender. Female checked first since "female" contains "male".
-  if(g.includes("female")||g.includes("woman")||g==="w"||g==="f"||g.includes("여")) return "female";
-  if(g.includes("male")||g.includes("man")||g==="m"||g.includes("남")) return "male";
-  return null;
-}
-function pickDoublesPartnerFromSearch(name){
-  const rows=DOUBLES_PARTNER_SEARCH_RESULTS.filter(x=>x.r.n===name);
-  if(!rows.length) return;
-  const races=rows.map(x=>{
-    const r=x.r;
-    const runs={}; RUN_KEYS.forEach((k,i)=>{ runs[k]=r.u?.[i]||""; });
-    const stations={}; STATIONS.forEach((s,i)=>{ stations[s.key]=r.s?.[i]||""; });
-    const validDate = r.dt && /^\d{4}-\d{2}-\d{2}$/.test(r.dt) ? r.dt : todayISO();
-    return { id:uid(), date:validDate, division:reconcileDivisionWithGender(r.d||DIVISIONS[0], r.g), officialTime:r.t||"", runs, stations, transition:r.z||"" };
-  });
-  let gender=null;
-  for(const x of rows){ gender=parseIndividualGenderRaw(x.r.g); if(gender) break; }
-  // every found race was Mixed Doubles (team-level gender tag only) — can't infer the athlete's
-  // actual gender from the DB, so leave it unset rather than silently guessing "male". The Doubles
-  // tab shows a required gender picker below until this is confirmed.
-  STATE.doublesPartner = {
-    id:uid(), name, gender,
-    age:"", ageGroupDisplay: rows[0].r.a||"", // HPS 검색은 나이대(예: 35-39)만 제공 — 정확한 나이가 아니므로
-                                              // 벤치마크 fallback 계산에는 쓰지 않고 참고 표시로만 남긴다.
-    division: races[0]?.division||"Open",
-    races, simulationTests:[], running:{ pb5k:"",pb10k:"",pbHalf:"",tt1k:"",tt3k:"",tt5k:"",tt10k:"" },
-    source:"hps_search"
-  };
-  // bug fix: this used to clear DOUBLES_PARTNER_SEARCH_QUERY/RESULTS on pick. The search view
-  // isn't shown anyway while a partner is selected, but wiping it meant that removing the partner
-  // afterward (파트너 제거) dropped the user back to a blank search box, forcing them to retype and
-  // re-search just to pick a different result from the same list. Keeping it in memory means the
-  // same results are still there if they come back.
-  GOAL_DOUBLES_MANUAL_MODE=false;
-  persist();
-  showToast(gender ? `${name}님을 파트너로 선택했습니다` : `${name}님을 파트너로 선택했습니다 — 성별을 확인해주세요`);
-  renderAll();
-}
-
-function renderDoublesPartnerManualForm(){
-  const d=DOUBLES_PARTNER_MANUAL_DRAFT || { name:"", gender:"male", age:"", division:"Open", officialTime:"", date:todayISO() };
-  DOUBLES_PARTNER_MANUAL_DRAFT=d;
-  return `
-    <div class="grid grid-3">
-      ${field("이름 (선택)", `<input id="dbl-m-name" placeholder="파트너 이름" value="${escapeHtml(d.name)}">`)}
-      ${field("성별", `<select id="dbl-m-gender"><option value="male" ${d.gender==="male"?"selected":""}>남성</option><option value="female" ${d.gender==="female"?"selected":""}>여성</option></select>`)}
-      ${field("나이", `<input id="dbl-m-age" type="number" min="16" max="90" value="${escapeHtml(String(d.age))}">`)}
-    </div>
-    <div class="grid grid-3" style="margin-top:10px;">
-      ${field("Division", `<select id="dbl-m-division">${DIVISIONS.filter(x=>!x.includes("Doubles")).map(x=>`<option value="${x}" ${d.division===x?"selected":""}>${x}</option>`).join("")}</select>`)}
-      ${field("대회 기록 (h:mm:ss, 선택)", `<input id="dbl-m-time" placeholder="예: 1:05:00" value="${escapeHtml(d.officialTime)}">`)}
-      ${field("날짜", `<input id="dbl-m-date" type="text" inputmode="numeric" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}" value="${escapeHtml(d.date)}">`)}
-    </div>
-    <p class="reason-line" style="margin-top:8px;">대회 기록이 없어도 성별·나이·Division만 입력하면 동일 조건 benchmark로 팀 예상 기록을 계산합니다.</p>
-    <div style="margin-top:12px;"><button class="btn sm" id="dbl-m-save">파트너로 저장</button></div>
-  `;
-}
-function bindDoublesPartnerManualForm(wrap){
-  const set=(id,key,parser)=>wrap.querySelector(id)?.addEventListener("change",e=>{
-    DOUBLES_PARTNER_MANUAL_DRAFT[key]=parser?parser(e.target.value):e.target.value;
-  });
-  set("#dbl-m-name","name"); set("#dbl-m-gender","gender"); set("#dbl-m-age","age");
-  set("#dbl-m-division","division"); set("#dbl-m-time","officialTime"); set("#dbl-m-date","date");
-  wrap.querySelector("#dbl-m-save")?.addEventListener("click",()=>{
-    const d=DOUBLES_PARTNER_MANUAL_DRAFT;
-    const age=Number(d.age);
-    if(!Number.isFinite(age) || age<16 || age>90){ showToast("나이를 정확히 입력해주세요"); return; }
-    const races=[];
-    if(d.officialTime.trim()){
-      if(!parseTimeToSec(d.officialTime.trim())){ showToast("대회 기록을 h:mm:ss 형식으로 입력해주세요"); return; }
-      if(!/^\d{4}-\d{2}-\d{2}$/.test(d.date)){ showToast("날짜를 YYYY-MM-DD 형식으로 입력해주세요"); return; }
-      races.push({ id:uid(), date:d.date, division:d.division, officialTime:d.officialTime.trim(), runs:{}, stations:{}, transition:null });
-    }
-    STATE.doublesPartner = {
-      id:uid(), name:d.name.trim()||"파트너", gender:d.gender, age, ageGroupDisplay:"",
-      division:d.division, races, simulationTests:[],
-      running:{ pb5k:"",pb10k:"",pbHalf:"",tt1k:"",tt3k:"",tt5k:"",tt10k:"" },
-      source:"manual"
-    };
-    GOAL_DOUBLES_MANUAL_MODE=false; DOUBLES_PARTNER_MANUAL_DRAFT=null;
-    persist(); showToast("파트너 정보가 저장되었습니다"); renderAll();
   });
 }
 
