@@ -7379,6 +7379,36 @@ function doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData){
   const table = partnerHasDoublesData ? DOUBLES_RUN_PACE_WEIGHT_HAS_DOUBLES : DOUBLES_RUN_PACE_WEIGHT_SINGLES_ONLY;
   return (table.find(r=>paceDiffSecKm<=r.max) || table[table.length-1]).w;
 }
+// 파트너의 "현재 Running 기준값" — 동일 유형 기록이 여러 개면 최근 최대 3개를 최근일수록 더 크게
+// 가중(3:2:1 / 2:1 / 1)해 반영한다. 각 기록의 변환은 새로 만들지 않고 resolveUnifiedPerformance를
+// 기록 1건씩 넣어 그대로 재사용 — Division 변환/Same-format 우선/Tier Floor 등 기존 로직이 각
+// 기록에 동일하게 적용된다. 실제 대회 러닝 스플릿이 있는 기록이 하나도 없으면 null을 반환해
+// (Running TT/PB → benchmark로 이어지는) 기존 fallback 경로를 그대로 쓰도록 한다.
+function computeDoublesPartnerRunningBasis(teamDivision){
+  const partner=STATE.doublesPartner;
+  if(!partner) return null;
+  const gender=upv4NormGender(partner.gender);
+  const perRace=(partner.races||[]).map(race=>{
+    const u=resolveUnifiedPerformance(teamDivision, { races:[race], simulations:[], forceGender:gender });
+    const seg=u.segments?.runTotal;
+    if(!seg) return null;
+    return { date:race.date||"", paceSecKm:seg.value/RUN_KEYS.length };
+  }).filter(Boolean).sort((a,b)=>b.date.localeCompare(a.date)); // 최신순
+  if(!perRace.length) return null;
+
+  const recent=perRace.slice(0,3);
+  const weights = recent.length===3 ? [3,2,1] : recent.length===2 ? [2,1] : [1];
+  const sumW=weights.reduce((a,b)=>a+b,0);
+  const pace=recent.reduce((s,r,i)=>s+r.paceSecKm*weights[i],0)/sumW;
+
+  // 편차(일관성) — 1차 구현은 UI 없이 계산만. 나중에 신뢰도 표시에 재사용 가능하도록 남겨둔다.
+  const paces=recent.map(r=>r.paceSecKm);
+  const meanPace=paces.reduce((a,b)=>a+b,0)/paces.length;
+  const stdevSecKm=Math.sqrt(paces.reduce((s,p)=>s+(p-meanPace)**2,0)/paces.length);
+  const spreadSecKm=Math.max(...paces)-Math.min(...paces);
+
+  return { pace, n:recent.length, records:recent, stdevSecKm, spreadSecKm };
+}
 function computeDoublesTeamPrediction(){
   const partner=STATE.doublesPartner;
   if(!partner) return null;
@@ -7399,6 +7429,7 @@ function computeDoublesTeamPrediction(){
   // "상대 선수(파트너)가 Doubles 기록을 보유했는가" — 나 자신의 Doubles 경험 여부는 이 계산에서
   // 보지 않는다(스펙 그대로: 상대 선수 기준).
   const partnerHasDoublesData = (partner.races||[]).some(r=>upv4IsDoubles(normalizeRaceDivision(r.division)||r.division));
+  const partnerRunBasis = computeDoublesPartnerRunningBasis(teamDivision);
 
   const splitPct = STATE.doublesTeam.splitPct||{};
   const order=["runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"];
@@ -7409,15 +7440,17 @@ function computeDoublesTeamPrediction(){
     if(!mine || !theirs) return null; // missing on either side (rare — no benchmark coverage at all)
     if(seg==="runTotal"){
       // 페이스(초/km) 차이 + 파트너의 Doubles 보유 여부로 "느린 선수 가중"을 구해 함께 달리는
-      // 팀 페이스를 추정한다 — 단순히 더 느린 쪽 기록을 그대로 쓰지 않는다.
-      const myPaceSecKm=mine.value/RUN_KEYS.length, partnerPaceSecKm=theirs.value/RUN_KEYS.length;
+      // 팀 페이스를 추정한다 — 단순히 더 느린 쪽 기록을 그대로 쓰지 않는다. 파트너 쪽 페이스는
+      // (실제 러닝 스플릿이 있는 기록이 있다면) 최근 최대 3개 기록의 가중평균을 사용한다.
+      const myPaceSecKm=mine.value/RUN_KEYS.length;
+      const partnerPaceSecKm=partnerRunBasis ? partnerRunBasis.pace : theirs.value/RUN_KEYS.length;
       const paceDiffSecKm=Math.abs(myPaceSecKm-partnerPaceSecKm);
       const slowerWeight=doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData);
       const fasterPace=Math.min(myPaceSecKm,partnerPaceSecKm), slowerPace=Math.max(myPaceSecKm,partnerPaceSecKm);
       const teamPaceSecKm=fasterPace*(1-slowerWeight) + slowerPace*slowerWeight;
       const value=teamPaceSecKm*RUN_KEYS.length;
-      return { segment:seg, value, mode:"run-weighted", mySec:mine.value, partnerSec:theirs.value,
-        mySource:mine.source, partnerSource:theirs.source, paceDiffSecKm, slowerWeight, partnerHasDoublesData };
+      return { segment:seg, value, mode:"run-weighted", mySec:mine.value, partnerSec:partnerPaceSecKm*RUN_KEYS.length,
+        mySource:mine.source, partnerSource:theirs.source, paceDiffSecKm, slowerWeight, partnerHasDoublesData, partnerRunBasis };
     }
     if(seg==="roxzone"){
       const value=Math.max(mine.value, theirs.value);
@@ -7487,7 +7520,7 @@ function renderGoalDoublesTab(wrap){
         <div class="row-between"><h2 class="section-title">✍️ 파트너 기록 직접 입력</h2>
           <span class="chip" id="dbl-manual-toggle" style="cursor:pointer;">${GOAL_DOUBLES_MANUAL_MODE?"검색으로 돌아가기":"직접 입력하기"}</span>
         </div>
-        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
+        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">HPS에 파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
       </div>
     `;
     bindDoublesPartnerSearch(wrap);
@@ -7765,7 +7798,7 @@ function renderDoublesPartnerSearchResults(){
     if(!byName.has(key)) byName.set(key,{first:i, rows:[]});
     byName.get(key).rows.push(x);
   });
-  return [...byName.entries()].map(([name,g])=>{
+  const rows=[...byName.entries()].map(([name,g])=>{
     const r=g.rows[0].r;
     return `
       <div style="padding:11px 0;border-top:1px solid var(--line);">
@@ -7780,6 +7813,9 @@ function renderDoublesPartnerSearchResults(){
       </div>
     `;
   }).join("");
+  // 검색 결과가 3건보다 많아도 화면엔 3건 정도 높이만 보이도록 하고, 나머지는 이 영역 안에서만
+  // 스크롤해서 볼 수 있게 한다 (페이지 전체 스크롤과 분리).
+  return `<div style="max-height:280px;overflow-y:auto;">${rows}</div>`;
 }
 function bindDoublesPartnerSearch(wrap){
   const input=wrap.querySelector("#dbl-partner-search");
@@ -7850,7 +7886,12 @@ function pickDoublesPartnerFromSearch(name){
     races, simulationTests:[], running:{ pb5k:"",pb10k:"",pbHalf:"",tt1k:"",tt3k:"",tt5k:"",tt10k:"" },
     source:"hps_search"
   };
-  DOUBLES_PARTNER_SEARCH_QUERY=""; DOUBLES_PARTNER_SEARCH_RESULTS=[]; GOAL_DOUBLES_MANUAL_MODE=false;
+  // bug fix: this used to clear DOUBLES_PARTNER_SEARCH_QUERY/RESULTS on pick. The search view
+  // isn't shown anyway while a partner is selected, but wiping it meant that removing the partner
+  // afterward (파트너 제거) dropped the user back to a blank search box, forcing them to retype and
+  // re-search just to pick a different result from the same list. Keeping it in memory means the
+  // same results are still there if they come back.
+  GOAL_DOUBLES_MANUAL_MODE=false;
   persist();
   showToast(gender ? `${name}님을 파트너로 선택했습니다` : `${name}님을 파트너로 선택했습니다 — 성별을 확인해주세요`);
   renderAll();
