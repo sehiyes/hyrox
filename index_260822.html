@@ -7366,6 +7366,19 @@ function deriveDoublesTeamDivision(myGender, partnerGender, selectedTier){
 // Running (and, for lack of any spec'd alternative, Roxzone transition time — both are "moving as a
 // team" segments rather than divisible work) are NOT split: the team is bound by whichever partner
 // is slower, so the combined value is the SLOWER (larger) of the two individually-resolved values.
+// Doubles Running pace-combination: "느린 선수 Pace 가중" 테이블. 파트너가 실제 Doubles 기록을
+// 보유했는지(둘이 같이 뛰어본 경험 반영, 완화됨) vs Singles 기록만 있는지(더 크게 반영)에 따라
+// 다른 테이블을 쓰고, 두 선수의 페이스 차이(초/km) 구간별로 "느린 쪽에 얼마나 가중치를 둘지" 결정.
+const DOUBLES_RUN_PACE_WEIGHT_SINGLES_ONLY = [
+  {max:10, w:0.55}, {max:20, w:0.65}, {max:30, w:0.75}, {max:45, w:0.85}, {max:Infinity, w:0.90}
+];
+const DOUBLES_RUN_PACE_WEIGHT_HAS_DOUBLES = [
+  {max:10, w:0.55}, {max:20, w:0.60}, {max:30, w:0.65}, {max:45, w:0.70}, {max:Infinity, w:0.70}
+];
+function doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData){
+  const table = partnerHasDoublesData ? DOUBLES_RUN_PACE_WEIGHT_HAS_DOUBLES : DOUBLES_RUN_PACE_WEIGHT_SINGLES_ONLY;
+  return (table.find(r=>paceDiffSecKm<=r.max) || table[table.length-1]).w;
+}
 function computeDoublesTeamPrediction(){
   const partner=STATE.doublesPartner;
   if(!partner) return null;
@@ -7383,16 +7396,30 @@ function computeDoublesTeamPrediction(){
     forceGender: upv4NormGender(partner.gender),
     age: Number.isFinite(partnerAge) && partnerAge>0 ? partnerAge : null,
   });
+  // "상대 선수(파트너)가 Doubles 기록을 보유했는가" — 나 자신의 Doubles 경험 여부는 이 계산에서
+  // 보지 않는다(스펙 그대로: 상대 선수 기준).
+  const partnerHasDoublesData = (partner.races||[]).some(r=>upv4IsDoubles(normalizeRaceDivision(r.division)||r.division));
 
   const splitPct = STATE.doublesTeam.splitPct||{};
   const order=["runTotal","ski","sledPush","sledPull","bbj","row","farmers","lunges","wallBalls","roxzone"];
-  const SHARED=new Set(["runTotal","roxzone"]);
   const myMap=Object.fromEntries(myPred.parts.map(p=>[p.segment,p]));
   const partnerMap=Object.fromEntries(partnerPred.parts.map(p=>[p.segment,p]));
   const parts=order.map(seg=>{
     const mine=myMap[seg], theirs=partnerMap[seg];
     if(!mine || !theirs) return null; // missing on either side (rare — no benchmark coverage at all)
-    if(SHARED.has(seg)){
+    if(seg==="runTotal"){
+      // 페이스(초/km) 차이 + 파트너의 Doubles 보유 여부로 "느린 선수 가중"을 구해 함께 달리는
+      // 팀 페이스를 추정한다 — 단순히 더 느린 쪽 기록을 그대로 쓰지 않는다.
+      const myPaceSecKm=mine.value/RUN_KEYS.length, partnerPaceSecKm=theirs.value/RUN_KEYS.length;
+      const paceDiffSecKm=Math.abs(myPaceSecKm-partnerPaceSecKm);
+      const slowerWeight=doublesSlowerRunWeight(paceDiffSecKm, partnerHasDoublesData);
+      const fasterPace=Math.min(myPaceSecKm,partnerPaceSecKm), slowerPace=Math.max(myPaceSecKm,partnerPaceSecKm);
+      const teamPaceSecKm=fasterPace*(1-slowerWeight) + slowerPace*slowerWeight;
+      const value=teamPaceSecKm*RUN_KEYS.length;
+      return { segment:seg, value, mode:"run-weighted", mySec:mine.value, partnerSec:theirs.value,
+        mySource:mine.source, partnerSource:theirs.source, paceDiffSecKm, slowerWeight, partnerHasDoublesData };
+    }
+    if(seg==="roxzone"){
       const value=Math.max(mine.value, theirs.value);
       return { segment:seg, value, mode:"shared-slower", mySec:mine.value, partnerSec:theirs.value, mySource:mine.source, partnerSource:theirs.source };
     }
@@ -7460,7 +7487,7 @@ function renderGoalDoublesTab(wrap){
         <div class="row-between"><h2 class="section-title">✍️ 파트너 기록 직접 입력</h2>
           <span class="chip" id="dbl-manual-toggle" style="cursor:pointer;">${GOAL_DOUBLES_MANUAL_MODE?"검색으로 돌아가기":"직접 입력하기"}</span>
         </div>
-        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">HPS에 파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
+        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
       </div>
     `;
     bindDoublesPartnerSearch(wrap);
