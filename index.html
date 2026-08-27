@@ -1800,6 +1800,41 @@ function upv4Conversion(gender, source, target, segment){
     }
   }
 
+  /*
+    bug fix: Open <-> Pro Doubles and Pro <-> Open Doubles (a cross-FORMAT *and* cross-TIER jump at
+    once) had NO segment-level conversion path at all — only UPV4_EMPIRICAL_TOTAL has a shortcut for
+    these pairs, and that shortcut only ever applies to segment==="officialTotal", never "runTotal"
+    or any station. So for "runTotal"/stations specifically, this silently returned multiplier:null,
+    the athlete's real race got dropped entirely (see upv4SegmentValue's null-skip), and the
+    prediction fell back to a generic population benchmark — completely disconnected from their
+    actual performance (reported symptom: a partner with only an Open Singles race, on a Pro
+    Doubles team, showed an unrealistically fast ~29min running split that was actually just the
+    Pro Doubles elite benchmark, not anything derived from their real data).
+    Bridged the same way as the Mixed Doubles case above, through the natural intermediate that DOES
+    have a direct segment-level entry in both directions: Open<->Open Doubles<->Pro Doubles (or the
+    Pro-tier equivalent) — reusing the already-correct Open<->OpenDoubles and OpenDoubles<->ProDoubles
+    conversions rather than inventing a new one.
+  */
+  if(!result){
+    const crossFormatTierBridge = {
+      "Open|Pro Doubles":"Open Doubles", "Pro Doubles|Open":"Open Doubles",
+      "Pro|Open Doubles":"Pro Doubles", "Open Doubles|Pro":"Pro Doubles",
+    };
+    const bridgeMid2 = crossFormatTierBridge[`${source}|${target}`];
+    if(bridgeMid2){
+      const first=upv4Conversion(gender,source,bridgeMid2,segment);
+      const second=upv4Conversion(gender,bridgeMid2,target,segment);
+      if(Number.isFinite(Number(first?.multiplier)) && Number.isFinite(Number(second?.multiplier))){
+        result = {
+          multiplier:Number(first.multiplier)*Number(second.multiplier),
+          confidence:"LOW",
+          hops:2,
+          source:`COMPOSED_EMPIRICAL_${source.replace(/\s+/g,"_")}_TO_${bridgeMid2.replace(/\s+/g,"_")}_TO_${target.replace(/\s+/g,"_")}`
+        };
+      }
+    }
+  }
+
   if(!result){
     const path=(UPV4_DIVISION_GRAPH[target]||[]).find(x=>x[0]===source);
     result = {
@@ -7524,7 +7559,7 @@ function renderGoalDoublesTab(wrap){
         <div class="row-between"><h2 class="section-title">✍️ 파트너 기록 직접 입력</h2>
           <span class="chip" id="dbl-manual-toggle" style="cursor:pointer;">${GOAL_DOUBLES_MANUAL_MODE?"검색으로 돌아가기":"직접 입력하기"}</span>
         </div>
-        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
+        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">HPS에 파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
       </div>
     `;
     bindDoublesPartnerSearch(wrap);
