@@ -6558,9 +6558,10 @@ function renderHyroxImportConfirmModal(){
     RC_OCR_CONF=null;
     const data={...d};
     HYROX_IMPORT_DRAFT=null; HYROX_DB_SELECTED=null;
-    // 기록 추가까지 마쳤으면 검색 결과/검색어를 비운다 (같은 선수를 중복 등록하기 쉬운 상태로
-    // 남겨두지 않기 위해).
-    HYROX_DB_QUERY=""; HYROX_DB_RESULTS=[];
+    // bug fix: this used to clear HYROX_DB_QUERY/HYROX_DB_RESULTS here. Keeping them means the
+    // same search results are still there afterward (e.g. to add another of this athlete's races,
+    // or a different person from the same search) instead of forcing a re-search from scratch —
+    // matching the same fix already applied to the Doubles partner search.
     // reuses the exact same duplicate-check + save pipeline as the manual "기록 추가" form
     // (raceDuplicateExists / showRaceDuplicateConfirm / finalizeAddRace) so both entry paths
     // end up writing to STATE.races identically.
@@ -6602,7 +6603,7 @@ function renderHyroxSearchResults(){
   if(!HYROX_DB_RESULTS.length){
     return `<div class="empty-note">검색 결과가 없습니다. 이름의 일부만 입력해보세요.</div>`;
   }
-  return HYROX_DB_RESULTS.map((x,i)=>{
+  const rows=HYROX_DB_RESULTS.map((x,i)=>{
     const r=x.r;
     return `
       <div style="padding:11px 0;border-top:1px solid var(--line);">
@@ -6619,6 +6620,9 @@ function renderHyroxSearchResults(){
       </div>
     `;
   }).join("");
+  // 검색 결과가 많아도 화면엔 3건 정도 높이만 보이도록 하고, 나머지는 이 영역 안에서만 스크롤해서
+  // 볼 수 있게 한다 (페이지 전체 스크롤과 분리) — Doubles 파트너 검색과 동일한 처리.
+  return `<div style="max-height:280px;overflow-y:auto;">${rows}</div>`;
 }
 
 function bindHyroxNameSearch(wrap){
@@ -7520,7 +7524,7 @@ function renderGoalDoublesTab(wrap){
         <div class="row-between"><h2 class="section-title">✍️ 파트너 기록 직접 입력</h2>
           <span class="chip" id="dbl-manual-toggle" style="cursor:pointer;">${GOAL_DOUBLES_MANUAL_MODE?"검색으로 돌아가기":"직접 입력하기"}</span>
         </div>
-        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">HPS에 파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
+        ${GOAL_DOUBLES_MANUAL_MODE ? renderDoublesPartnerManualForm() : `<p class="lead" style="margin:6px 0;">파트너 기록이 없다면, 직접 성별·나이·Division·기록을 입력할 수 있습니다.</p>`}
       </div>
     `;
     bindDoublesPartnerSearch(wrap);
